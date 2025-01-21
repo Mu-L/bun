@@ -1,50 +1,22 @@
+#include "napi_external.h"
+#include "napi.h"
 
+namespace Bun {
 
-// #pragma once
+NapiExternal::~NapiExternal()
+{
+    if (finalizer) {
+        // We cannot call globalObject() here because it is in a finalizer.
+        // https://github.com/oven-sh/bun/issues/13001#issuecomment-2290022312
+        reinterpret_cast<napi_finalize>(finalizer)(toNapi(this->napi_env), m_value, m_finalizerHint);
+    }
+}
 
-// #include "root.h"
+void NapiExternal::destroy(JSC::JSCell* cell)
+{
+    static_cast<NapiExternal*>(cell)->~NapiExternal();
+}
 
-// #include "BunBuiltinNames.h"
-// #include "BunClientData.h"
+const ClassInfo NapiExternal::s_info = { "External"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(NapiExternal) };
 
-// namespace Zig {
-
-// using namespace JSC;
-
-// class NapiExternal : public JSC::JSNonFinalObject {
-//     using Base = JSC::JSNonFinalObject;
-
-// public:
-//     NapiExternal(JSC::VM& vm, JSC::Structure* structure)
-//         : Base(vm, structure)
-//     {
-//     }
-
-//     DECLARE_INFO;
-
-//     static constexpr unsigned StructureFlags = Base::StructureFlags;
-
-//     template<typename CellType, SubspaceAccess> static GCClient::IsoSubspace* subspaceFor(VM& vm)
-//     {
-//         return &vm.plainObjectSpace();
-//     }
-
-//     static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* globalObject,
-//         JSC::JSValue prototype)
-//     {
-//         return JSC::Structure::create(vm, globalObject, prototype,
-//             JSC::TypeInfo(JSC::ObjectType, StructureFlags), info());
-//     }
-
-//     static NapiExternal* create(JSC::VM& vm, JSC::Structure* structure)
-//     {
-//         NapiExternal* accessor = new (NotNull, JSC::allocateCell<NapiExternal>(vm)) NapiExternal(vm, structure);
-//         accessor->finishCreation(vm);
-//         return accessor;
-//     }
-
-//     void finishCreation(JSC::VM& vm);
-//     void* m_value;
-// };
-
-// } // namespace Zig
+}

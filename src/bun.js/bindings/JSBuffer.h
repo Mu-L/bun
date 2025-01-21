@@ -20,89 +20,50 @@
 
 #pragma once
 
+#include "JavaScriptCore/ArrayBuffer.h"
 #include "root.h"
 
-#include "JSDOMWrapper.h"
-#include "wtf/NeverDestroyed.h"
+#include <JavaScriptCore/JSGlobalObject.h>
+#include <wtf/NeverDestroyed.h>
 
 #include "BufferEncodingType.h"
-#include "Buffer.h"
+#include "headers-handwritten.h"
 
+extern "C" JSC::EncodedJSValue JSBuffer__bufferFromLength(JSC::JSGlobalObject* lexicalGlobalObject, int64_t length);
+extern "C" JSC::EncodedJSValue JSBuffer__bufferFromPointerAndLengthAndDeinit(JSC::JSGlobalObject* lexicalGlobalObject, char* ptr, size_t length, void* ctx, JSTypedArrayBytesDeallocator bytesDeallocator);
+extern "C" JSC::EncodedJSValue Bun__encoding__toString(const uint8_t* input, size_t len, JSC::JSGlobalObject* globalObject, Encoding encoding);
+extern "C" JSC::EncodedJSValue Bun__encoding__toStringUTF8(const uint8_t* input, size_t len, JSC::JSGlobalObject* globalObject);
+extern "C" bool Bun__Buffer_fill(ZigString*, void*, size_t, WebCore::BufferEncodingType);
 extern "C" bool JSBuffer__isBuffer(JSC::JSGlobalObject*, JSC::EncodedJSValue);
+
+namespace Bun {
+
+std::optional<double> byteLength(JSC::JSString* str, WebCore::BufferEncodingType encoding);
+
+namespace Buffer {
+
+const size_t kMaxLength = MAX_ARRAY_BUFFER_SIZE;
+const size_t kStringMaxLength = WTF::String::MaxLength;
+const size_t MAX_LENGTH = MAX_ARRAY_BUFFER_SIZE;
+const size_t MAX_STRING_LENGTH = WTF::String::MaxLength;
+
+}
+
+}
 
 namespace WebCore {
 
-class WEBCORE_EXPORT JSBuffer final : public JSDOMWrapper<Buffer> {
-public:
-    using Base = JSDOMWrapper<Buffer>;
+JSC::JSUint8Array* createUninitializedBuffer(JSC::JSGlobalObject* lexicalGlobalObject, size_t length);
+JSC::JSUint8Array* createBuffer(JSC::JSGlobalObject* lexicalGlobalObject, const uint8_t* data, size_t length);
+JSC::JSUint8Array* createBuffer(JSC::JSGlobalObject* lexicalGlobalObject, const Vector<uint8_t>& data);
+JSC::JSUint8Array* createBuffer(JSC::JSGlobalObject* lexicalGlobalObject, const std::span<const uint8_t> data);
+JSC::JSUint8Array* createBuffer(JSC::JSGlobalObject* lexicalGlobalObject, const char* ptr, size_t length);
+JSC::JSUint8Array* createBuffer(JSC::JSGlobalObject* lexicalGlobalObject, Ref<JSC::ArrayBuffer>&& backingStore);
+JSC::JSUint8Array* createEmptyBuffer(JSC::JSGlobalObject* lexicalGlobalObject);
 
-    static constexpr JSC::TypedArrayType TypedArrayStorageType = JSC::JSUint8Array::Adaptor::typeValue;
-    static JSBuffer* create(JSC::Structure* structure, JSDOMGlobalObject* globalObject, Ref<Buffer>&& impl)
-    {
-        JSBuffer* ptr = new (NotNull, JSC::allocateCell<JSBuffer>(globalObject->vm())) JSBuffer(structure, *globalObject, WTFMove(impl));
-        ptr->finishCreation(globalObject->vm());
-        return ptr;
-    }
+JSC_DECLARE_HOST_FUNCTION(constructSlowBuffer);
+JSC::JSObject* createBufferPrototype(JSC::VM&, JSC::JSGlobalObject*);
+JSC::Structure* createBufferStructure(JSC::VM&, JSC::JSGlobalObject*, JSC::JSValue prototype);
+JSC::JSObject* createBufferConstructor(JSC::VM&, JSC::JSGlobalObject*, JSC::JSObject* bufferPrototype);
 
-    static JSC::JSObject* createPrototype(JSC::VM&, JSDOMGlobalObject&);
-    static JSC::JSObject* prototype(JSC::VM&, JSDOMGlobalObject&);
-    static Buffer* toWrapped(JSC::VM&, JSC::JSValue);
-    static void destroy(JSC::JSCell*);
-
-    using Adaptor = JSC::JSUint8Array::Adaptor;
-
-    DECLARE_INFO;
-
-    static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* globalObject, JSC::JSValue prototype)
-    {
-        return JSC::Structure::create(vm, globalObject, prototype, JSC::TypeInfo(JSC::JSType(JSC::JSType::Uint8ArrayType), StructureFlags), info(), JSC::MayHaveIndexedAccessors);
-    }
-
-    static JSC::JSValue getConstructor(JSC::VM&, const JSC::JSGlobalObject*);
-    template<typename, JSC::SubspaceAccess mode> static JSC::GCClient::IsoSubspace* subspaceFor(JSC::VM& vm)
-    {
-        if constexpr (mode == JSC::SubspaceAccess::Concurrently)
-            return nullptr;
-        return subspaceForImpl(vm);
-    }
-    static JSC::GCClient::IsoSubspace* subspaceForImpl(JSC::VM& vm);
-    // DECLARE_VISIT_CHILDREN;
-    // template<typename Visitor> void visitAdditionalChildren(Visitor&);
-    // template<typename Visitor> static void visitOutputConstraints(JSCell*, Visitor&);
-    // static void analyzeHeap(JSCell*, JSC::HeapAnalyzer&);
-
-protected:
-    JSBuffer(JSC::Structure*, JSDOMGlobalObject&, Ref<Buffer>&&);
-
-    void finishCreation(JSC::VM&);
-};
-
-class JSBufferOwner final : public JSC::WeakHandleOwner {
-public:
-    ~JSBufferOwner() final;
-    bool isReachableFromOpaqueRoots(JSC::Handle<JSC::Unknown>, void* context, JSC::AbstractSlotVisitor&, const char**) final;
-    void finalize(JSC::Handle<JSC::Unknown>, void* context) final;
-};
-
-inline JSC::WeakHandleOwner* wrapperOwner(DOMWrapperWorld&, Buffer*)
-{
-    static NeverDestroyed<JSBufferOwner> owner;
-    return &owner.get();
 }
-
-inline void* wrapperKey(Buffer* wrappableObject)
-{
-    return wrappableObject;
-}
-
-WEBCORE_EXPORT JSC::JSValue toJS(JSC::JSGlobalObject*, JSDOMGlobalObject*, Buffer&);
-inline JSC::JSValue toJS(JSC::JSGlobalObject* lexicalGlobalObject, JSDOMGlobalObject* globalObject, Buffer* impl) { return impl ? toJS(lexicalGlobalObject, globalObject, *impl) : JSC::jsNull(); }
-JSC::JSValue toJSNewlyCreated(JSC::JSGlobalObject*, JSDOMGlobalObject*, Ref<Buffer>&&);
-inline JSC::JSValue toJSNewlyCreated(JSC::JSGlobalObject* lexicalGlobalObject, JSDOMGlobalObject* globalObject, RefPtr<Buffer>&& impl) { return impl ? toJSNewlyCreated(lexicalGlobalObject, globalObject, impl.releaseNonNull()) : JSC::jsNull(); }
-
-template<> struct JSDOMWrapperConverterTraits<Buffer> {
-    using WrapperClass = JSBuffer;
-    using ToWrappedReturnType = Buffer*;
-};
-
-} // namespace WebCore

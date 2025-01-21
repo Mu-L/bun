@@ -1,11 +1,11 @@
 import {
 __require as require
 } from "http://localhost:8080/bun:wrap";
-import * as $1407d117 from "http://localhost:8080/node_modules/react/jsx-dev-runtime.js";
-var JSX = require($1407d117);
+import * as $a77976b9 from "http://localhost:8080/node_modules/react/jsx-dev-runtime.js";
+var JSX = require($a77976b9);
 var jsx = require(JSX).jsxDEV;
-import * as $72f3f54c from "http://localhost:8080/node_modules/react-dom/server.browser.js";
-var ReactDOM = require($72f3f54c);
+import * as $66da6d1a from "http://localhost:8080/node_modules/react-dom/server.browser.js";
+var ReactDOM = require($66da6d1a);
 const ReturnDescriptionAsString = ({ description }) => description;
 export function test() {
   const _bun = ReactDOM.renderToString(jsx(ReturnDescriptionAsString, {
@@ -17,7 +17,7 @@ line4 no trailing space 'single quote' \\t\\f\\v\\uF000 \`template string\`
 line6 no trailing space
 line7 trailing newline that \${terminates} the string literal
 `
-  }, undefined, false, undefined, this));
+  }));
   const el = document.createElement("textarea");
   el.innerHTML = _bun;
   const bun = el.value;

@@ -43,24 +43,25 @@ test "SliceIterator" {
     }
 }
 
+const bun = @import("root").bun;
 /// An argument iterator which wraps the ArgIterator in ::std.
 /// On windows, this iterator allocates.
 pub const OsIterator = struct {
     const Error = process.ArgIterator.InitError;
 
-    arena: heap.ArenaAllocator,
-    args: process.ArgIterator,
+    arena: bun.ArenaAllocator,
+    remain: [][:0]const u8,
 
     /// The executable path (this is the first argument passed to the program)
     /// TODO: Is it the right choice for this to be null? Maybe `init` should
     ///       return an error when we have no exe.
     exe_arg: ?[:0]const u8,
 
-    pub fn init(allocator: mem.Allocator) Error!OsIterator {
+    pub fn init(allocator: mem.Allocator) OsIterator {
         var res = OsIterator{
-            .arena = heap.ArenaAllocator.init(allocator),
-            .args = process.args(),
+            .arena = bun.ArenaAllocator.init(allocator),
             .exe_arg = undefined,
+            .remain = bun.argv,
         };
         res.exe_arg = res.next();
         return res;
@@ -71,7 +72,13 @@ pub const OsIterator = struct {
     }
 
     pub fn next(iter: *OsIterator) ?[:0]const u8 {
-        return iter.args.next();
+        if (iter.remain.len > 0) {
+            const res = iter.remain[0];
+            iter.remain = iter.remain[1..];
+            return res;
+        }
+
+        return null;
     }
 };
 
@@ -83,12 +90,12 @@ pub const ShellIterator = struct {
         QuoteNotClosed,
     } || mem.Allocator.Error;
 
-    arena: heap.ArenaAllocator,
+    arena: bun.ArenaAllocator,
     str: []const u8,
 
     pub fn init(allocator: mem.Allocator, str: []const u8) ShellIterator {
         return .{
-            .arena = heap.ArenaAllocator.init(allocator),
+            .arena = bun.ArenaAllocator.init(allocator),
             .str = str,
         };
     }
@@ -113,7 +120,7 @@ pub const ShellIterator = struct {
             after_quote,
         } = .skip_whitespace;
 
-        for (iter.str) |c, i| {
+        for (iter.str, 0..) |c, i| {
             switch (state) {
                 // The state that skips the initial whitespace.
                 .skip_whitespace => switch (c) {
@@ -256,7 +263,7 @@ pub const ShellIterator = struct {
         // the rest we have to the list and return that.
         if (list.items.len != 0) {
             try list.appendSlice(res);
-            return list.toOwnedSlice();
+            return try list.toOwnedSlice();
         }
         return res;
     }

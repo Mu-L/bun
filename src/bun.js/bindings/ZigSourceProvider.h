@@ -10,16 +10,20 @@ class SourceCodeKey;
 class SourceProvider;
 } // namespace JSC
 
-#include "JavaScriptCore/CachedBytecode.h"
-#include "JavaScriptCore/JSGlobalObject.h"
-#include "JavaScriptCore/JSTypeInfo.h"
-#include "ZigConsoleClient.h"
-// #include "JavaScriptCore/SourceCodeKey.h"
-#include "JavaScriptCore/SourceProvider.h"
-#include "JavaScriptCore/Structure.h"
+#include <JavaScriptCore/CachedBytecode.h>
+#include <JavaScriptCore/JSGlobalObject.h>
+#include <JavaScriptCore/JSTypeInfo.h>
+#include <JavaScriptCore/SourceProvider.h>
+#include <JavaScriptCore/Structure.h>
 
 namespace Zig {
 
+class GlobalObject;
+
+void forEachSourceProvider(WTF::Function<void(JSC::SourceID)>);
+JSC::SourceID sourceIDForSourceURL(const WTF::String& sourceURL);
+void* sourceMappingForSourceURL(const WTF::String& sourceURL);
+JSC::SourceOrigin toSourceOrigin(const String& sourceURL, bool isBuiltin);
 class SourceProvider final : public JSC::SourceProvider {
     WTF_MAKE_FAST_ALLOCATED;
     using Base = JSC::SourceProvider;
@@ -32,23 +36,18 @@ class SourceProvider final : public JSC::SourceProvider {
     using SourceOrigin = JSC::SourceOrigin;
 
 public:
-    static Ref<SourceProvider> create(ResolvedSource resolvedSource);
-    ~SourceProvider()
+    static Ref<SourceProvider> create(
+        Zig::GlobalObject*,
+        ResolvedSource& resolvedSource,
+        JSC::SourceProviderSourceType sourceType = JSC::SourceProviderSourceType::Module,
+        bool isBuiltIn = false);
+    ~SourceProvider();
+    unsigned hash() const override;
+    StringView source() const override;
+
+    RefPtr<JSC::CachedBytecode> cachedBytecode() const final
     {
-        freeSourceCode();
-
-        commitCachedBytecode();
-    }
-
-    unsigned hash() const { return m_hash; };
-    StringView source() const { return StringView(m_source.get()); }
-    RefPtr<JSC::CachedBytecode> cachedBytecode()
-    {
-        // if (m_resolvedSource.bytecodecache_fd == 0) {
-        return nullptr;
-        // }
-
-        // return m_cachedBytecode;
+        return m_cachedBytecode.copyRef();
     };
 
     void updateCache(const UnlinkedFunctionExecutable* executable, const SourceCode&,
@@ -62,26 +61,21 @@ public:
     void freeSourceCode();
 
 private:
-    SourceProvider(ResolvedSource resolvedSource, WTF::StringImpl& sourceImpl,
+    SourceProvider(Zig::GlobalObject* globalObject, ResolvedSource resolvedSource, Ref<WTF::StringImpl>&& sourceImpl,
+        JSC::SourceTaintedOrigin taintedness,
         const SourceOrigin& sourceOrigin, WTF::String&& sourceURL,
         const TextPosition& startPosition, JSC::SourceProviderSourceType sourceType)
-        : Base(sourceOrigin, WTFMove(sourceURL), startPosition, sourceType)
+        : Base(sourceOrigin, WTFMove(sourceURL), String(), taintedness, startPosition, sourceType)
+        , m_globalObject(globalObject)
         , m_source(sourceImpl)
     {
-
         m_resolvedSource = resolvedSource;
-
-        m_hash = resolvedSource.hash;
-
-        getHash();
     }
 
-    unsigned m_hash;
-    unsigned getHash();
+    Zig::GlobalObject* m_globalObject;
     RefPtr<JSC::CachedBytecode> m_cachedBytecode;
     Ref<WTF::StringImpl> m_source;
-    bool did_free_source_code = false;
-    // JSC::SourceCodeKey key;
+    unsigned m_hash = 0;
 };
 
 } // namespace Zig

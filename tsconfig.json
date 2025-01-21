@@ -1,10 +1,18 @@
 {
+  "files": [],
+  "include": [],
   "compilerOptions": {
-    "lib": ["ESNext"],
-    "module": "esnext",
-    "target": "esnext",
-    "typeRoots": ["./types"],
-    "types": ["bun"]
+    "noEmit": true,
+    "skipLibCheck": true,
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true
   },
-  "exclude": ["src"]
+  "references": [
+    //
+    { "path": "./src" },
+    { "path": "./src/bake" },
+    { "path": "./src/js" },
+    { "path": "./test" },
+    { "path": "./packages/bun-types" }
+  ]
 }

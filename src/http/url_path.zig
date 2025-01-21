@@ -1,7 +1,6 @@
-const bun = @import("../global.zig");
+const bun = @import("root").bun;
 const string = bun.string;
 const Output = bun.Output;
-const toMutable = bun.constStrToU8;
 const Global = bun.Global;
 const Environment = bun.Environment;
 const strings = bun.strings;
@@ -59,27 +58,21 @@ pub fn parse(possibly_encoded_pathname_: string) !URLPath {
     var needs_redirect = false;
 
     if (strings.containsChar(decoded_pathname, '%')) {
-        var possibly_encoded_pathname = switch (decoded_pathname.len) {
+        // https://github.com/ziglang/zig/issues/14148
+        var possibly_encoded_pathname: []u8 = switch (decoded_pathname.len) {
             0...1024 => &temp_path_buf,
             else => &big_temp_path_buf,
         };
-        possibly_encoded_pathname = possibly_encoded_pathname[0..std.math.min(
+        possibly_encoded_pathname = possibly_encoded_pathname[0..@min(
             possibly_encoded_pathname_.len,
             possibly_encoded_pathname.len,
         )];
 
-        std.mem.copy(u8, possibly_encoded_pathname, possibly_encoded_pathname_[0..possibly_encoded_pathname.len]);
-        var clone = possibly_encoded_pathname[0..possibly_encoded_pathname.len];
+        bun.copy(u8, possibly_encoded_pathname, possibly_encoded_pathname_[0..possibly_encoded_pathname.len]);
+        const clone = possibly_encoded_pathname[0..possibly_encoded_pathname.len];
 
-        var fbs = std.io.fixedBufferStream(
-            // This is safe because:
-            // - this comes from a non-const buffer
-            // - percent *decoding* will always be <= length of the original string (no buffer overflow)
-            toMutable(
-                possibly_encoded_pathname,
-            ),
-        );
-        var writer = fbs.writer();
+        var fbs = std.io.fixedBufferStream(possibly_encoded_pathname);
+        const writer = fbs.writer();
 
         decoded_pathname = possibly_encoded_pathname[0..try PercentEncoding.decodeFaultTolerant(@TypeOf(writer), writer, clone, &needs_redirect, true)];
     }
@@ -90,14 +83,14 @@ pub fn parse(possibly_encoded_pathname_: string) !URLPath {
     var first_segment_end: i16 = std.math.maxInt(i16);
     var last_slash: i16 = -1;
 
-    var i: i16 = @intCast(i16, decoded_pathname.len) - 1;
+    var i: i16 = @as(i16, @intCast(decoded_pathname.len)) - 1;
 
     while (i >= 0) : (i -= 1) {
-        const c = decoded_pathname[@intCast(usize, i)];
+        const c = decoded_pathname[@as(usize, @intCast(i))];
 
         switch (c) {
             '?' => {
-                question_mark_i = @maximum(question_mark_i, i);
+                question_mark_i = @max(question_mark_i, i);
                 if (question_mark_i < period_i) {
                     period_i = -1;
                 }
@@ -107,13 +100,13 @@ pub fn parse(possibly_encoded_pathname_: string) !URLPath {
                 }
             },
             '.' => {
-                period_i = @maximum(period_i, i);
+                period_i = @max(period_i, i);
             },
             '/' => {
-                last_slash = @maximum(last_slash, i);
+                last_slash = @max(last_slash, i);
 
                 if (i > 0) {
-                    first_segment_end = @minimum(first_segment_end, i);
+                    first_segment_end = @min(first_segment_end, i);
                 }
             },
             else => {},
@@ -129,18 +122,18 @@ pub fn parse(possibly_encoded_pathname_: string) !URLPath {
     const extname = brk: {
         if (question_mark_i > -1 and period_i > -1) {
             period_i += 1;
-            break :brk decoded_pathname[@intCast(usize, period_i)..@intCast(usize, question_mark_i)];
+            break :brk decoded_pathname[@as(usize, @intCast(period_i))..@as(usize, @intCast(question_mark_i))];
         } else if (period_i > -1) {
             period_i += 1;
-            break :brk decoded_pathname[@intCast(usize, period_i)..];
+            break :brk decoded_pathname[@as(usize, @intCast(period_i))..];
         } else {
             break :brk &([_]u8{});
         }
     };
 
-    var path = if (question_mark_i < 0) decoded_pathname[1..] else decoded_pathname[1..@intCast(usize, question_mark_i)];
+    var path = if (question_mark_i < 0) decoded_pathname[1..] else decoded_pathname[1..@as(usize, @intCast(question_mark_i))];
 
-    const first_segment = decoded_pathname[1..@minimum(@intCast(usize, first_segment_end), decoded_pathname.len)];
+    const first_segment = decoded_pathname[1..@min(@as(usize, @intCast(first_segment_end)), decoded_pathname.len)];
     const is_source_map = strings.eqlComptime(extname, "map");
     var backup_extname: string = extname;
     if (is_source_map and path.len > ".map".len) {
@@ -157,7 +150,7 @@ pub fn parse(possibly_encoded_pathname_: string) !URLPath {
         .pathname = decoded_pathname,
         .first_segment = first_segment,
         .path = if (decoded_pathname.len == 1) "." else path,
-        .query_string = if (question_mark_i > -1) decoded_pathname[@intCast(usize, question_mark_i)..@intCast(usize, decoded_pathname.len)] else "",
+        .query_string = if (question_mark_i > -1) decoded_pathname[@as(usize, @intCast(question_mark_i))..@as(usize, @intCast(decoded_pathname.len))] else "",
         .needs_redirect = needs_redirect,
     };
 }

@@ -31,6 +31,7 @@
 
 #include "config.h"
 #include "Event.h"
+#include "EventPath.h"
 
 #include "EventTarget.h"
 
@@ -73,6 +74,11 @@ bool EventTarget::isNode() const
     return false;
 }
 
+bool EventTarget::isContextStopped() const
+{
+    return !scriptExecutionContext();
+}
+
 bool EventTarget::isPaymentRequest() const
 {
     return false;
@@ -92,15 +98,13 @@ bool EventTarget::addEventListener(const AtomString& eventType, Ref<EventListene
     // if (!passive.has_value() && Quirks::shouldMakeEventListenerPassive(*this, eventType, listener.get()))
     //     passive = true;
 
-    bool listenerCreatedFromScript = is<JSEventListener>(listener) && !downcast<JSEventListener>(listener.get()).wasCreatedFromMarkup();
-
     if (!ensureEventTargetData().eventListenerMap.add(eventType, listener.copyRef(), { options.capture, passive.value_or(false), options.once }))
         return false;
 
     if (options.signal) {
-        options.signal->addAlgorithm([weakThis = WeakPtr { *this }, eventType, listener = WeakPtr { listener }, capture = options.capture] {
+        options.signal->addAlgorithm([weakThis = WeakPtr { *this }, eventType, listener = WeakPtr { listener }, capture = options.capture](JSC::JSValue) {
             if (weakThis && listener)
-                weakThis->removeEventListener(eventType, *listener, capture);
+                Ref { *weakThis } -> removeEventListener(eventType, *listener, capture);
         });
     }
 
@@ -111,6 +115,9 @@ bool EventTarget::addEventListener(const AtomString& eventType, Ref<EventListene
     // invalidateEventListenerRegions();
 
     eventListenersDidChange();
+    if (UNLIKELY(this->onDidChangeListener)) {
+        this->onDidChangeListener(*this, eventType, OnDidChangeListenerKind::Add);
+    }
     return true;
 }
 
@@ -146,6 +153,9 @@ bool EventTarget::removeEventListener(const AtomString& eventType, EventListener
         if (eventNames().isWheelEventType(eventType))
             invalidateEventListenerRegions();
 
+        if (UNLIKELY(this->onDidChangeListener)) {
+            this->onDidChangeListener(*this, eventType, OnDidChangeListenerKind::Remove);
+        }
         eventListenersDidChange();
         return true;
     }
@@ -161,7 +171,7 @@ void EventTarget::setAttributeEventListener(const AtomString& eventType, JSC::JS
         if (existingListener)
             removeEventListener(eventType, *existingListener, false);
     } else if (existingListener) {
-        bool capture = false;
+        // bool capture = false;
 
         // InspectorInstrumentation::willRemoveEventListener(*this, eventType, *existingListener, capture);
         existingListener->replaceJSFunctionForAttributeListener(asObject(listener), &jsEventTarget);
@@ -239,10 +249,12 @@ void EventTarget::dispatchEvent(Event& event)
     ASSERT(event.isInitialized());
     ASSERT(!event.isBeingDispatched());
 
+    EventPath eventPath(*this);
     event.setTarget(this);
     event.setCurrentTarget(this);
     event.setEventPhase(Event::AT_TARGET);
     event.resetBeforeDispatch();
+    event.setEventPath(eventPath);
     fireEventListeners(event, EventInvokePhase::Capturing);
     fireEventListeners(event, EventInvokePhase::Bubbling);
     event.resetAfterDispatch();
@@ -261,7 +273,6 @@ static const AtomString& legacyType(const Event& event)
 // https://dom.spec.whatwg.org/#concept-event-listener-invoke
 void EventTarget::fireEventListeners(Event& event, EventInvokePhase phase)
 {
-    ASSERT_WITH_SECURITY_IMPLICATION(ScriptDisallowedScope::isEventAllowedInMainThread());
     ASSERT(event.isInitialized());
 
     auto* data = eventTargetData();
@@ -377,6 +388,11 @@ void EventTarget::removeAllEventListeners()
         // if (data->eventListenerMap.contains(eventNames().wheelEvent) || data->eventListenerMap.contains(eventNames().mousewheelEvent))
         // invalidateEventListenerRegions();
 
+        if (UNLIKELY(this->onDidChangeListener)) {
+            for (auto& eventType : data->eventListenerMap.eventTypes()) {
+                this->onDidChangeListener(*this, eventType, OnDidChangeListenerKind::Clear);
+            }
+        }
         data->eventListenerMap.clear();
         eventListenersDidChange();
     }

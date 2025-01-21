@@ -1,12 +1,8 @@
-import { Main } from "./main";
-import classNames from "classnames";
 import ReactDOM from "react-dom";
+import { Main } from "./main";
 
-const Base = ({}) => {
-  const name =
-    typeof location !== "undefined"
-      ? decodeURIComponent(location.search.substring(1))
-      : null;
+const Base = () => {
+  const name = typeof location !== "undefined" ? decodeURIComponent(location.search.substring(1)) : null;
   return <Main productName={name} />;
 };
 

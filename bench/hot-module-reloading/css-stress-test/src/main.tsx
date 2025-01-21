@@ -1,11 +1,11 @@
-export const Main = ({ productName, cssInJS }) => {
+export const Main = (props: { productName: string; cssInJS?: string }) => {
   return (
     <>
       <header>
         <div className="Title">CSS HMR Stress Test!</div>
         <p className="Description">
-          This page visually tests how quickly a bundler can update{" "}
-          {cssInJS ? "CSS-in-JS" : "CSS"} over Hot Module Reloading.
+          This page visually tests how quickly a bundler can update {props.cssInJS ? "CSS-in-JS" : "CSS"} over Hot
+          Module Reloading.
         </p>
       </header>
       <main className="main">
@@ -19,9 +19,7 @@ export const Main = ({ productName, cssInJS }) => {
           <div className="ProgressBar-container">
             <div className="ProgressBar"></div>
           </div>
-          <div className="SectionLabel">
-            The progress bar should move from left to right smoothly.
-          </div>
+          <div className="SectionLabel">The progress bar should move from left to right smoothly.</div>
         </section>
 
         <section>
@@ -42,21 +40,15 @@ export const Main = ({ productName, cssInJS }) => {
               <div className="Spinner"></div>
             </div>
           </div>
-          <div className="SectionLabel">
-            The spinners should rotate &amp; change color smoothly.
-          </div>
+          <div className="SectionLabel">The spinners should rotate &amp; change color smoothly.</div>
         </section>
       </main>
       <footer>
-        <div className="SectionLabel FooterLabel">
-          There are no CSS animations on this page.
-        </div>
+        <div className="SectionLabel FooterLabel">There are no CSS animations on this page.</div>
 
         <div className="Bundler-container">
-          <div className="Bundler">{productName}</div>
-          <div className="Bundler-updateRate">
-            {cssInJS ? "CSS-in-JS framework: " + cssInJS : ""}
-          </div>
+          <div className="Bundler">{props.productName}</div>
+          <div className="Bundler-updateRate">{props.cssInJS ? "CSS-in-JS framework: " + props.cssInJS : ""}</div>
         </div>
       </footer>
     </>

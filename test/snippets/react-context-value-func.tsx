@@ -1,3 +1,4 @@
+// @ts-nocheck
 import React from "react";
 
 const Context = React.createContext({});
@@ -9,9 +10,9 @@ const ContextProvider = ({ children }) => {
   return <Context.Provider value={cb}>{children(foo)}</Context.Provider>;
 };
 
-const ContextValue = ({}) => (
+const ContextValue = () => (
   <Context.Consumer>
-    {(foo) => {
+    {foo => {
       if (foo) {
         return <div>Worked!</div>;
       }

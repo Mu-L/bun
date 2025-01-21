@@ -1,5 +1,5 @@
 const std = @import("std");
-const bun = @import("./global.zig");
+const bun = @import("root").bun;
 const string = bun.string;
 const Output = bun.Output;
 const Global = bun.Global;
@@ -11,88 +11,130 @@ const default_allocator = bun.default_allocator;
 const URL = @import("./url.zig").URL;
 const C = bun.C;
 const options = @import("./options.zig");
-const logger = @import("./logger.zig");
-const js_ast = @import("./js_ast.zig");
-const js_lexer = @import("./js_lexer.zig");
+const logger = bun.logger;
+const js_ast = bun.JSAst;
+const js_lexer = bun.js_lexer;
 const Defines = @import("./defines.zig");
 const ConditionsMap = @import("./resolver/package_json.zig").ESModule.ConditionsMap;
 const Api = @import("./api/schema.zig").Api;
 const Npm = @import("./install/npm.zig");
+const PackageManager = @import("./install/install.zig").PackageManager;
 const PackageJSON = @import("./resolver/package_json.zig").PackageJSON;
 const resolver = @import("./resolver/resolver.zig");
-pub const MacroImportReplacementMap = std.StringArrayHashMap(string);
-pub const MacroMap = std.StringArrayHashMapUnmanaged(MacroImportReplacementMap);
-pub const BundlePackageOverride = std.StringArrayHashMapUnmanaged(options.BundleOverride);
-const LoaderMap = std.StringArrayHashMapUnmanaged(options.Loader);
-const Analytics = @import("./analytics.zig");
-const JSONParser = @import("./json_parser.zig");
+const TestCommand = @import("./cli/test_command.zig").TestCommand;
+pub const MacroImportReplacementMap = bun.StringArrayHashMap(string);
+pub const MacroMap = bun.StringArrayHashMapUnmanaged(MacroImportReplacementMap);
+pub const BundlePackageOverride = bun.StringArrayHashMapUnmanaged(options.BundleOverride);
+const LoaderMap = bun.StringArrayHashMapUnmanaged(options.Loader);
+const JSONParser = bun.JSON;
 const Command = @import("cli.zig").Command;
 const TOML = @import("./toml/toml_parser.zig").TOML;
 
 // TODO: replace Api.TransformOptions with Bunfig
 pub const Bunfig = struct {
-    const Parser = struct {
+    pub const OfflineMode = enum {
+        online,
+        latest,
+        offline,
+    };
+    pub const Prefer = bun.ComptimeStringMap(OfflineMode, .{
+        &.{ "offline", OfflineMode.offline },
+        &.{ "latest", OfflineMode.latest },
+        &.{ "online", OfflineMode.online },
+    });
+
+    pub const Parser = struct {
         json: js_ast.Expr,
         source: *const logger.Source,
         log: *logger.Log,
         allocator: std.mem.Allocator,
         bunfig: *Api.TransformOptions,
-        ctx: *Command.Context,
+        ctx: Command.Context,
 
         fn addError(this: *Parser, loc: logger.Loc, comptime text: string) !void {
-            this.log.addError(this.source, loc, text) catch unreachable;
+            this.log.addErrorOpts(text, .{
+                .source = this.source,
+                .loc = loc,
+                .redact_sensitive_information = true,
+            }) catch unreachable;
             return error.@"Invalid Bunfig";
         }
 
-        fn parseRegistry(this: *Parser, expr: js_ast.Expr) !Api.NpmRegistry {
+        fn addErrorFormat(this: *Parser, loc: logger.Loc, allocator: std.mem.Allocator, comptime text: string, args: anytype) !void {
+            this.log.addErrorFmtOpts(allocator, text, args, .{
+                .source = this.source,
+                .loc = loc,
+                .redact_sensitive_information = true,
+            }) catch unreachable;
+            return error.@"Invalid Bunfig";
+        }
+
+        fn parseRegistryURLString(this: *Parser, str: *js_ast.E.String) !Api.NpmRegistry {
+            const url = URL.parse(str.data);
             var registry = std.mem.zeroes(Api.NpmRegistry);
 
-            switch (expr.data) {
-                .e_string => |str| {
-                    const url = URL.parse(str.data);
-                    // Token
-                    if (url.username.len == 0 and url.password.len > 0) {
-                        registry.token = url.password;
-                        registry.url = try std.fmt.allocPrint(this.allocator, "{s}://{s}/{s}", .{ url.displayProtocol(), url.displayHostname(), std.mem.trimLeft(u8, url.pathname, "/") });
-                    } else if (url.username.len > 0 and url.password.len > 0) {
-                        registry.username = url.username;
-                        registry.password = url.password;
-                        registry.url = try std.fmt.allocPrint(this.allocator, "{s}://{s}/{s}", .{ url.displayProtocol(), url.displayHostname(), std.mem.trimLeft(u8, url.pathname, "/") });
-                    } else {
-                        registry.url = url.href;
-                    }
-                },
-                .e_object => |obj| {
-                    if (obj.get("url")) |url| {
-                        try this.expect(url, .e_string);
-                        registry.url = url.data.e_string.data;
-                    }
+            // Token
+            if (url.username.len == 0 and url.password.len > 0) {
+                registry.token = url.password;
+                registry.url = try std.fmt.allocPrint(this.allocator, "{s}://{}/{s}/", .{ url.displayProtocol(), url.displayHost(), std.mem.trim(u8, url.pathname, "/") });
+            } else if (url.username.len > 0 and url.password.len > 0) {
+                registry.username = url.username;
+                registry.password = url.password;
 
-                    if (obj.get("username")) |username| {
-                        try this.expect(username, .e_string);
-                        registry.username = username.data.e_string.data;
-                    }
-
-                    if (obj.get("password")) |password| {
-                        try this.expect(password, .e_string);
-                        registry.password = password.data.e_string.data;
-                    }
-
-                    if (obj.get("token")) |token| {
-                        try this.expect(token, .e_string);
-                        registry.token = token.data.e_string.data;
-                    }
-                },
-                else => {
-                    try this.addError(expr.loc, "Expected registry to be a URL string or an object");
-                },
+                registry.url = try std.fmt.allocPrint(this.allocator, "{s}://{}/{s}/", .{ url.displayProtocol(), url.displayHost(), std.mem.trim(u8, url.pathname, "/") });
+            } else {
+                // Do not include a trailing slash. There might be parameters at the end.
+                registry.url = url.href;
             }
 
             return registry;
         }
 
+        fn parseRegistryObject(this: *Parser, obj: *js_ast.E.Object) !Api.NpmRegistry {
+            var registry = std.mem.zeroes(Api.NpmRegistry);
+
+            if (obj.get("url")) |url| {
+                try this.expectString(url);
+                const href = url.asString(this.allocator).?;
+                // Do not include a trailing slash. There might be parameters at the end.
+                registry.url = href;
+            }
+
+            if (obj.get("username")) |username| {
+                try this.expectString(username);
+                registry.username = username.asString(this.allocator).?;
+            }
+
+            if (obj.get("password")) |password| {
+                try this.expectString(password);
+                registry.password = password.asString(this.allocator).?;
+            }
+
+            if (obj.get("token")) |token| {
+                try this.expectString(token);
+                registry.token = token.asString(this.allocator).?;
+            }
+
+            return registry;
+        }
+
+        fn parseRegistry(this: *Parser, expr: js_ast.Expr) !Api.NpmRegistry {
+            switch (expr.data) {
+                .e_string => |str| {
+                    return this.parseRegistryURLString(str);
+                },
+                .e_object => |obj| {
+                    return this.parseRegistryObject(obj);
+                },
+                else => {
+                    try this.addError(expr.loc, "Expected registry to be a URL string or an object");
+                    return std.mem.zeroes(Api.NpmRegistry);
+                },
+            }
+        }
+
         fn loadLogLevel(this: *Parser, expr: js_ast.Expr) !void {
-            try this.expect(expr, .e_string);
+            try this.expectString(expr);
             const Matcher = strings.ExactSizeMatcher(8);
 
             this.bunfig.log_level = switch (Matcher.match(expr.asString(this.allocator).?)) {
@@ -107,7 +149,35 @@ pub const Bunfig = struct {
             };
         }
 
+        fn loadPreload(
+            this: *Parser,
+            allocator: std.mem.Allocator,
+            expr: js_ast.Expr,
+        ) !void {
+            if (expr.asArray()) |array_| {
+                var array = array_;
+                var preloads = try std.ArrayList(string).initCapacity(allocator, array.array.items.len);
+                errdefer preloads.deinit();
+                while (array.next()) |item| {
+                    try this.expectString(item);
+                    if (item.data.e_string.len() > 0)
+                        preloads.appendAssumeCapacity(try item.data.e_string.string(allocator));
+                }
+                this.ctx.preloads = preloads.items;
+            } else if (expr.data == .e_string) {
+                if (expr.data.e_string.len() > 0) {
+                    var preloads = try allocator.alloc(string, 1);
+                    preloads[0] = try expr.data.e_string.string(allocator);
+                    this.ctx.preloads = preloads;
+                }
+            } else if (expr.data != .e_null) {
+                try this.addError(expr.loc, "Expected preload to be an array");
+            }
+        }
+
         pub fn parse(this: *Parser, comptime cmd: Command.Tag) !void {
+            bun.analytics.Features.bunfig += 1;
+
             const json = this.json;
             var allocator = this.allocator;
 
@@ -144,7 +214,7 @@ pub const Bunfig = struct {
             }
 
             if (json.get("origin")) |expr| {
-                try this.expect(expr, .e_string);
+                try this.expectString(expr);
                 this.bunfig.origin = try expr.data.e_string.string(allocator);
             }
 
@@ -158,99 +228,269 @@ pub const Bunfig = struct {
                         }
                     }
                 }
+
+                if (json.get("preload")) |expr| {
+                    try this.loadPreload(allocator, expr);
+                }
+
+                if (json.get("telemetry")) |expr| {
+                    try this.expect(expr, .e_boolean);
+                    bun.analytics.enabled = if (expr.data.e_boolean.value) .yes else .no;
+                }
             }
 
-            if (comptime cmd == .DevCommand or cmd == .AutoCommand) {
-                if (json.get("dev")) |expr| {
-                    if (expr.get("disableBunJS")) |disable| {
-                        this.ctx.debug.fallback_only = disable.asBool() orelse false;
+            if (comptime cmd == .RunCommand or cmd == .AutoCommand) {
+                if (json.get("smol")) |expr| {
+                    try this.expect(expr, .e_boolean);
+                    this.ctx.runtime_options.smol = expr.data.e_boolean.value;
+                }
+            }
+
+            if (comptime cmd == .TestCommand) {
+                if (json.get("test")) |test_| {
+                    if (test_.get("root")) |root| {
+                        this.ctx.debug.test_directory = root.asString(this.allocator) orelse "";
                     }
 
-                    if (expr.get("logLevel")) |expr2| {
-                        try this.loadLogLevel(expr2);
+                    if (test_.get("preload")) |expr| {
+                        try this.loadPreload(allocator, expr);
                     }
 
-                    if (expr.get("port")) |port| {
-                        try this.expect(port, .e_number);
-                        this.bunfig.port = port.data.e_number.toU16();
-                        if (this.bunfig.port.? == 0) {
-                            this.bunfig.port = 3000;
+                    if (test_.get("smol")) |expr| {
+                        try this.expect(expr, .e_boolean);
+                        this.ctx.runtime_options.smol = expr.data.e_boolean.value;
+                    }
+
+                    if (test_.get("coverage")) |expr| {
+                        try this.expect(expr, .e_boolean);
+                        this.ctx.test_options.coverage.enabled = expr.data.e_boolean.value;
+                    }
+
+                    if (test_.get("reporter")) |expr| {
+                        try this.expect(expr, .e_object);
+                        if (expr.get("junit")) |junit_expr| {
+                            try this.expectString(junit_expr);
+                            if (junit_expr.data.e_string.len() > 0) {
+                                this.ctx.test_options.file_reporter = .junit;
+                                this.ctx.test_options.reporter_outfile = try junit_expr.data.e_string.string(allocator);
+                            }
                         }
+                    }
+
+                    if (test_.get("coverageReporter")) |expr| brk: {
+                        this.ctx.test_options.coverage.reporters = .{ .text = false, .lcov = false };
+                        if (expr.data == .e_string) {
+                            const item_str = expr.asString(bun.default_allocator) orelse "";
+                            if (bun.strings.eqlComptime(item_str, "text")) {
+                                this.ctx.test_options.coverage.reporters.text = true;
+                            } else if (bun.strings.eqlComptime(item_str, "lcov")) {
+                                this.ctx.test_options.coverage.reporters.lcov = true;
+                            } else {
+                                try this.addErrorFormat(expr.loc, allocator, "Invalid coverage reporter \"{s}\"", .{item_str});
+                            }
+
+                            break :brk;
+                        }
+
+                        try this.expect(expr, .e_array);
+                        const items = expr.data.e_array.items.slice();
+                        for (items) |item| {
+                            try this.expectString(item);
+                            const item_str = item.asString(bun.default_allocator) orelse "";
+                            if (bun.strings.eqlComptime(item_str, "text")) {
+                                this.ctx.test_options.coverage.reporters.text = true;
+                            } else if (bun.strings.eqlComptime(item_str, "lcov")) {
+                                this.ctx.test_options.coverage.reporters.lcov = true;
+                            } else {
+                                try this.addErrorFormat(item.loc, allocator, "Invalid coverage reporter \"{s}\"", .{item_str});
+                            }
+                        }
+                    }
+
+                    if (test_.get("coverageDir")) |expr| {
+                        try this.expectString(expr);
+                        this.ctx.test_options.coverage.reports_directory = try expr.data.e_string.string(allocator);
+                    }
+
+                    if (test_.get("coverageThreshold")) |expr| outer: {
+                        if (expr.data == .e_number) {
+                            this.ctx.test_options.coverage.fractions.functions = expr.data.e_number.value;
+                            this.ctx.test_options.coverage.fractions.lines = expr.data.e_number.value;
+                            this.ctx.test_options.coverage.fractions.stmts = expr.data.e_number.value;
+                            this.ctx.test_options.coverage.fail_on_low_coverage = true;
+                            break :outer;
+                        }
+
+                        try this.expect(expr, .e_object);
+                        if (expr.get("functions")) |functions| {
+                            try this.expect(functions, .e_number);
+                            this.ctx.test_options.coverage.fractions.functions = functions.data.e_number.value;
+                            this.ctx.test_options.coverage.fail_on_low_coverage = true;
+                        }
+
+                        if (expr.get("lines")) |lines| {
+                            try this.expect(lines, .e_number);
+                            this.ctx.test_options.coverage.fractions.lines = lines.data.e_number.value;
+                            this.ctx.test_options.coverage.fail_on_low_coverage = true;
+                        }
+
+                        if (expr.get("statements")) |stmts| {
+                            try this.expect(stmts, .e_number);
+                            this.ctx.test_options.coverage.fractions.stmts = stmts.data.e_number.value;
+                            this.ctx.test_options.coverage.fail_on_low_coverage = true;
+                        }
+                    }
+
+                    // This mostly exists for debugging.
+                    if (test_.get("coverageIgnoreSourcemaps")) |expr| {
+                        try this.expect(expr, .e_boolean);
+                        this.ctx.test_options.coverage.ignore_sourcemap = expr.data.e_boolean.value;
+                    }
+
+                    if (test_.get("coverageSkipTestFiles")) |expr| {
+                        try this.expect(expr, .e_boolean);
+                        this.ctx.test_options.coverage.skip_test_files = expr.data.e_boolean.value;
                     }
                 }
             }
 
-            if (comptime cmd.isNPMRelated()) {
-                if (json.get("install")) |_bun| {
+            if (comptime cmd.isNPMRelated() or cmd == .RunCommand or cmd == .AutoCommand) {
+                if (json.getObject("install")) |install_obj| {
                     var install: *Api.BunInstall = this.ctx.install orelse brk: {
-                        var install_ = try this.allocator.create(Api.BunInstall);
-                        install_.* = std.mem.zeroes(Api.BunInstall);
-                        this.ctx.install = install_;
-                        break :brk install_;
+                        const install = try this.allocator.create(Api.BunInstall);
+                        install.* = std.mem.zeroes(Api.BunInstall);
+                        this.ctx.install = install;
+                        break :brk install;
                     };
 
-                    if (_bun.get("registry")) |registry| {
+                    if (install_obj.get("auto")) |auto_install_expr| {
+                        if (auto_install_expr.data == .e_string) {
+                            this.ctx.debug.global_cache = options.GlobalCache.Map.get(auto_install_expr.asString(this.allocator) orelse "") orelse {
+                                try this.addError(auto_install_expr.loc, "Invalid auto install setting, must be one of true, false, or \"force\" \"fallback\" \"disable\"");
+                                return;
+                            };
+                        } else if (auto_install_expr.data == .e_boolean) {
+                            this.ctx.debug.global_cache = if (auto_install_expr.asBool().?)
+                                options.GlobalCache.allow_install
+                            else
+                                options.GlobalCache.disable;
+                        } else {
+                            try this.addError(auto_install_expr.loc, "Invalid auto install setting, must be one of true, false, or \"force\" \"fallback\" \"disable\"");
+                            return;
+                        }
+                    }
+
+                    if (install_obj.get("cafile")) |cafile| {
+                        install.cafile = try cafile.asStringCloned(allocator) orelse {
+                            try this.addError(cafile.loc, "Invalid cafile. Expected a string.");
+                            return;
+                        };
+                    }
+
+                    if (install_obj.get("ca")) |ca| {
+                        switch (ca.data) {
+                            .e_array => |arr| {
+                                var list = try allocator.alloc([]const u8, arr.items.len);
+                                for (arr.items.slice(), 0..) |item, i| {
+                                    list[i] = try item.asStringCloned(allocator) orelse {
+                                        try this.addError(item.loc, "Invalid CA. Expected a string.");
+                                        return;
+                                    };
+                                }
+                                install.ca = .{
+                                    .list = list,
+                                };
+                            },
+                            .e_string => |str| {
+                                install.ca = .{
+                                    .str = try str.stringCloned(allocator),
+                                };
+                            },
+                            else => {
+                                try this.addError(ca.loc, "Invalid CA. Expected a string or an array of strings.");
+                                return;
+                            },
+                        }
+                    }
+
+                    if (install_obj.get("exact")) |exact| {
+                        if (exact.asBool()) |value| {
+                            install.exact = value;
+                        }
+                    }
+
+                    if (install_obj.get("prefer")) |prefer_expr| {
+                        try this.expectString(prefer_expr);
+
+                        if (Prefer.get(prefer_expr.asString(bun.default_allocator) orelse "")) |setting| {
+                            this.ctx.debug.offline_mode_setting = setting;
+                        } else {
+                            try this.addError(prefer_expr.loc, "Invalid prefer setting, must be one of online or offline");
+                        }
+                    }
+
+                    if (install_obj.get("registry")) |registry| {
                         install.default_registry = try this.parseRegistry(registry);
                     }
 
-                    if (_bun.get("scopes")) |scopes| {
-                        var registry_map = install.scoped orelse std.mem.zeroes(Api.NpmRegistryMap);
+                    if (install_obj.get("scopes")) |scopes| {
+                        var registry_map = install.scoped orelse Api.NpmRegistryMap{};
                         try this.expect(scopes, .e_object);
-                        const count = scopes.data.e_object.properties.len + registry_map.registries.len;
-                        var registries = std.ArrayListUnmanaged(Api.NpmRegistry){
-                            .items = try this.allocator.alloc(Api.NpmRegistry, count),
-                            .capacity = count,
-                        };
-                        registries.appendSliceAssumeCapacity(registry_map.registries);
 
-                        var names = std.ArrayListUnmanaged(string){
-                            .items = try this.allocator.alloc(string, count),
-                            .capacity = count,
-                        };
-
-                        names.appendSliceAssumeCapacity(registry_map.scopes);
+                        try registry_map.scopes.ensureUnusedCapacity(this.allocator, scopes.data.e_object.properties.len);
 
                         for (scopes.data.e_object.properties.slice()) |prop| {
                             const name_ = prop.key.?.asString(this.allocator) orelse continue;
                             const value = prop.value orelse continue;
                             if (name_.len == 0) continue;
                             const name = if (name_[0] == '@') name_[1..] else name_;
-                            var index = names.items.len;
-                            for (names.items) |comparator, i| {
-                                if (strings.eql(name, comparator)) {
-                                    index = i;
-                                    break;
-                                }
-                            }
-
-                            if (index == names.items.len) {
-                                names.items.len += 1;
-                                registries.items.len += 1;
-                            }
-                            names.items[index] = name;
-                            registries.items[index] = try this.parseRegistry(value);
+                            const registry = try this.parseRegistry(value);
+                            try registry_map.scopes.put(this.allocator, name, registry);
                         }
 
-                        registry_map.registries = registries.items;
-                        registry_map.scopes = names.items;
                         install.scoped = registry_map;
                     }
 
-                    if (_bun.get("dryRun")) |dry_run| {
+                    if (install_obj.get("dryRun")) |dry_run| {
                         if (dry_run.asBool()) |value| {
                             install.dry_run = value;
                         }
                     }
 
-                    if (_bun.get("production")) |production| {
+                    if (install_obj.get("production")) |production| {
                         if (production.asBool()) |value| {
                             install.production = value;
                         }
                     }
 
-                    if (_bun.get("lockfile")) |lockfile_expr| {
+                    if (install_obj.get("frozenLockfile")) |frozen_lockfile| {
+                        if (frozen_lockfile.asBool()) |value| {
+                            install.frozen_lockfile = value;
+                        }
+                    }
+
+                    if (install_obj.get("saveTextLockfile")) |save_text_lockfile| {
+                        if (save_text_lockfile.asBool()) |value| {
+                            install.save_text_lockfile = value;
+                        }
+                    }
+
+                    if (install_obj.get("concurrentScripts")) |jobs| {
+                        if (jobs.data == .e_number) {
+                            install.concurrent_scripts = jobs.data.e_number.toU32();
+                            if (install.concurrent_scripts.? == 0) install.concurrent_scripts = null;
+                        }
+                    }
+
+                    if (install_obj.get("ignoreScripts")) |ignore_scripts_expr| {
+                        if (ignore_scripts_expr.asBool()) |ignore_scripts| {
+                            install.ignore_scripts = ignore_scripts;
+                        }
+                    }
+
+                    if (install_obj.get("lockfile")) |lockfile_expr| {
                         if (lockfile_expr.get("print")) |lockfile| {
-                            try this.expect(lockfile, .e_string);
+                            try this.expectString(lockfile);
                             if (lockfile.asString(this.allocator)) |value| {
                                 if (!(strings.eqlComptime(value, "bun"))) {
                                     if (!strings.eqlComptime(value, "yarn")) {
@@ -281,41 +521,41 @@ pub const Bunfig = struct {
                         }
                     }
 
-                    if (_bun.get("optional")) |optional| {
+                    if (install_obj.get("optional")) |optional| {
                         if (optional.asBool()) |value| {
                             install.save_optional = value;
                         }
                     }
 
-                    if (_bun.get("peer")) |optional| {
+                    if (install_obj.get("peer")) |optional| {
                         if (optional.asBool()) |value| {
                             install.save_peer = value;
                         }
                     }
 
-                    if (_bun.get("dev")) |optional| {
+                    if (install_obj.get("dev")) |optional| {
                         if (optional.asBool()) |value| {
                             install.save_dev = value;
                         }
                     }
 
-                    if (_bun.get("globalDir")) |dir| {
+                    if (install_obj.get("globalDir")) |dir| {
                         if (dir.asString(allocator)) |value| {
                             install.global_dir = value;
                         }
                     }
 
-                    if (_bun.get("globalBinDir")) |dir| {
+                    if (install_obj.get("globalBinDir")) |dir| {
                         if (dir.asString(allocator)) |value| {
                             install.global_bin_dir = value;
                         }
                     }
 
-                    if (_bun.get("logLevel")) |expr| {
+                    if (install_obj.get("logLevel")) |expr| {
                         try this.loadLogLevel(expr);
                     }
 
-                    if (_bun.get("cache")) |cache| {
+                    if (install_obj.get("cache")) |cache| {
                         load: {
                             if (cache.asBool()) |value| {
                                 if (!value) {
@@ -353,22 +593,84 @@ pub const Bunfig = struct {
                         }
                     }
                 }
+
+                if (json.get("run")) |run_expr| {
+                    if (run_expr.get("silent")) |silent| {
+                        if (silent.asBool()) |value| {
+                            this.ctx.debug.silent = value;
+                        } else {
+                            try this.addError(silent.loc, "Expected boolean");
+                        }
+                    }
+
+                    if (run_expr.get("elide-lines")) |elide_lines| {
+                        if (elide_lines.data == .e_number) {
+                            this.ctx.bundler_options.elide_lines = @intFromFloat(elide_lines.data.e_number.value);
+                        } else {
+                            try this.addError(elide_lines.loc, "Expected number");
+                        }
+                    }
+
+                    if (run_expr.get("shell")) |shell| {
+                        if (shell.asString(allocator)) |value| {
+                            if (strings.eqlComptime(value, "bun")) {
+                                this.ctx.debug.use_system_shell = false;
+                            } else if (strings.eqlComptime(value, "system")) {
+                                this.ctx.debug.use_system_shell = true;
+                            } else {
+                                try this.addError(shell.loc, "Invalid shell, only 'bun' and 'system' are supported");
+                            }
+                        } else {
+                            try this.addError(shell.loc, "Expected string");
+                        }
+                    }
+
+                    if (run_expr.get("bun")) |bun_flag| {
+                        if (bun_flag.asBool()) |value| {
+                            this.ctx.debug.run_in_bun = value;
+                        } else {
+                            try this.addError(bun_flag.loc, "Expected boolean");
+                        }
+                    }
+                }
+            }
+
+            if (json.getObject("serve")) |serve_obj2| {
+                if (serve_obj2.getObject("static")) |serve_obj| {
+                    if (serve_obj.get("plugins")) |config_plugins| {
+                        const plugins: ?[]const []const u8 = plugins: {
+                            if (config_plugins.data == .e_array) {
+                                const raw_plugins = config_plugins.data.e_array.items.slice();
+                                if (raw_plugins.len == 0) break :plugins null;
+                                const plugins = try this.allocator.alloc(string, raw_plugins.len);
+                                for (raw_plugins, 0..) |p, i| {
+                                    try this.expectString(p);
+                                    plugins[i] = try p.data.e_string.string(allocator);
+                                }
+                                break :plugins plugins;
+                            } else {
+                                const p = try config_plugins.data.e_string.string(allocator);
+                                const plugins = try this.allocator.alloc(string, 1);
+                                plugins[0] = p;
+                                break :plugins plugins;
+                            }
+                        };
+
+                        this.bunfig.serve_plugins = plugins;
+                        this.bunfig.bunfig_path = bun.default_allocator.dupe(u8, this.source.path.text) catch bun.outOfMemory();
+                    }
+                }
             }
 
             if (json.get("bundle")) |_bun| {
-                if (comptime cmd == .DevCommand or cmd == .BuildCommand or cmd == .RunCommand or cmd == .AutoCommand or cmd == .BunCommand) {
-                    if (_bun.get("saveTo")) |file| {
-                        try this.expect(file, .e_string);
-                        this.bunfig.node_modules_bundle_path = try file.data.e_string.string(allocator);
-                    }
-
+                if (comptime cmd == .BuildCommand or cmd == .RunCommand or cmd == .AutoCommand or cmd == .BuildCommand) {
                     if (_bun.get("outdir")) |dir| {
-                        try this.expect(dir, .e_string);
+                        try this.expectString(dir);
                         this.bunfig.output_dir = try dir.data.e_string.string(allocator);
                     }
                 }
 
-                if (comptime cmd == .BunCommand) {
+                if (comptime cmd == .BuildCommand) {
                     if (_bun.get("logLevel")) |expr2| {
                         try this.loadLogLevel(expr2);
                     }
@@ -377,8 +679,8 @@ pub const Bunfig = struct {
                         try this.expect(entryPoints, .e_array);
                         const items = entryPoints.data.e_array.items.slice();
                         var names = try this.allocator.alloc(string, items.len);
-                        for (items) |item, i| {
-                            try this.expect(item, .e_string);
+                        for (items, 0..) |item, i| {
+                            try this.expectString(item);
                             names[i] = try item.data.e_string.string(allocator);
                         }
                         this.bunfig.entry_points = names;
@@ -387,7 +689,6 @@ pub const Bunfig = struct {
                     if (_bun.get("packages")) |expr| {
                         try this.expect(expr, .e_object);
                         var valid_count: usize = 0;
-                        Analytics.Features.always_bundle = true;
 
                         const object = expr.data.e_object;
                         const properties = object.properties.slice();
@@ -460,9 +761,9 @@ pub const Bunfig = struct {
 
             if (this.bunfig.jsx == null) {
                 this.bunfig.jsx = Api.Jsx{
-                    .factory = bun.constStrToU8(jsx_factory),
-                    .fragment = bun.constStrToU8(jsx_fragment),
-                    .import_source = bun.constStrToU8(jsx_import_source),
+                    .factory = @constCast(jsx_factory),
+                    .fragment = @constCast(jsx_fragment),
+                    .import_source = @constCast(jsx_import_source),
                     .runtime = jsx_runtime,
                     .development = jsx_dev,
                     .react_fast_refresh = false,
@@ -470,30 +771,16 @@ pub const Bunfig = struct {
             } else {
                 var jsx: *Api.Jsx = &this.bunfig.jsx.?;
                 if (jsx_factory.len > 0) {
-                    jsx.factory = bun.constStrToU8(jsx_factory);
+                    jsx.factory = jsx_factory;
                 }
                 if (jsx_fragment.len > 0) {
-                    jsx.fragment = bun.constStrToU8(jsx_fragment);
+                    jsx.fragment = jsx_fragment;
                 }
                 if (jsx_import_source.len > 0) {
-                    jsx.import_source = bun.constStrToU8(jsx_import_source);
+                    jsx.import_source = jsx_import_source;
                 }
                 jsx.runtime = jsx_runtime;
                 jsx.development = jsx_dev;
-            }
-
-            switch (comptime cmd) {
-                .AutoCommand, .DevCommand, .BuildCommand, .BunCommand => {
-                    if (json.get("publicDir")) |public_dir| {
-                        try this.expect(public_dir, .e_string);
-                        this.bunfig.router = Api.RouteConfig{
-                            .extensions = &.{},
-                            .dir = &.{},
-                            .static_dir = try public_dir.data.e_string.string(allocator),
-                        };
-                    }
-                },
-                else => {},
             }
 
             if (json.get("debug")) |expr| {
@@ -505,9 +792,14 @@ pub const Bunfig = struct {
             }
 
             if (json.get("macros")) |expr| {
-                // technical debt
-                this.ctx.debug.macros = PackageJSON.parseMacrosJSON(allocator, expr, this.log, this.source);
-                Analytics.Features.macros = true;
+                if (expr.data == .e_boolean) {
+                    if (expr.data.e_boolean.value == false) {
+                        this.ctx.debug.macros = .{ .disable = {} };
+                    }
+                } else {
+                    this.ctx.debug.macros = .{ .map = PackageJSON.parseMacrosJSON(allocator, expr, this.log, this.source) };
+                }
+                bun.analytics.Features.macros += 1;
             }
 
             if (json.get("external")) |expr| {
@@ -520,8 +812,8 @@ pub const Bunfig = struct {
                     .e_array => |array| {
                         var externals = try allocator.alloc(string, array.items.len);
 
-                        for (array.items.slice()) |item, i| {
-                            try this.expect(item, .e_string);
+                        for (array.items.slice(), 0..) |item, i| {
+                            try this.expectString(item);
                             externals[i] = try item.data.e_string.string(allocator);
                         }
 
@@ -531,27 +823,20 @@ pub const Bunfig = struct {
                 }
             }
 
-            if (json.get("framework")) |expr| {
-                try this.expect(expr, .e_string);
-                this.bunfig.framework = Api.FrameworkConfig{
-                    .package = expr.asString(allocator).?,
-                };
-            }
-
             if (json.get("loader")) |expr| {
                 try this.expect(expr, .e_object);
                 const properties = expr.data.e_object.properties.slice();
                 var loader_names = try this.allocator.alloc(string, properties.len);
                 var loader_values = try this.allocator.alloc(Api.Loader, properties.len);
 
-                for (properties) |item, i| {
-                    var key = item.key.?.asString(allocator).?;
+                for (properties, 0..) |item, i| {
+                    const key = item.key.?.asString(allocator).?;
                     if (key.len == 0) continue;
                     if (key[0] != '.') {
-                        try this.addError(item.key.?.loc, "file extension must start with a dot");
+                        try this.addError(item.key.?.loc, "file extension for loader must start with a '.'");
                     }
                     var value = item.value.?;
-                    try this.expect(value, .e_string);
+                    try this.expectString(value);
 
                     const loader = options.Loader.fromString(value.asString(allocator).?) orelse {
                         try this.addError(value.loc, "Invalid loader");
@@ -566,32 +851,66 @@ pub const Bunfig = struct {
                     .loaders = loader_values,
                 };
             }
+        }
 
-            Analytics.Features.bunfig = true;
+        pub fn expectString(this: *Parser, expr: js_ast.Expr) !void {
+            switch (expr.data) {
+                .e_string => {},
+                else => {
+                    this.log.addErrorFmtOpts(
+                        this.allocator,
+                        "expected string but received {}",
+                        .{
+                            @as(js_ast.Expr.Tag, expr.data),
+                        },
+                        .{
+                            .source = this.source,
+                            .loc = expr.loc,
+                            .redact_sensitive_information = true,
+                        },
+                    ) catch unreachable;
+                    return error.@"Invalid Bunfig";
+                },
+            }
         }
 
         pub fn expect(this: *Parser, expr: js_ast.Expr, token: js_ast.Expr.Tag) !void {
             if (@as(js_ast.Expr.Tag, expr.data) != token) {
-                this.log.addErrorFmt(this.source, expr.loc, this.allocator, "expected {} but received {}", .{
-                    token,
-                    @as(js_ast.Expr.Tag, expr.data),
-                }) catch unreachable;
+                this.log.addErrorFmtOpts(
+                    this.allocator,
+                    "expected {} but received {}",
+                    .{
+                        token,
+                        @as(js_ast.Expr.Tag, expr.data),
+                    },
+                    .{
+                        .source = this.source,
+                        .loc = expr.loc,
+                        .redact_sensitive_information = true,
+                    },
+                ) catch unreachable;
                 return error.@"Invalid Bunfig";
             }
         }
     };
 
-    pub fn parse(allocator: std.mem.Allocator, source: logger.Source, ctx: *Command.Context, comptime cmd: Command.Tag) !void {
+    pub fn parse(allocator: std.mem.Allocator, source: logger.Source, ctx: Command.Context, comptime cmd: Command.Tag) !void {
         const log_count = ctx.log.errors + ctx.log.warnings;
 
-        var expr = if (strings.eqlComptime(source.path.name.ext[1..], "toml")) TOML.parse(&source, ctx.log, allocator) catch |err| {
+        const expr = if (strings.eqlComptime(source.path.name.ext[1..], "toml")) TOML.parse(&source, ctx.log, allocator, true) catch |err| {
             if (ctx.log.errors + ctx.log.warnings == log_count) {
-                ctx.log.addErrorFmt(&source, logger.Loc.Empty, allocator, "Failed to parse", .{}) catch unreachable;
+                try ctx.log.addErrorOpts("Failed to parse", .{
+                    .source = &source,
+                    .redact_sensitive_information = true,
+                });
             }
             return err;
-        } else JSONParser.ParseTSConfig(&source, ctx.log, allocator) catch |err| {
+        } else JSONParser.parseTSConfig(&source, ctx.log, allocator, true) catch |err| {
             if (ctx.log.errors + ctx.log.warnings == log_count) {
-                ctx.log.addErrorFmt(&source, logger.Loc.Empty, allocator, "Failed to parse", .{}) catch unreachable;
+                try ctx.log.addErrorOpts("Failed to parse", .{
+                    .source = &source,
+                    .redact_sensitive_information = true,
+                });
             }
             return err;
         };

@@ -1,4 +1,4 @@
-const bun = @import("../global.zig");
+const bun = @import("root").bun;
 const string = bun.string;
 const Output = bun.Output;
 const Global = bun.Global;
@@ -13,21 +13,41 @@ const Api = @import("../api/schema.zig").Api;
 const std = @import("std");
 const options = @import("../options.zig");
 const cache = @import("../cache.zig");
-const logger = @import("../logger.zig");
-const js_ast = @import("../js_ast.zig");
+const logger = bun.logger;
+const js_ast = bun.JSAst;
 
 const fs = @import("../fs.zig");
 const resolver = @import("./resolver.zig");
-const js_lexer = @import("../js_lexer.zig");
+const js_lexer = bun.js_lexer;
 const resolve_path = @import("./resolve_path.zig");
 // Assume they're not going to have hundreds of main fields or browser map
 // so use an array-backed hash table instead of bucketed
-const MainFieldMap = std.StringArrayHashMap(string);
-pub const BrowserMap = std.StringArrayHashMap(string);
-pub const MacroImportReplacementMap = std.StringArrayHashMap(string);
-pub const MacroMap = std.StringArrayHashMapUnmanaged(MacroImportReplacementMap);
+const MainFieldMap = bun.StringMap;
+pub const BrowserMap = bun.StringMap;
+pub const MacroImportReplacementMap = bun.StringArrayHashMap(string);
+pub const MacroMap = bun.StringArrayHashMapUnmanaged(MacroImportReplacementMap);
 
-const ScriptsMap = std.StringArrayHashMap(string);
+const ScriptsMap = bun.StringArrayHashMap(string);
+const Semver = @import("../install/semver.zig");
+const Dependency = @import("../install/dependency.zig");
+const String = @import("../install/semver.zig").String;
+const Version = Semver.Version;
+const Install = @import("../install/install.zig");
+const FolderResolver = @import("../install/resolvers/folder_resolver.zig");
+
+const Architecture = @import("../install/npm.zig").Architecture;
+const OperatingSystem = @import("../install/npm.zig").OperatingSystem;
+pub const DependencyMap = struct {
+    map: HashMap = .{},
+    source_buf: []const u8 = "",
+
+    pub const HashMap = std.ArrayHashMapUnmanaged(
+        String,
+        Dependency,
+        String.ArrayHashContext,
+        false,
+    );
+};
 
 pub const PackageJSON = struct {
     pub const LoadFramework = enum {
@@ -36,22 +56,25 @@ pub const PackageJSON = struct {
         production,
     };
 
+    pub usingnamespace bun.New(@This());
+
     pub fn generateHash(package_json: *PackageJSON) void {
         var hashy: [1024]u8 = undefined;
-        std.mem.set(u8, &hashy, 0);
+        @memset(&hashy, 0);
         var used: usize = 0;
-        std.mem.copy(u8, &hashy, package_json.name);
+        bun.copy(u8, &hashy, package_json.name);
         used = package_json.name.len;
 
         hashy[used] = '@';
         used += 1;
-        std.mem.copy(u8, hashy[used..], package_json.version);
+        bun.copy(u8, hashy[used..], package_json.version);
         used += package_json.version.len;
 
         package_json.hash = std.hash.Murmur3_32.hash(hashy[0..used]);
     }
 
     const node_modules_path = std.fs.path.sep_str ++ "node_modules" ++ std.fs.path.sep_str;
+
     pub fn nameForImport(this: *const PackageJSON, allocator: std.mem.Allocator) !string {
         if (strings.indexOf(this.source.path.text, node_modules_path)) |_| {
             return this.name;
@@ -60,9 +83,8 @@ pub const PackageJSON = struct {
             if (strings.indexOf(parent, fs.FileSystem.instance.top_level_dir)) |i| {
                 const relative_dir = parent[i + fs.FileSystem.instance.top_level_dir.len ..];
                 var out_dir = try allocator.alloc(u8, relative_dir.len + 2);
-                std.mem.copy(u8, out_dir[2..], relative_dir);
-                out_dir[0] = '.';
-                out_dir[1] = '/';
+                bun.copy(u8, out_dir[2..], relative_dir);
+                out_dir[0..2].* = ("." ++ std.fs.path.sep_str).*;
                 return out_dir;
             }
 
@@ -84,6 +106,15 @@ pub const PackageJSON = struct {
     hash: u32 = 0xDEADBEEF,
 
     scripts: ?*ScriptsMap = null,
+    config: ?*bun.StringArrayHashMap(string) = null,
+
+    arch: Architecture = Architecture.all,
+    os: OperatingSystem = OperatingSystem.all,
+
+    package_manager_package_id: Install.PackageID = Install.invalid_package_id,
+    dependencies: DependencyMap = .{},
+
+    side_effects: SideEffects = .unspecified,
 
     // Present if the "browser" field is present. This field is intended to be
     // used by bundlers and lets you redirect the paths of certain 3rd-party
@@ -113,6 +144,34 @@ pub const PackageJSON = struct {
     browser_map: BrowserMap,
 
     exports: ?ExportsMap = null,
+    imports: ?ExportsMap = null,
+
+    pub const SideEffects = union(enum) {
+        /// either `package.json` is missing "sideEffects", it is true, or some
+        /// other unsupported value. Treat all files as side effects
+        unspecified,
+        /// "sideEffects": false
+        false,
+        /// "sideEffects": ["file.js", "other.js"]
+        map: Map,
+        // /// "sideEffects": ["side_effects/*.js"]
+        // glob: TODO,
+
+        pub const Map = std.HashMapUnmanaged(
+            bun.StringHashMapUnowned.Key,
+            void,
+            bun.StringHashMapUnowned.Adapter,
+            80,
+        );
+
+        pub fn hasSideEffects(side_effects: SideEffects, path: []const u8) bool {
+            return switch (side_effects) {
+                .unspecified => true,
+                .false => false,
+                .map => |map| map.contains(bun.StringHashMapUnowned.Key.init(path)),
+            };
+        }
+    };
 
     pub inline fn isAppPackage(this: *const PackageJSON) bool {
         return this.hash == 0xDEADBEEF;
@@ -356,7 +415,7 @@ pub const PackageJSON = struct {
                             var count: usize = 0;
                             const items = array.items.slice();
                             for (items) |item| {
-                                count += @boolToInt(item.data == .e_string and item.data.e_string.data.len > 0);
+                                count += @intFromBool(item.data == .e_string and item.data.e_string.data.len > 0);
                             }
                             switch (count) {
                                 0 => {},
@@ -392,7 +451,8 @@ pub const PackageJSON = struct {
                 }
 
                 if (router.expr.asProperty("extensions")) |extensions_expr| {
-                    if (extensions_expr.expr.asArray()) |*array| {
+                    if (extensions_expr.expr.asArray()) |array_const| {
+                        var array = array_const;
                         var valid_count: usize = 0;
 
                         while (array.next()) |expr| {
@@ -459,7 +519,7 @@ pub const PackageJSON = struct {
                     }
                 }
             },
-            else => unreachable,
+            else => @compileError("unreachable"),
         }
 
         if (loadFrameworkExpression(pair.framework, framework_object.expr, allocator, read_defines)) {
@@ -537,20 +597,28 @@ pub const PackageJSON = struct {
     }
 
     pub fn parse(
-        comptime ResolverType: type,
-        r: *ResolverType,
+        r: *resolver.Resolver,
         input_path: string,
         dirname_fd: StoredFileDescriptorType,
-        comptime generate_hash: bool,
-        comptime include_scripts: bool,
+        package_id: ?Install.PackageID,
+        comptime include_scripts_: enum { ignore_scripts, include_scripts },
+        comptime include_dependencies: enum { main, local, none },
+        comptime generate_hash_: enum { generate_hash, no_hash },
     ) ?PackageJSON {
+        const generate_hash = generate_hash_ == .generate_hash;
+        const include_scripts = include_scripts_ == .include_scripts;
 
         // TODO: remove this extra copy
         const parts = [_]string{ input_path, "package.json" };
         const package_json_path_ = r.fs.abs(&parts);
         const package_json_path = r.fs.dirname_store.append(@TypeOf(package_json_path_), package_json_path_) catch unreachable;
 
-        const entry = r.caches.fs.readFile(
+        // DirInfo cache is reused globally
+        // So we cannot free these
+        const allocator = bun.fs_allocator;
+
+        var entry = r.caches.fs.readFileWithAllocator(
+            allocator,
             r.fs,
             package_json_path,
             dirname_fd,
@@ -558,14 +626,15 @@ pub const PackageJSON = struct {
             null,
         ) catch |err| {
             if (err != error.IsDir) {
-                r.log.addErrorFmt(null, logger.Loc.Empty, r.allocator, "Cannot read file \"{s}\": {s}", .{ r.prettyPath(fs.Path.init(input_path)), @errorName(err) }) catch unreachable;
+                r.log.addErrorFmt(null, logger.Loc.Empty, allocator, "Cannot read file \"{s}\": {s}", .{ r.prettyPath(fs.Path.init(input_path)), @errorName(err) }) catch unreachable;
             }
 
             return null;
         };
+        defer _ = entry.closeFD();
 
         if (r.debug_logs) |*debug| {
-            debug.addNoteFmt("The file \"{s}\" exists", .{package_json_path}) catch unreachable;
+            debug.addNoteFmt("The file \"{s}\" exists", .{package_json_path});
         }
 
         const key_path = fs.Path.init(package_json_path);
@@ -573,12 +642,19 @@ pub const PackageJSON = struct {
         var json_source = logger.Source.initPathString(key_path.text, entry.contents);
         json_source.path.pretty = r.prettyPath(json_source.path);
 
-        const json: js_ast.Expr = (r.caches.json.parseJSON(r.log, json_source, r.allocator) catch |err| {
+        const json: js_ast.Expr = (r.caches.json.parsePackageJSON(r.log, json_source, allocator, true) catch |err| {
             if (Environment.isDebug) {
                 Output.printError("{s}: JSON parse error: {s}", .{ package_json_path, @errorName(err) });
             }
             return null;
         } orelse return null);
+
+        if (json.data != .e_object) {
+            // Invalid package.json in node_modules is noisy.
+            // Let's just ignore it.
+            allocator.free(entry.contents);
+            return null;
+        }
 
         var package_json = PackageJSON{
             .name = "",
@@ -586,8 +662,8 @@ pub const PackageJSON = struct {
             .hash = 0xDEADBEEF,
             .source = json_source,
             .module_type = .unknown,
-            .browser_map = BrowserMap.init(r.allocator),
-            .main_fields = MainFieldMap.init(r.allocator),
+            .browser_map = BrowserMap.init(allocator, false),
+            .main_fields = MainFieldMap.init(allocator, false),
         };
 
         // Note: we tried rewriting this to be fewer loops over all the properties (asProperty loops over each)
@@ -596,23 +672,23 @@ pub const PackageJSON = struct {
         // Feels like a codegen issue.
         // or that looping over every property doesn't really matter because most package.jsons are < 20 properties
         if (json.asProperty("version")) |version_json| {
-            if (version_json.expr.asString(r.allocator)) |version_str| {
+            if (version_json.expr.asString(allocator)) |version_str| {
                 if (version_str.len > 0) {
-                    package_json.version = r.allocator.dupe(u8, version_str) catch unreachable;
+                    package_json.version = allocator.dupe(u8, version_str) catch unreachable;
                 }
             }
         }
 
         if (json.asProperty("name")) |version_json| {
-            if (version_json.expr.asString(r.allocator)) |version_str| {
+            if (version_json.expr.asString(allocator)) |version_str| {
                 if (version_str.len > 0) {
-                    package_json.name = r.allocator.dupe(u8, version_str) catch unreachable;
+                    package_json.name = allocator.dupe(u8, version_str) catch unreachable;
                 }
             }
         }
 
         if (json.asProperty("type")) |type_json| {
-            if (type_json.expr.asString(r.allocator)) |type_str| {
+            if (type_json.expr.asString(allocator)) |type_str| {
                 switch (options.ModuleType.List.get(type_str) orelse options.ModuleType.unknown) {
                     .cjs => {
                         package_json.module_type = .cjs;
@@ -624,7 +700,7 @@ pub const PackageJSON = struct {
                         r.log.addRangeWarningFmt(
                             &json_source,
                             json_source.rangeOfString(type_json.loc),
-                            r.allocator,
+                            allocator,
                             "\"{s}\" is not a valid value for \"type\" field (must be either \"commonjs\" or \"module\")",
                             .{type_str},
                         ) catch unreachable;
@@ -640,16 +716,16 @@ pub const PackageJSON = struct {
             if (json.asProperty(main)) |main_json| {
                 const expr: js_ast.Expr = main_json.expr;
 
-                if ((expr.asString(r.allocator))) |str| {
+                if ((expr.asString(allocator))) |str| {
                     if (str.len > 0) {
-                        package_json.main_fields.put(main, r.allocator.dupe(u8, str) catch unreachable) catch unreachable;
+                        package_json.main_fields.put(main, str) catch unreachable;
                     }
                 }
             }
         }
 
         // Read the "browser" property, but only when targeting the browser
-        if (r.opts.platform.supportsBrowserField()) {
+        if (r.opts.target == .browser) {
             // We both want the ability to have the option of CJS vs. ESM and the
             // option of having node vs. browser. The way to do this is to use the
             // object literal form of the "browser" field like this:
@@ -668,7 +744,7 @@ pub const PackageJSON = struct {
 
                         // Remap all files in the browser field
                         for (obj.properties.slice()) |*prop| {
-                            var _key_str = (prop.key orelse continue).asString(r.allocator) orelse continue;
+                            const _key_str = (prop.key orelse continue).asString(allocator) orelse continue;
                             const value: js_ast.Expr = prop.value orelse continue;
 
                             // Normalize the path so we can compare against it without getting
@@ -680,12 +756,12 @@ pub const PackageJSON = struct {
                             // import of "foo", but that's actually not a bug. Or arguably it's a
                             // bug in Browserify but we have to replicate this bug because packages
                             // do this in the wild.
-                            const key = r.allocator.dupe(u8, r.fs.normalize(_key_str)) catch unreachable;
+                            const key = allocator.dupe(u8, r.fs.normalize(_key_str)) catch unreachable;
 
                             switch (value.data) {
                                 .e_string => |str| {
                                     // If this is a string, it's a replacement package
-                                    package_json.browser_map.put(key, str.string(r.allocator) catch unreachable) catch unreachable;
+                                    package_json.browser_map.put(key, str.string(allocator) catch unreachable) catch unreachable;
                                 },
                                 .e_boolean => |boolean| {
                                     if (!boolean.value) {
@@ -704,47 +780,236 @@ pub const PackageJSON = struct {
         }
 
         if (json.asProperty("exports")) |exports_prop| {
-            if (ExportsMap.parse(r.allocator, &json_source, r.log, exports_prop.expr)) |exports_map| {
+            if (ExportsMap.parse(bun.default_allocator, &json_source, r.log, exports_prop.expr, exports_prop.loc)) |exports_map| {
                 package_json.exports = exports_map;
             }
         }
 
-        // used by `bun run`
-        if (include_scripts) {
-            read_scripts: {
-                if (json.asProperty("scripts")) |scripts_prop| {
-                    if (scripts_prop.expr.data == .e_object) {
-                        const scripts_obj = scripts_prop.expr.data.e_object;
+        if (json.asProperty("imports")) |imports_prop| {
+            if (ExportsMap.parse(bun.default_allocator, &json_source, r.log, imports_prop.expr, imports_prop.loc)) |imports_map| {
+                package_json.imports = imports_map;
+            }
+        }
 
-                        var count: usize = 0;
-                        for (scripts_obj.properties.slice()) |prop| {
-                            const key = prop.key.?.asString(r.allocator) orelse continue;
-                            const value = prop.value.?.asString(r.allocator) orelse continue;
+        if (json.get("sideEffects")) |side_effects_field| outer: {
+            if (side_effects_field.asBool()) |boolean| {
+                if (!boolean)
+                    package_json.side_effects = .{ .false = {} };
+            } else if (side_effects_field.asArray()) |array_| {
+                var array = array_;
+                // TODO: switch to only storing hashes
+                var map = SideEffects.Map{};
+                map.ensureTotalCapacity(allocator, array.array.items.len) catch unreachable;
+                while (array.next()) |item| {
+                    if (item.asString(allocator)) |name| {
+                        // TODO: support RegExp using JavaScriptCore <> C++ bindings
+                        if (strings.containsChar(name, '*')) {
+                            // https://sourcegraph.com/search?q=context:global+file:package.json+sideEffects%22:+%5B&patternType=standard&sm=1&groupBy=repo
+                            // a lot of these seem to be css files which we don't care about for now anyway
+                            // so we can just skip them in here
+                            if (strings.eqlComptime(std.fs.path.extension(name), ".css"))
+                                continue;
 
-                            count += @as(usize, @boolToInt(key.len > 0 and value.len > 0));
+                            r.log.addWarning(
+                                &json_source,
+                                item.loc,
+                                "wildcard sideEffects are not supported yet, which means this package will be deoptimized",
+                            ) catch unreachable;
+                            map.deinit(allocator);
+
+                            package_json.side_effects = .{ .unspecified = {} };
+                            break :outer;
                         }
 
-                        if (count == 0) break :read_scripts;
-                        var scripts = ScriptsMap.init(r.allocator);
-                        scripts.ensureUnusedCapacity(count) catch break :read_scripts;
+                        var joined = [_]string{
+                            json_source.path.name.dirWithTrailingSlash(),
+                            name,
+                        };
 
-                        for (scripts_obj.properties.slice()) |prop| {
-                            const key = prop.key.?.asString(r.allocator) orelse continue;
-                            const value = prop.value.?.asString(r.allocator) orelse continue;
+                        _ = map.getOrPutAssumeCapacity(
+                            bun.StringHashMapUnowned.Key.init(r.fs.join(&joined)),
+                        );
+                    }
+                }
+                package_json.side_effects = .{ .map = map };
+            }
+        }
 
-                            if (!(key.len > 0 and value.len > 0)) continue;
+        if (comptime include_dependencies == .main or include_dependencies == .local) {
+            update_dependencies: {
+                if (package_id) |pkg| {
+                    package_json.package_manager_package_id = pkg;
+                    break :update_dependencies;
+                }
 
-                            scripts.putAssumeCapacity(key, value);
+                // // if there is a name & version, check if the lockfile has the package
+                if (package_json.name.len > 0 and package_json.version.len > 0) {
+                    if (r.package_manager) |pm| {
+                        const tag = Dependency.Version.Tag.infer(package_json.version);
+
+                        if (tag == .npm) {
+                            const sliced = Semver.SlicedString.init(package_json.version, package_json.version);
+                            if (Dependency.parseWithTag(
+                                allocator,
+                                String.init(package_json.name, package_json.name),
+                                String.Builder.stringHash(package_json.name),
+                                package_json.version,
+                                .npm,
+                                &sliced,
+                                r.log,
+                                pm,
+                            )) |dependency_version| {
+                                if (dependency_version.value.npm.version.isExact()) {
+                                    if (pm.lockfile.resolvePackageFromNameAndVersion(package_json.name, dependency_version)) |resolved| {
+                                        package_json.package_manager_package_id = resolved;
+                                        if (resolved > 0) {
+                                            break :update_dependencies;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (json.get("cpu")) |os_field| {
+                    if (os_field.asArray()) |array_const| {
+                        var array = array_const;
+                        var arch = Architecture.none.negatable();
+                        while (array.next()) |item| {
+                            if (item.asString(bun.default_allocator)) |str| {
+                                arch.apply(str);
+                            }
                         }
 
-                        package_json.scripts = r.allocator.create(ScriptsMap) catch unreachable;
-                        package_json.scripts.?.* = scripts;
+                        package_json.arch = arch.combine();
+                    }
+                }
+
+                if (json.get("os")) |os_field| {
+                    var tmp = os_field.asArray();
+                    if (tmp) |*array| {
+                        var os = OperatingSystem.none.negatable();
+                        while (array.next()) |item| {
+                            if (item.asString(bun.default_allocator)) |str| {
+                                os.apply(str);
+                            }
+                        }
+
+                        package_json.os = os.combine();
+                    }
+                }
+
+                const DependencyGroup = Install.Lockfile.Package.DependencyGroup;
+                const features = .{
+                    .dependencies = true,
+                    .dev_dependencies = include_dependencies == .main,
+                    .optional_dependencies = true,
+                    .peer_dependencies = false,
+                };
+
+                const dependency_groups = comptime brk: {
+                    var out_groups: [
+                        @as(usize, @intFromBool(features.dependencies)) +
+                            @as(usize, @intFromBool(features.dev_dependencies)) +
+                            @as(usize, @intFromBool(features.optional_dependencies)) +
+                            @as(usize, @intFromBool(features.peer_dependencies))
+                    ]DependencyGroup = undefined;
+                    var out_group_i: usize = 0;
+                    if (features.dependencies) {
+                        out_groups[out_group_i] = DependencyGroup.dependencies;
+                        out_group_i += 1;
+                    }
+
+                    if (features.dev_dependencies) {
+                        out_groups[out_group_i] = DependencyGroup.dev;
+                        out_group_i += 1;
+                    }
+                    if (features.optional_dependencies) {
+                        out_groups[out_group_i] = DependencyGroup.optional;
+                        out_group_i += 1;
+                    }
+
+                    if (features.peer_dependencies) {
+                        out_groups[out_group_i] = DependencyGroup.peer;
+                        out_group_i += 1;
+                    }
+
+                    break :brk out_groups;
+                };
+
+                var total_dependency_count: usize = 0;
+                inline for (dependency_groups) |group| {
+                    if (json.get(group.field)) |group_json| {
+                        if (group_json.data == .e_object) {
+                            total_dependency_count += group_json.data.e_object.properties.len;
+                        }
+                    }
+                }
+
+                if (total_dependency_count > 0) {
+                    package_json.dependencies.map = DependencyMap.HashMap{};
+                    package_json.dependencies.source_buf = json_source.contents;
+                    const ctx = String.ArrayHashContext{
+                        .a_buf = json_source.contents,
+                        .b_buf = json_source.contents,
+                    };
+                    package_json.dependencies.map.ensureTotalCapacityContext(
+                        allocator,
+                        total_dependency_count,
+                        ctx,
+                    ) catch unreachable;
+
+                    inline for (dependency_groups) |group| {
+                        if (json.get(group.field)) |group_json| {
+                            if (group_json.data == .e_object) {
+                                var group_obj = group_json.data.e_object;
+                                for (group_obj.properties.slice()) |*prop| {
+                                    const name_prop = prop.key orelse continue;
+                                    const name_str = name_prop.asString(allocator) orelse continue;
+                                    const name_hash = String.Builder.stringHash(name_str);
+                                    const name = String.init(name_str, name_str);
+                                    const version_value = prop.value orelse continue;
+                                    const version_str = version_value.asString(allocator) orelse continue;
+                                    const sliced_str = Semver.SlicedString.init(version_str, version_str);
+
+                                    if (Dependency.parse(
+                                        allocator,
+                                        name,
+                                        name_hash,
+                                        version_str,
+                                        &sliced_str,
+                                        r.log,
+                                        r.package_manager,
+                                    )) |dependency_version| {
+                                        const dependency = Dependency{
+                                            .name = name,
+                                            .version = dependency_version,
+                                            .name_hash = name_hash,
+                                            .behavior = group.behavior,
+                                        };
+                                        package_json.dependencies.map.putAssumeCapacityContext(
+                                            dependency.name,
+                                            dependency,
+                                            ctx,
+                                        );
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // TODO: side effects
+        // used by `bun run`
+        if (include_scripts) {
+            if (json.asPropertyStringMap("scripts", allocator)) |scripts| {
+                package_json.scripts = scripts;
+            }
+            if (json.asPropertyStringMap("config", allocator)) |config| {
+                package_json.config = config;
+            }
+        }
 
         if (generate_hash) {
             if (package_json.name.len > 0 and package_json.version.len > 0) {
@@ -756,30 +1021,32 @@ pub const PackageJSON = struct {
     }
 
     pub fn hashModule(this: *const PackageJSON, module: string) u32 {
-        var hasher = std.hash.Wyhash.init(0);
+        var hasher = bun.Wyhash.init(0);
         hasher.update(std.mem.asBytes(&this.hash));
         hasher.update(module);
 
-        return @truncate(u32, hasher.final());
+        return @as(u32, @truncate(hasher.final()));
     }
 };
 
 pub const ExportsMap = struct {
     root: Entry,
     exports_range: logger.Range = logger.Range.None,
+    property_key_loc: logger.Loc,
 
-    pub fn parse(allocator: std.mem.Allocator, source: *const logger.Source, log: *logger.Log, json: js_ast.Expr) ?ExportsMap {
+    pub fn parse(allocator: std.mem.Allocator, source: *const logger.Source, log: *logger.Log, json: js_ast.Expr, property_key_loc: logger.Loc) ?ExportsMap {
         var visitor = Visitor{ .allocator = allocator, .source = source, .log = log };
 
         const root = visitor.visit(json);
 
-        if (root.data == .@"null") {
+        if (root.data == .null) {
             return null;
         }
 
         return ExportsMap{
             .root = root,
             .exports_range = source.rangeOfString(json.loc),
+            .property_key_loc = property_key_loc,
         };
     }
 
@@ -793,20 +1060,20 @@ pub const ExportsMap = struct {
 
             switch (expr.data) {
                 .e_null => {
-                    return Entry{ .first_token = js_lexer.rangeOfIdentifier(this.source, expr.loc), .data = .{ .@"null" = void{} } };
+                    return Entry{ .first_token = js_lexer.rangeOfIdentifier(this.source, expr.loc), .data = .{ .null = {} } };
                 },
                 .e_string => |str| {
                     return Entry{
                         .data = .{
-                            .string = str.string(this.allocator) catch unreachable,
+                            .string = str.slice(this.allocator),
                         },
                         .first_token = this.source.rangeOfString(expr.loc),
                     };
                 },
                 .e_array => |e_array| {
-                    var array = this.allocator.alloc(Entry, e_array.items.len) catch unreachable;
-                    for (e_array.items.slice()) |item, i| {
-                        array[i] = this.visit(item);
+                    const array = this.allocator.alloc(Entry, e_array.items.len) catch unreachable;
+                    for (e_array.items.slice(), array) |item, *dest| {
+                        dest.* = this.visit(item);
                     }
                     return Entry{
                         .data = .{
@@ -818,7 +1085,7 @@ pub const ExportsMap = struct {
                 .e_object => |e_obj| {
                     var map_data = Entry.Data.Map.List{};
                     map_data.ensureTotalCapacity(this.allocator, e_obj.*.properties.len) catch unreachable;
-                    map_data.len = map_data.capacity;
+                    map_data.len = e_obj.*.properties.len;
                     var expansion_keys = this.allocator.alloc(Entry.Data.Map.MapEntry, e_obj.*.properties.len) catch unreachable;
                     var expansion_key_i: usize = 0;
                     var map_data_slices = map_data.slice();
@@ -828,13 +1095,13 @@ pub const ExportsMap = struct {
                     var is_conditional_sugar = false;
                     first_token.loc = expr.loc;
                     first_token.len = 1;
-                    for (e_obj.properties.slice()) |prop, i| {
-                        const key: string = prop.key.?.data.e_string.string(this.allocator) catch unreachable;
+                    for (e_obj.properties.slice(), 0..) |prop, i| {
+                        const key: string = prop.key.?.data.e_string.slice(this.allocator);
                         const key_range: logger.Range = this.source.rangeOfString(prop.key.?.loc);
 
                         // If exports is an Object with both a key starting with "." and a key
                         // not starting with ".", throw an Invalid Package Configuration error.
-                        var cur_is_conditional_sugar = !strings.startsWithChar(key, '.');
+                        const cur_is_conditional_sugar = !strings.startsWithChar(key, '.');
                         if (i == 0) {
                             is_conditional_sugar = cur_is_conditional_sugar;
                         } else if (is_conditional_sugar != cur_is_conditional_sugar) {
@@ -853,7 +1120,7 @@ pub const ExportsMap = struct {
                             map_data.deinit(this.allocator);
                             this.allocator.free(expansion_keys);
                             return Entry{
-                                .data = .{ .invalid = void{} },
+                                .data = .{ .invalid = {} },
                                 .first_token = first_token,
                             };
                         }
@@ -862,7 +1129,8 @@ pub const ExportsMap = struct {
                         map_data_ranges[i] = key_range;
                         map_data_entries[i] = this.visit(prop.value.?);
 
-                        if (strings.endsWithAnyComptime(key, "/*")) {
+                        // safe to use "/" on windows. exports in package.json does not use "\\"
+                        if (strings.endsWithComptime(key, "/") or strings.containsChar(key, '*')) {
                             expansion_keys[expansion_key_i] = Entry.Data.Map.MapEntry{
                                 .value = map_data_entries[i],
                                 .key = key,
@@ -875,11 +1143,12 @@ pub const ExportsMap = struct {
                     // this leaks a lil, but it's fine.
                     expansion_keys = expansion_keys[0..expansion_key_i];
 
-                    // Let expansion_keys be the list of keys of matchObj ending in "/" or "*",
-                    // sorted by length descending.
-                    const LengthSorter: type = strings.NewLengthSorter(Entry.Data.Map.MapEntry, "key");
-                    var sorter = LengthSorter{};
-                    std.sort.sort(Entry.Data.Map.MapEntry, expansion_keys, sorter, LengthSorter.lessThan);
+                    // Let expansionKeys be the list of keys of matchObj either ending in "/"
+                    // or containing only a single "*", sorted by the sorting function
+                    // PATTERN_KEY_COMPARE which orders in descending order of specificity.
+                    const GlobLengthSorter: type = strings.NewGlobLengthSorter(Entry.Data.Map.MapEntry, "key");
+                    const sorter = GlobLengthSorter{};
+                    std.sort.pdq(Entry.Data.Map.MapEntry, expansion_keys, sorter, GlobLengthSorter.lessThan);
 
                     return Entry{
                         .data = .{
@@ -906,7 +1175,7 @@ pub const ExportsMap = struct {
 
             this.log.addRangeWarning(this.source, first_token, "This value must be a string, an object, an array, or null") catch unreachable;
             return Entry{
-                .data = .{ .invalid = void{} },
+                .data = .{ .invalid = {} },
                 .first_token = first_token,
             };
         }
@@ -918,19 +1187,19 @@ pub const ExportsMap = struct {
 
         pub const Data = union(Tag) {
             invalid: void,
-            @"null": void,
+            null: void,
             boolean: bool,
-            @"string": string,
+            string: string,
             array: []const Entry,
             map: Map,
 
             pub const Tag = enum {
-                @"null",
-                string,
+                invalid,
+                null,
                 boolean,
+                string,
                 array,
                 map,
-                invalid,
             };
 
             pub const Map = struct {
@@ -956,7 +1225,7 @@ pub const ExportsMap = struct {
                 .map => {
                     var slice = this.data.map.list.slice();
                     const keys = slice.items(.key);
-                    for (keys) |key, i| {
+                    for (keys, 0..) |key, i| {
                         if (strings.eql(key, key_)) {
                             return slice.items(.value)[i];
                         }
@@ -973,11 +1242,12 @@ pub const ExportsMap = struct {
 };
 
 pub const ESModule = struct {
-    pub const ConditionsMap = std.StringArrayHashMap(void);
+    pub const ConditionsMap = bun.StringArrayHashMap(void);
 
     debug_logs: ?*resolver.DebugLogs = null,
     conditions: ConditionsMap,
     allocator: std.mem.Allocator,
+    module_type: *options.ModuleType = undefined,
 
     pub const Resolution = struct {
         status: Status = Status.Undefined,
@@ -998,28 +1268,40 @@ pub const ESModule = struct {
         UndefinedNoConditionsMatch, // A more friendly error message for when no conditions are matched
         Null,
         Exact,
+        ExactEndsWithStar,
         Inexact, // This means we may need to try CommonJS-style extension suffixes
 
-        // Module specifier is an invalid URL, package name or package subpath specifier.
+        /// Module specifier is an invalid URL, package name or package subpath specifier.
         InvalidModuleSpecifier,
 
-        // package.json configuration is invalid or contains an invalid configuration.
+        /// package.json configuration is invalid or contains an invalid configuration.
         InvalidPackageConfiguration,
 
-        // Package exports or imports define a target module for the package that is an invalid type or string target.
+        /// Package exports or imports define a target module for the package that is an invalid type or string target.
         InvalidPackageTarget,
 
-        // Package exports do not define or permit a target subpath in the package for the given module.
+        /// Package exports do not define or permit a target subpath in the package for the given module.
         PackagePathNotExported,
 
-        // The package or module requested does not exist.
+        /// The package or module requested does not exist.
         ModuleNotFound,
 
-        // The resolved path corresponds to a directory, which is not a supported target for module imports.
+        /// The user just needs to add the missing extension
+        ModuleNotFoundMissingExtension,
+
+        /// The resolved path corresponds to a directory, which is not a supported target for module imports.
         UnsupportedDirectoryImport,
 
-        // When a package path is explicitly set to null, that means it's not exported.
+        /// The user just needs to add the missing "/index.js" suffix
+        UnsupportedDirectoryImportMissingIndex,
+
+        /// When a package path is explicitly set to null, that means it's not exported.
         PackagePathDisabled,
+
+        // The internal #import specifier was not found
+        PackageImportNotDefined,
+
+        PackageResolve,
 
         pub inline fn isUndefined(this: Status) bool {
             return switch (this) {
@@ -1031,20 +1313,82 @@ pub const ESModule = struct {
 
     pub const Package = struct {
         name: string,
+        version: string = "",
         subpath: string,
+
+        pub const External = struct {
+            name: Semver.String = .{},
+            version: Semver.String = .{},
+            subpath: Semver.String = .{},
+        };
+
+        pub fn count(this: Package, builder: *Semver.String.Builder) void {
+            builder.count(this.name);
+            builder.count(this.version);
+            builder.count(this.subpath);
+        }
+
+        pub fn clone(this: Package, builder: *Semver.String.Builder) External {
+            return .{
+                .name = builder.appendUTF8WithoutPool(Semver.String, this.name, 0),
+                .version = builder.appendUTF8WithoutPool(Semver.String, this.version, 0),
+                .subpath = builder.appendUTF8WithoutPool(Semver.String, this.subpath, 0),
+            };
+        }
+
+        pub fn toExternal(this: Package, buffer: []const u8) External {
+            return .{
+                .name = Semver.String.init(buffer, this.name),
+                .version = Semver.String.init(buffer, this.version),
+                .subpath = Semver.String.init(buffer, this.subpath),
+            };
+        }
+
+        pub fn withAutoVersion(this: Package) Package {
+            if (this.version.len == 0) {
+                return .{
+                    .name = this.name,
+                    .subpath = this.subpath,
+                    .version = "latest",
+                };
+            }
+
+            return this;
+        }
 
         pub fn parseName(specifier: string) ?string {
             var slash = strings.indexOfCharNeg(specifier, '/');
             if (!strings.startsWithChar(specifier, '@')) {
-                slash = if (slash == -1) @intCast(i32, specifier.len) else slash;
-                return specifier[0..@intCast(usize, slash)];
+                slash = if (slash == -1) @as(i32, @intCast(specifier.len)) else slash;
+                return specifier[0..@as(usize, @intCast(slash))];
             } else {
                 if (slash == -1) return null;
 
-                const slash2 = strings.indexOfChar(specifier[@intCast(usize, slash) + 1 ..], '/') orelse
-                    specifier[@intCast(u32, slash + 1)..].len;
-                return specifier[0 .. @intCast(usize, slash + 1) + slash2];
+                const slash2 = strings.indexOfChar(specifier[@as(usize, @intCast(slash)) + 1 ..], '/') orelse
+                    specifier[@as(u32, @intCast(slash + 1))..].len;
+                return specifier[0 .. @as(usize, @intCast(slash + 1)) + slash2];
             }
+        }
+
+        pub fn parseVersion(specifier_after_name: string) ?string {
+            if (strings.indexOfChar(specifier_after_name, '/')) |slash| {
+                // "foo@/bar" is not a valid specifier\
+                // "foo@/"   is not a valid specifier
+                // "foo/@/bar" is not a valid specifier
+                // "foo@1/bar" is a valid specifier
+                // "foo@^123.2.3+ba-ab/bar" is a valid specifier
+                //      ^^^^^^^^^^^^^^
+                //    this is the version
+
+                const remainder = specifier_after_name[0..slash];
+                if (remainder.len > 0 and remainder[0] == '@') {
+                    return remainder[1..];
+                }
+
+                return remainder;
+            }
+
+            return null;
         }
 
         pub fn parse(specifier: string, subpath_buf: []u8) ?Package {
@@ -1054,10 +1398,29 @@ pub const ESModule = struct {
             if (strings.startsWith(package.name, ".") or strings.indexAnyComptime(package.name, "\\%") != null)
                 return null;
 
-            std.mem.copy(u8, subpath_buf[1..], specifier[package.name.len..]);
-            subpath_buf[0] = '.';
-            package.subpath = subpath_buf[0 .. specifier[package.name.len..].len + 1];
+            const offset: usize = if (package.name.len == 0 or package.name[0] != '@') 0 else 1;
+            if (strings.indexOfChar(specifier[offset..], '@')) |at| {
+                package.version = parseVersion(specifier[offset..][at..]) orelse "";
+                if (package.version.len == 0) {
+                    package.version = specifier[offset..][at..];
+                    if (package.version.len > 0 and package.version[0] == '@') {
+                        package.version = package.version[1..];
+                    }
+                }
+                package.name = specifier[0 .. at + offset];
+
+                parseSubpath(&package.subpath, specifier[@min(package.name.len + package.version.len + 1, specifier.len)..], subpath_buf);
+            } else {
+                parseSubpath(&package.subpath, specifier[package.name.len..], subpath_buf);
+            }
+
             return package;
+        }
+
+        pub fn parseSubpath(subpath: *[]const u8, specifier: string, subpath_buf: []u8) void {
+            subpath_buf[0] = '.';
+            bun.copy(u8, subpath_buf[1..], specifier);
+            subpath.* = subpath_buf[0 .. specifier.len + 1];
         }
     };
 
@@ -1073,11 +1436,43 @@ pub const ESModule = struct {
         "%5C",
     };
 
-    threadlocal var resolved_path_buf_percent: [bun.MAX_PATH_BYTES]u8 = undefined;
+    threadlocal var resolved_path_buf_percent: bun.PathBuffer = undefined;
     pub fn resolve(r: *const ESModule, package_url: string, subpath: string, exports: ExportsMap.Entry) Resolution {
-        var result = r.resolveExports(package_url, subpath, exports);
+        return finalize(
+            r.resolveExports(package_url, subpath, exports),
+        );
+    }
 
-        if (result.status != .Exact and result.status != .Inexact) {
+    pub fn resolveImports(r: *const ESModule, specifier: string, imports: ExportsMap.Entry) Resolution {
+        if (imports.data != .map) {
+            return .{
+                .status = .InvalidPackageConfiguration,
+                .debug = .{
+                    .token = logger.Range.None,
+                },
+            };
+        }
+
+        const result = r.resolveImportsExports(
+            specifier,
+            imports,
+            true,
+            "/",
+        );
+
+        switch (result.status) {
+            .Undefined, .Null => {
+                return .{ .status = .PackageImportNotDefined, .debug = .{ .token = result.debug.token } };
+            },
+            else => {
+                return finalize(result);
+            },
+        }
+    }
+
+    pub fn finalize(result_: Resolution) Resolution {
+        var result = result_;
+        if (result.status != .Exact and result.status != .ExactEndsWithStar and result.status != .Inexact) {
             return result;
         }
 
@@ -1126,14 +1521,14 @@ pub const ESModule = struct {
     ) Resolution {
         if (exports.data == .invalid) {
             if (r.debug_logs) |logs| {
-                logs.addNote("Invalid package configuration") catch unreachable;
+                logs.addNote("Invalid package configuration");
             }
 
             return Resolution{ .status = .InvalidPackageConfiguration, .debug = .{ .token = exports.first_token } };
         }
 
         if (strings.eqlComptime(subpath, ".")) {
-            var main_export = ExportsMap.Entry{ .data = .{ .@"null" = void{} }, .first_token = logger.Range.None };
+            var main_export = ExportsMap.Entry{ .data = .{ .null = {} }, .first_token = logger.Range.None };
             if (switch (exports.data) {
                 .string,
                 .array,
@@ -1148,14 +1543,14 @@ pub const ESModule = struct {
                 }
             }
 
-            if (main_export.data != .@"null") {
-                const result = r.resolveTarget(package_url, main_export, "", false);
+            if (main_export.data != .null) {
+                const result = r.resolveTarget(package_url, main_export, "", false, false);
                 if (result.status != .Null and result.status != .Undefined) {
                     return result;
                 }
             }
         } else if (exports.data == .map and exports.keysStartWithDot()) {
-            const result = r.resolveImportsExports(subpath, exports, package_url);
+            const result = r.resolveImportsExports(subpath, exports, false, package_url);
             if (result.status != .Null and result.status != .Undefined) {
                 return result;
             }
@@ -1166,7 +1561,7 @@ pub const ESModule = struct {
         }
 
         if (r.debug_logs) |logs| {
-            logs.addNoteFmt("The path \"{s}\" was not exported", .{subpath}) catch unreachable;
+            logs.addNoteFmt("The path \"{s}\" was not exported", .{subpath});
         }
 
         return Resolution{ .status = .PackagePathNotExported, .debug = .{ .token = exports.first_token } };
@@ -1176,65 +1571,77 @@ pub const ESModule = struct {
         r: *const ESModule,
         match_key: string,
         match_obj: ExportsMap.Entry,
+        is_imports: bool,
         package_url: string,
     ) Resolution {
         if (r.debug_logs) |logs| {
-            logs.addNoteFmt("Checking object path map for \"{s}\"", .{match_key}) catch unreachable;
+            logs.addNoteFmt("Checking object path map for \"{s}\"", .{match_key});
         }
 
-        if (!strings.endsWithChar(match_key, '.')) {
+        // If matchKey is a key of matchObj and does not end in "/" or contain "*", then
+        if (!strings.endsWithChar(match_key, '/') and !strings.containsChar(match_key, '*')) {
             if (match_obj.valueForKey(match_key)) |target| {
                 if (r.debug_logs) |log| {
-                    log.addNoteFmt("Found \"{s}\"", .{match_key}) catch unreachable;
+                    log.addNoteFmt("Found \"{s}\"", .{match_key});
                 }
 
-                return r.resolveTarget(package_url, target, "", false);
+                return r.resolveTarget(package_url, target, "", is_imports, false);
             }
         }
 
         if (match_obj.data == .map) {
             const expansion_keys = match_obj.data.map.expansion_keys;
             for (expansion_keys) |expansion| {
-                // If expansionKey ends in "*" and matchKey starts with but is not equal to
-                // the substring of expansionKey excluding the last "*" character
-                if (strings.endsWithChar(expansion.key, '*')) {
-                    const substr = expansion.key[0 .. expansion.key.len - 1];
-                    if (strings.startsWith(match_key, substr) and !strings.eql(match_key, substr)) {
-                        const target = expansion.value;
-                        const subpath = match_key[expansion.key.len - 1 ..];
-                        if (r.debug_logs) |log| {
-                            log.addNoteFmt("The key \"{s}\" matched with \"{s}\" left over", .{ expansion.key, subpath }) catch unreachable;
+
+                // If expansionKey contains "*", set patternBase to the substring of
+                // expansionKey up to but excluding the first "*" character
+                if (strings.indexOfChar(expansion.key, '*')) |star| {
+                    const pattern_base = expansion.key[0..star];
+                    // If patternBase is not null and matchKey starts with but is not equal
+                    // to patternBase, then
+                    if (strings.startsWith(match_key, pattern_base)) {
+                        // Let patternTrailer be the substring of expansionKey from the index
+                        // after the first "*" character.
+                        const pattern_trailer = expansion.key[star + 1 ..];
+
+                        // If patternTrailer has zero length, or if matchKey ends with
+                        // patternTrailer and the length of matchKey is greater than or
+                        // equal to the length of expansionKey, then
+                        if (pattern_trailer.len == 0 or (strings.endsWith(match_key, pattern_trailer) and match_key.len >= expansion.key.len)) {
+                            const target = expansion.value;
+                            const subpath = match_key[pattern_base.len .. match_key.len - pattern_trailer.len];
+                            if (r.debug_logs) |log| {
+                                log.addNoteFmt("The key \"{s}\" matched with \"{s}\" left over", .{ expansion.key, subpath });
+                            }
+                            return r.resolveTarget(package_url, target, subpath, is_imports, true);
                         }
-
-                        return r.resolveTarget(package_url, target, subpath, true);
                     }
-                }
-
-                if (strings.startsWith(match_key, expansion.key)) {
-                    const target = expansion.value;
-                    const subpath = match_key[expansion.key.len..];
-                    if (r.debug_logs) |log| {
-                        log.addNoteFmt("The key \"{s}\" matched with \"{s}\" left over", .{ expansion.key, subpath }) catch unreachable;
+                } else {
+                    // Otherwise if patternBase is null and matchKey starts with
+                    // expansionKey, then
+                    if (strings.startsWith(match_key, expansion.key)) {
+                        const target = expansion.value;
+                        const subpath = match_key[expansion.key.len..];
+                        if (r.debug_logs) |log| {
+                            log.addNoteFmt("The key \"{s}\" matched with \"{s}\" left over", .{ expansion.key, subpath });
+                        }
+                        var result = r.resolveTarget(package_url, target, subpath, is_imports, false);
+                        if (result.status == .Exact or result.status == .ExactEndsWithStar) {
+                            // Return the object { resolved, exact: false }.
+                            result.status = .Inexact;
+                        }
+                        return result;
                     }
-
-                    var result = r.resolveTarget(package_url, target, subpath, false);
-                    result.status = if (result.status == .Exact)
-                        // Return the object { resolved, exact: false }.
-                        .Inexact
-                    else
-                        result.status;
-
-                    return result;
                 }
 
                 if (r.debug_logs) |log| {
-                    log.addNoteFmt("The key \"{s}\" did not match", .{expansion.key}) catch unreachable;
+                    log.addNoteFmt("The key \"{s}\" did not match", .{expansion.key});
                 }
             }
         }
 
         if (r.debug_logs) |log| {
-            log.addNoteFmt("No keys matched \"{s}\"", .{match_key}) catch unreachable;
+            log.addNoteFmt("No keys matched \"{s}\"", .{match_key});
         }
 
         return Resolution{
@@ -1243,24 +1650,25 @@ pub const ESModule = struct {
         };
     }
 
-    threadlocal var resolve_target_buf: [bun.MAX_PATH_BYTES]u8 = undefined;
-    threadlocal var resolve_target_buf2: [bun.MAX_PATH_BYTES]u8 = undefined;
+    threadlocal var resolve_target_buf: bun.PathBuffer = undefined;
+    threadlocal var resolve_target_buf2: bun.PathBuffer = undefined;
     fn resolveTarget(
         r: *const ESModule,
         package_url: string,
         target: ExportsMap.Entry,
         subpath: string,
+        internal: bool,
         comptime pattern: bool,
     ) Resolution {
         switch (target.data) {
             .string => |str| {
                 if (r.debug_logs) |log| {
-                    log.addNoteFmt("Checking path \"{s}\" against target \"{s}\"", .{ subpath, str }) catch unreachable;
-                    log.increaseIndent() catch unreachable;
+                    log.addNoteFmt("Checking path \"{s}\" against target \"{s}\"", .{ subpath, str });
+                    log.increaseIndent();
                 }
                 defer {
                     if (r.debug_logs) |log| {
-                        log.decreaseIndent() catch unreachable;
+                        log.decreaseIndent();
                     }
                 }
 
@@ -1269,16 +1677,39 @@ pub const ESModule = struct {
                 if (comptime !pattern) {
                     if (subpath.len > 0 and !strings.endsWithChar(str, '/')) {
                         if (r.debug_logs) |log| {
-                            log.addNoteFmt("The target \"{s}\" is invalid because it doesn't end with a \"/\"", .{str}) catch unreachable;
+                            log.addNoteFmt("The target \"{s}\" is invalid because it doesn't end with a \"/\"", .{str});
                         }
 
                         return Resolution{ .path = str, .status = .InvalidModuleSpecifier, .debug = .{ .token = target.first_token } };
                     }
                 }
 
+                // If target does not start with "./", then...
                 if (!strings.startsWith(str, "./")) {
                     if (r.debug_logs) |log| {
-                        log.addNoteFmt("The target \"{s}\" is invalid because it doesn't start with a \"./\"", .{str}) catch unreachable;
+                        log.addNoteFmt("The target \"{s}\" is invalid because it doesn't start with a \"./\"", .{str});
+                    }
+
+                    if (internal and !strings.hasPrefixComptime(str, "../") and !strings.hasPrefix(str, "/")) {
+                        if (comptime pattern) {
+                            // Return the URL resolution of resolvedTarget with every instance of "*" replaced with subpath.
+                            const len = std.mem.replacementSize(u8, str, "*", subpath);
+                            _ = std.mem.replace(u8, str, "*", subpath, &resolve_target_buf2);
+                            const result = resolve_target_buf2[0..len];
+                            if (r.debug_logs) |log| {
+                                log.addNoteFmt("Subsituted \"{s}\" for \"*\" in \".{s}\" to get \".{s}\" ", .{ subpath, str, result });
+                            }
+
+                            return Resolution{ .path = result, .status = .PackageResolve, .debug = .{ .token = target.first_token } };
+                        } else {
+                            const parts2 = [_]string{ str, subpath };
+                            const result = resolve_path.joinStringBuf(&resolve_target_buf2, parts2, .auto);
+                            if (r.debug_logs) |log| {
+                                log.addNoteFmt("Resolved \".{s}\" to \".{s}\"", .{ str, result });
+                            }
+
+                            return Resolution{ .path = result, .status = .PackageResolve, .debug = .{ .token = target.first_token } };
+                        }
                     }
 
                     return Resolution{ .path = str, .status = .InvalidPackageTarget, .debug = .{ .token = target.first_token } };
@@ -1288,21 +1719,21 @@ pub const ESModule = struct {
                 // segments after the first segment, throw an Invalid Package Target error.
                 if (findInvalidSegment(str)) |invalid| {
                     if (r.debug_logs) |log| {
-                        log.addNoteFmt("The target \"{s}\" is invalid because it contains an invalid segment \"{s}\"", .{ str, invalid }) catch unreachable;
+                        log.addNoteFmt("The target \"{s}\" is invalid because it contains an invalid segment \"{s}\"", .{ str, invalid });
                     }
 
                     return Resolution{ .path = str, .status = .InvalidPackageTarget, .debug = .{ .token = target.first_token } };
                 }
 
                 // Let resolvedTarget be the URL resolution of the concatenation of packageURL and target.
-                var parts = [_]string{ package_url, str };
+                const parts = [_]string{ package_url, str };
                 const resolved_target = resolve_path.joinStringBuf(&resolve_target_buf, parts, .auto);
 
                 // If target split on "/" or "\" contains any ".", ".." or "node_modules"
                 // segments after the first segment, throw an Invalid Package Target error.
                 if (findInvalidSegment(resolved_target)) |invalid| {
                     if (r.debug_logs) |log| {
-                        log.addNoteFmt("The target \"{s}\" is invalid because it contains an invalid segment \"{s}\"", .{ str, invalid }) catch unreachable;
+                        log.addNoteFmt("The target \"{s}\" is invalid because it contains an invalid segment \"{s}\"", .{ str, invalid });
                     }
 
                     return Resolution{ .path = str, .status = .InvalidModuleSpecifier, .debug = .{ .token = target.first_token } };
@@ -1314,15 +1745,19 @@ pub const ESModule = struct {
                     _ = std.mem.replace(u8, resolved_target, "*", subpath, &resolve_target_buf2);
                     const result = resolve_target_buf2[0..len];
                     if (r.debug_logs) |log| {
-                        log.addNoteFmt("Subsituted \"{s}\" for \"*\" in \".{s}\" to get \".{s}\" ", .{ subpath, resolved_target, result }) catch unreachable;
+                        log.addNoteFmt("Substituted \"{s}\" for \"*\" in \".{s}\" to get \".{s}\" ", .{ subpath, resolved_target, result });
                     }
 
-                    return Resolution{ .path = result, .status = .Exact, .debug = .{ .token = target.first_token } };
+                    const status: Status = if (strings.endsWithCharOrIsZeroLength(result, '*') and strings.indexOfChar(result, '*').? == result.len - 1)
+                        .ExactEndsWithStar
+                    else
+                        .Exact;
+                    return Resolution{ .path = result, .status = status, .debug = .{ .token = target.first_token } };
                 } else {
-                    var parts2 = [_]string{ package_url, str, subpath };
+                    const parts2 = [_]string{ package_url, str, subpath };
                     const result = resolve_path.joinStringBuf(&resolve_target_buf2, parts2, .auto);
                     if (r.debug_logs) |log| {
-                        log.addNoteFmt("Substituted \"{s}\" for \"*\" in \".{s}\" to get \".{s}\" ", .{ subpath, resolved_target, result }) catch unreachable;
+                        log.addNoteFmt("Substituted \"{s}\" for \"*\" in \".{s}\" to get \".{s}\" ", .{ subpath, resolved_target, result });
                     }
 
                     return Resolution{ .path = result, .status = .Exact, .debug = .{ .token = target.first_token } };
@@ -1334,29 +1769,39 @@ pub const ESModule = struct {
 
                 const slice = object.list.slice();
                 const keys = slice.items(.key);
-                for (keys) |key, i| {
-                    if (strings.eqlComptime(key, "default") or r.conditions.contains(key)) {
+                for (keys, 0..) |key, i| {
+                    if (r.conditions.contains(key)) {
                         if (r.debug_logs) |log| {
-                            log.addNoteFmt("The key \"{s}\" matched", .{key}) catch unreachable;
+                            log.addNoteFmt("The key \"{s}\" matched", .{key});
                         }
 
-                        var result = r.resolveTarget(package_url, slice.items(.value)[i], subpath, pattern);
+                        const prev_module_type = r.module_type.*;
+                        var result = r.resolveTarget(package_url, slice.items(.value)[i], subpath, internal, pattern);
                         if (result.status.isUndefined()) {
                             did_find_map_entry = true;
                             last_map_entry_i = i;
+                            r.module_type.* = prev_module_type;
                             continue;
+                        }
+
+                        if (strings.eqlComptime(key, "import")) {
+                            r.module_type.* = .esm;
+                        }
+
+                        if (strings.eqlComptime(key, "require")) {
+                            r.module_type.* = .cjs;
                         }
 
                         return result;
                     }
 
                     if (r.debug_logs) |log| {
-                        log.addNoteFmt("The key \"{s}\" did not match", .{key}) catch unreachable;
+                        log.addNoteFmt("The key \"{s}\" did not match", .{key});
                     }
                 }
 
                 if (r.debug_logs) |log| {
-                    log.addNoteFmt("No keys matched", .{}) catch unreachable;
+                    log.addNoteFmt("No keys matched", .{});
                 }
 
                 var return_target = target;
@@ -1420,7 +1865,7 @@ pub const ESModule = struct {
             .array => |array| {
                 if (array.len == 0) {
                     if (r.debug_logs) |log| {
-                        log.addNoteFmt("The path \"{s}\" is an empty array", .{subpath}) catch unreachable;
+                        log.addNoteFmt("The path \"{s}\" is an empty array", .{subpath});
                     }
 
                     return Resolution{ .path = "", .status = .Null, .debug = .{ .token = target.first_token } };
@@ -1431,13 +1876,15 @@ pub const ESModule = struct {
 
                 for (array) |targetValue| {
                     // Let resolved be the result, continuing the loop on any Invalid Package Target error.
-                    const result = r.resolveTarget(package_url, targetValue, subpath, pattern);
+                    const prev_module_type = r.module_type.*;
+                    const result = r.resolveTarget(package_url, targetValue, subpath, internal, pattern);
                     if (result.status == .InvalidPackageTarget or result.status == .Null) {
                         last_debug = result.debug;
                         last_exception = result.status;
                     }
 
                     if (result.status.isUndefined()) {
+                        r.module_type.* = prev_module_type;
                         continue;
                     }
 
@@ -1446,9 +1893,9 @@ pub const ESModule = struct {
 
                 return Resolution{ .path = "", .status = last_exception, .debug = last_debug };
             },
-            .@"null" => {
+            .null => {
                 if (r.debug_logs) |log| {
-                    log.addNoteFmt("The path \"{s}\" is null", .{subpath}) catch unreachable;
+                    log.addNoteFmt("The path \"{s}\" is null", .{subpath});
                 }
 
                 return Resolution{ .path = "", .status = .Null, .debug = .{ .token = target.first_token } };
@@ -1457,7 +1904,7 @@ pub const ESModule = struct {
         }
 
         if (r.debug_logs) |logs| {
-            logs.addNoteFmt("Invalid package target for path \"{s}\"", .{subpath}) catch unreachable;
+            logs.addNoteFmt("Invalid package target for path \"{s}\"", .{subpath});
         }
 
         return Resolution{ .status = .InvalidPackageTarget, .debug = .{ .token = target.first_token } };
@@ -1485,11 +1932,11 @@ pub const ESModule = struct {
         if (match_obj.data != .map) return null;
         const map = match_obj.data.map;
 
-        if (!strings.endsWithChar(query, "*")) {
+        if (!strings.endsWithCharOrIsZeroLength(query, "*")) {
             var slices = map.list.slice();
-            var keys = slices.items(.key);
-            var values = slices.items(.value);
-            for (keys) |key, i| {
+            const keys = slices.items(.key);
+            const values = slices.items(.value);
+            for (keys, 0..) |key, i| {
                 if (r.resolveTargetReverse(query, key, values[i], .exact)) |result| {
                     return result;
                 }
@@ -1497,7 +1944,7 @@ pub const ESModule = struct {
         }
 
         for (map.expansion_keys) |expansion| {
-            if (strings.endsWithChar(expansion.key, '*')) {
+            if (strings.endsWithCharOrIsZeroLength(expansion.key, '*')) {
                 if (r.resolveTargetReverse(query, expansion.key, expansion.value, .pattern)) |result| {
                     return result;
                 }
@@ -1509,8 +1956,8 @@ pub const ESModule = struct {
         }
     }
 
-    threadlocal var resolve_target_reverse_prefix_buf: [bun.MAX_PATH_BYTES]u8 = undefined;
-    threadlocal var resolve_target_reverse_prefix_buf2: [bun.MAX_PATH_BYTES]u8 = undefined;
+    threadlocal var resolve_target_reverse_prefix_buf: bun.PathBuffer = undefined;
+    threadlocal var resolve_target_reverse_prefix_buf2: bun.PathBuffer = undefined;
 
     fn resolveTargetReverse(
         r: *const ESModule,
@@ -1572,9 +2019,15 @@ pub const ESModule = struct {
             .map => |map| {
                 const slice = map.list.slice();
                 const keys = slice.items(.key);
-                for (keys) |map_key, i| {
-                    if (strings.eqlComptime(map_key, "default") or r.conditions.contains(map_key)) {
+                for (keys, 0..) |map_key, i| {
+                    if (r.conditions.contains(map_key)) {
                         if (r.resolveTargetReverse(query, key, slice.items(.value)[i], kind)) |result| {
+                            if (strings.eqlComptime(map_key, "import")) {
+                                r.module_type.* = .esm;
+                            } else if (strings.eqlComptime(map_key, "require")) {
+                                r.module_type.* = .cjs;
+                            }
+
                             return result;
                         }
                     }
@@ -1597,7 +2050,7 @@ pub const ESModule = struct {
 };
 
 fn findInvalidSegment(path_: string) ?string {
-    var slash = strings.indexAnyComptime(path_, "/\\") orelse return "";
+    const slash = strings.indexAnyComptime(path_, "/\\") orelse return "";
     var path = path_[slash + 1 ..];
 
     while (path.len > 0) {

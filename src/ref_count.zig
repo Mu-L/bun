@@ -1,6 +1,7 @@
 const std = @import("std");
+const bun = @import("root").bun;
 
-pub fn RefCount(comptime Type: type, comptime deinit_on_zero: bool) type {
+pub fn RefCount(comptime TypeName: type, comptime deinit_on_zero: bool) type {
     return struct {
         const AllocatorType = if (deinit_on_zero) std.mem.Allocator else void;
 
@@ -24,7 +25,7 @@ pub fn RefCount(comptime Type: type, comptime deinit_on_zero: bool) type {
 
         /// Get the value & increment the reference count.
         pub inline fn get(this: *@This()) *Type {
-            std.debug.assert(this.count >= 0);
+            bun.assert(this.count >= 0);
 
             this.count += 1;
             return this.leak();
@@ -66,7 +67,7 @@ pub fn RefCount(comptime Type: type, comptime deinit_on_zero: bool) type {
         pub inline fn deref(this: *@This()) void {
             this.count -= 1;
 
-            std.debug.assert(this.count >= 0);
+            bun.assert(this.count >= 0);
 
             if (comptime deinit_on_zero) {
                 if (this.count <= 0) {
@@ -75,6 +76,6 @@ pub fn RefCount(comptime Type: type, comptime deinit_on_zero: bool) type {
             }
         }
 
-        pub const Type = Type;
+        pub const Type = TypeName;
     };
 }

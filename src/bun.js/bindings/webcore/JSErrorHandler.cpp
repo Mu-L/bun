@@ -42,7 +42,6 @@
 // #include "JSExecState.h"
 // #include "JSExecStateInstrumentation.h"
 #include <JavaScriptCore/JSLock.h>
-#include <JavaScriptCore/VMEntryScope.h>
 #include <wtf/Ref.h>
 
 namespace WebCore {
@@ -99,9 +98,6 @@ void JSErrorHandler::handleEvent(ScriptExecutionContext& scriptExecutionContext,
         args.append(toJS<IDLUnsignedLong>(errorEvent.colno()));
         args.append(errorEvent.error(*globalObject));
         ASSERT(!args.hasOverflowed());
-
-        VM& vm = globalObject->vm();
-        VMEntryScope entryScope(vm, vm.entryScope ? vm.entryScope->globalObject() : globalObject);
 
         // JSExecState::instrumentFunction(&scriptExecutionContext, callData);
 

@@ -1,8 +1,8 @@
 const std = @import("std");
-const logger = @import("logger.zig");
+const logger = bun.logger;
 const JSXRuntime = @import("options.zig").JSX.Runtime;
 const Runtime = @import("runtime.zig").Runtime;
-const bun = @import("global.zig");
+const bun = @import("root").bun;
 const string = bun.string;
 const Output = bun.Output;
 const Global = bun.Global;
@@ -12,171 +12,187 @@ const MutableString = bun.MutableString;
 const stringZ = bun.stringZ;
 const default_allocator = bun.default_allocator;
 const C = bun.C;
-const Ref = @import("ast/base.zig").Ref;
+pub const Ref = @import("ast/base.zig").Ref;
+pub const Index = @import("ast/base.zig").Index;
 const RefHashCtx = @import("ast/base.zig").RefHashCtx;
 const ObjectPool = @import("./pool.zig").ObjectPool;
 const ImportRecord = @import("import_record.zig").ImportRecord;
 const allocators = @import("allocators.zig");
-const JSC = @import("javascript_core");
-const HTTP = @import("http");
+const JSC = bun.JSC;
 const RefCtx = @import("./ast/base.zig").RefCtx;
-const _hash_map = @import("hash_map.zig");
-const JSONParser = @import("./json_parser.zig");
-const StringHashMap = _hash_map.StringHashMap;
-const AutoHashMap = _hash_map.AutoHashMap;
-const StringHashMapUnmanaged = _hash_map.StringHashMapUnmanaged;
-const is_bindgen = std.meta.globalOption("bindgen", bool) orelse false;
+const JSONParser = bun.JSON;
+const is_bindgen = false;
 const ComptimeStringMap = bun.ComptimeStringMap;
 const JSPrinter = @import("./js_printer.zig");
-pub fn NewBaseStore(comptime Union: anytype, comptime count: usize) type {
-    var max_size = 0;
-    var max_align = 1;
-    for (Union) |kind| {
-        max_size = std.math.max(@sizeOf(kind), max_size);
-        max_align = if (@sizeOf(kind) == 0) max_align else std.math.max(@alignOf(kind), max_align);
-    }
+const js_lexer = @import("./js_lexer.zig");
+const TypeScript = @import("./js_parser.zig").TypeScript;
+const ThreadlocalArena = @import("./allocators/mimalloc_arena.zig").Arena;
+const MimeType = bun.http.MimeType;
+const OOM = bun.OOM;
+const Loader = bun.options.Loader;
+/// This is the index to the automatically-generated part containing code that
+/// calls "__export(exports, { ... getters ... })". This is used to generate
+/// getters on an exports object for ES6 export statements, and is both for
+/// ES6 star imports and CommonJS-style modules. All files have one of these,
+/// although it may contain no statements if there is nothing to export.
+pub const namespace_export_part_index = 0;
 
-    const UnionValueType = [max_size]u8;
-    const SizeType = std.math.IntFittingRange(0, (count + 1));
-    const MaxAlign = max_align;
+/// This "Store" is a specialized memory allocation strategy very similar to an
+/// arena, used for allocating expression and statement nodes during JavaScript
+/// parsing and visiting. Allocations are grouped into large blocks, where each
+/// block is treated as a fixed-buffer allocator. When a block runs out of
+/// space, a new one is created; all blocks are joined as a linked list.
+///
+/// Similarly to an arena, you can call .reset() to reset state, reusing memory
+/// across operations.
+pub fn NewStore(comptime types: []const type, comptime count: usize) type {
+    const largest_size, const largest_align = brk: {
+        var largest_size = 0;
+        var largest_align = 1;
+        for (types) |T| {
+            if (@sizeOf(T) == 0) {
+                @compileError("NewStore does not support 0 size type: " ++ @typeName(T));
+            }
+            largest_size = @max(@sizeOf(T), largest_size);
+            largest_align = @max(@alignOf(T), largest_align);
+        }
+        break :brk .{ largest_size, largest_align };
+    };
+
+    const backing_allocator = bun.default_allocator;
+
+    const log = Output.scoped(.Store, true);
 
     return struct {
-        const Allocator = std.mem.Allocator;
-        const Self = @This();
-        pub const WithBase = struct {
-            head: Block = Block{},
-            store: Self,
-        };
+        const Store = @This();
 
-        const Block = struct {
-            used: SizeType = 0,
-            items: [count]UnionValueType align(MaxAlign) = undefined,
+        current: *Block,
+        debug_lock: std.debug.SafetyLock = .{},
 
-            pub inline fn isFull(block: *const Block) bool {
-                return block.used >= @as(SizeType, count);
-            }
+        pub const Block = struct {
+            pub const size = largest_size * count * 2;
+            pub const Size = std.math.IntFittingRange(0, size + largest_size);
 
-            pub fn append(block: *Block, comptime ValueType: type, value: ValueType) *UnionValueType {
-                if (comptime Environment.allow_assert) std.debug.assert(block.used < count);
-                const index = block.used;
-                block.items[index][0..value.len].* = value.*;
-                block.used +|= 1;
-                return &block.items[index];
-            }
-        };
+            buffer: [size]u8 align(largest_align) = undefined,
+            bytes_used: Size = 0,
+            next: ?*Block = null,
 
-        const Overflow = struct {
-            const max = 4096 * 3;
-            const UsedSize = std.math.IntFittingRange(0, max + 1);
-            used: UsedSize = 0,
-            allocated: UsedSize = 0,
-            allocator: Allocator,
-            ptrs: [max]*Block = undefined,
+            pub fn tryAlloc(block: *Block, comptime T: type) ?*T {
+                const start = std.mem.alignForward(usize, block.bytes_used, @alignOf(T));
+                if (start + @sizeOf(T) > block.buffer.len) return null;
+                defer block.bytes_used = @intCast(start + @sizeOf(T));
 
-            pub fn tail(this: *Overflow) *Block {
-                if (this.ptrs[this.used].isFull()) {
-                    this.used +%= 1;
-                    if (this.allocated > this.used) {
-                        this.ptrs[this.used].used = 0;
-                    }
+                // it's simpler to use @ptrCast, but as a sanity check, we also
+                // try to compute the slice. Zig will report an out of bounds
+                // panic if the null detection logic above is wrong
+                if (Environment.isDebug) {
+                    _ = block.buffer[block.bytes_used..][0..@sizeOf(T)];
                 }
 
-                if (this.allocated <= this.used) {
-                    var new_ptrs = this.allocator.alloc(Block, 2) catch unreachable;
-                    new_ptrs[0] = Block{};
-                    new_ptrs[1] = Block{};
-                    this.ptrs[this.allocated] = &new_ptrs[0];
-                    this.ptrs[this.allocated + 1] = &new_ptrs[1];
-                    this.allocated +%= 2;
-                }
-
-                return this.ptrs[this.used];
-            }
-
-            pub inline fn slice(this: *Overflow) []*Block {
-                return this.ptrs[0..this.used];
+                return @alignCast(@ptrCast(&block.buffer[start]));
             }
         };
 
-        overflow: Overflow = Overflow{},
+        const PreAlloc = struct {
+            metadata: Store,
+            first_block: Block,
+        };
 
-        pub threadlocal var _self: *Self = undefined;
+        pub fn firstBlock(store: *Store) *Block {
+            return &@as(*PreAlloc, @fieldParentPtr("metadata", store)).first_block;
+        }
 
-        pub fn reclaim() []*Block {
-            if (_self.overflow.used == 0) return &[_]*Block{};
+        pub fn init() *Store {
+            log("init", .{});
+            const prealloc = backing_allocator.create(PreAlloc) catch bun.outOfMemory();
 
-            var used = _self.overflow.allocator.dupe(*Block, _self.overflow.slice()) catch unreachable;
-            var new_head = _self.overflow.allocator.create(Block) catch unreachable;
-            new_head.* = Block{};
+            prealloc.first_block.bytes_used = 0;
+            prealloc.first_block.next = null;
 
-            var to_move = _self.overflow.ptrs[0.._self.overflow.allocated][_self.overflow.used..];
-            if (to_move.len > 0) {
-                to_move = to_move[1..];
+            prealloc.metadata = .{
+                .current = &prealloc.first_block,
+            };
+
+            return &prealloc.metadata;
+        }
+
+        pub fn deinit(store: *Store) void {
+            log("deinit", .{});
+            var it = store.firstBlock().next; // do not free `store.head`
+            while (it) |next| {
+                if (Environment.isDebug)
+                    @memset(next.buffer, undefined);
+                it = next.next;
+                backing_allocator.destroy(next);
             }
 
-            std.mem.copyBackwards(*Block, _self.overflow.ptrs[1..], to_move);
-            _self.overflow.ptrs[0] = new_head;
-            _self.overflow.allocated = 1 + @truncate(Overflow.UsedSize, to_move.len);
-            reset();
-            return used;
+            const prealloc: PreAlloc = @fieldParentPtr("metadata", store);
+            bun.assert(&prealloc.first_block == store.head);
+            backing_allocator.destroy(prealloc);
         }
 
-        pub fn reset() void {
-            for (_self.overflow.slice()) |b| {
-                b.used = 0;
-            }
-            _self.overflow.used = 0;
-        }
+        pub fn reset(store: *Store) void {
+            log("reset", .{});
 
-        pub fn init(allocator: std.mem.Allocator) *Self {
-            var base = allocator.create(WithBase) catch unreachable;
-            base.* = WithBase{ .store = .{ .overflow = Overflow{ .allocator = allocator } } };
-            var instance = &base.store;
-            instance.overflow.ptrs[0] = &base.head;
-            instance.overflow.allocated = 1;
-
-            _self = instance;
-
-            return _self;
-        }
-
-        fn deinit() void {
-            var sliced = _self.overflow.slice();
-
-            if (sliced.len > 1) {
-                var i: usize = 1;
-                const end = sliced.len;
-                while (i < end) {
-                    var ptrs = @ptrCast(*[2]Block, sliced[i]);
-                    default_allocator.free(ptrs);
-                    i += 2;
+            if (Environment.isDebug) {
+                var it: ?*Block = store.firstBlock();
+                while (it) |next| : (it = next.next) {
+                    next.bytes_used = undefined;
+                    @memset(&next.buffer, undefined);
                 }
-                _self.overflow.allocated = 1;
             }
-            var base_store = @fieldParentPtr(WithBase, "store", _self);
-            if (_self.overflow.ptrs[0] == &base_store.head) {
-                default_allocator.destroy(base_store);
-            }
-            _self = undefined;
+
+            store.current = store.firstBlock();
+            store.current.bytes_used = 0;
         }
 
-        pub fn append(comptime ValueType: type, value: ValueType) *ValueType {
-            return _self._append(ValueType, value);
+        fn allocate(store: *Store, comptime T: type) *T {
+            comptime bun.assert(@sizeOf(T) > 0); // don't allocate!
+            comptime if (!supportsType(T)) {
+                @compileError("Store does not know about type: " ++ @typeName(T));
+            };
+
+            if (store.current.tryAlloc(T)) |ptr|
+                return ptr;
+
+            // a new block is needed
+            const next_block = if (store.current.next) |next| brk: {
+                next.bytes_used = 0;
+                break :brk next;
+            } else brk: {
+                const new_block = backing_allocator.create(Block) catch
+                    bun.outOfMemory();
+                new_block.next = null;
+                new_block.bytes_used = 0;
+                store.current.next = new_block;
+                break :brk new_block;
+            };
+
+            store.current = next_block;
+
+            return next_block.tryAlloc(T) orelse
+                unreachable; // newly initialized blocks must have enough space for at least one
         }
 
-        inline fn _append(self: *Self, comptime ValueType: type, value: ValueType) *ValueType {
-            const bytes = std.mem.asBytes(&value);
-            const BytesAsSlice = @TypeOf(bytes);
+        pub inline fn append(store: *Store, comptime T: type, data: T) *T {
+            const ptr = store.allocate(T);
+            if (Environment.isDebug) {
+                log("append({s}) -> 0x{x}", .{ bun.meta.typeName(T), @intFromPtr(ptr) });
+            }
+            ptr.* = data;
+            return ptr;
+        }
 
-            var block = self.overflow.tail();
+        pub fn lock(store: *Store) void {
+            store.debug_lock.lock();
+        }
 
-            return @ptrCast(
-                *ValueType,
-                @alignCast(
-                    @alignOf(ValueType),
-                    @alignCast(@alignOf(ValueType), block.append(BytesAsSlice, bytes)),
-                ),
-            );
+        pub fn unlock(store: *Store) void {
+            store.debug_lock.unlock();
+        }
+
+        fn supportsType(T: type) bool {
+            return std.mem.indexOfScalar(type, types, T) != null;
         }
     };
 }
@@ -211,7 +227,7 @@ pub fn NewBaseStore(comptime Union: anytype, comptime count: usize) type {
 pub const BindingNodeIndex = Binding;
 pub const StmtNodeIndex = Stmt;
 pub const ExprNodeIndex = Expr;
-pub const BabyList = @import("./baby_list.zig").BabyList;
+pub const BabyList = bun.BabyList;
 
 /// Slice that stores capacity and length in the same space as a regular slice.
 pub const ExprNodeList = BabyList(Expr);
@@ -221,14 +237,13 @@ pub const BindingNodeList = []Binding;
 
 pub const ImportItemStatus = enum(u2) {
     none,
-
-    // The linker doesn't report import/export mismatch errors
+    /// The linker doesn't report import/export mismatch errors
     generated,
-    // The printer will replace this import with "undefined"
-
+    /// The printer will replace this import with "undefined"
     missing,
-    pub fn jsonStringify(self: @This(), opts: anytype, o: anytype) !void {
-        return try std.json.stringify(@tagName(self), opts, o);
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        return try writer.write(@tagName(self));
     }
 };
 
@@ -236,19 +251,23 @@ pub const AssignTarget = enum(u2) {
     none = 0,
     replace = 1, // "a = b"
     update = 2, // "a += b"
-    pub fn jsonStringify(self: *const @This(), opts: anytype, o: anytype) !void {
-        return try std.json.stringify(@tagName(self), opts, o);
+    pub fn jsonStringify(self: *const @This(), writer: anytype) !void {
+        return try writer.write(@tagName(self));
     }
 };
 
-pub const LocRef = struct { loc: logger.Loc, ref: ?Ref = null };
+pub const LocRef = struct {
+    loc: logger.Loc = logger.Loc.Empty,
+
+    // TODO: remove this optional and make Ref a function getter
+    // That will make this struct 128 bits instead of 192 bits and we can remove some heap allocations
+    ref: ?Ref = null,
+};
 
 pub const Flags = struct {
     pub const JSXElement = enum {
-        is_key_before_rest,
+        is_key_after_spread,
         has_any_dynamic,
-        can_be_inlined,
-        can_be_hoisted,
         pub const Bitset = std.enums.EnumSet(JSXElement);
     };
 
@@ -282,10 +301,6 @@ pub const Flags = struct {
         /// Only applicable to function statements.
         is_export,
 
-        /// Used for Hot Module Reloading's wrapper function
-        /// "iife" stands for "immediately invoked function expression"
-        print_as_iife,
-
         pub inline fn init(fields: Fields) Set {
             return Set.init(fields);
         }
@@ -301,14 +316,14 @@ pub const Binding = struct {
     data: B,
 
     const Serializable = struct {
-        @"type": Tag,
+        type: Tag,
         object: string,
         value: B,
         loc: logger.Loc,
     };
 
-    pub fn jsonStringify(self: *const @This(), options: anytype, writer: anytype) !void {
-        return try std.json.stringify(Serializable{ .@"type" = std.meta.activeTag(self.data), .object = "binding", .value = self.data, .loc = self.loc }, options, writer);
+    pub fn jsonStringify(self: *const @This(), writer: anytype) !void {
+        return try writer.write(Serializable{ .type = std.meta.activeTag(self.data), .object = "binding", .value = self.data, .loc = self.loc });
     }
 
     pub fn ToExpr(comptime expr_type: type, comptime func_type: anytype) type {
@@ -329,13 +344,12 @@ pub const Binding = struct {
     }
 
     pub fn toExpr(binding: *const Binding, wrapper: anytype) Expr {
-        var loc = binding.loc;
+        const loc = binding.loc;
 
         switch (binding.data) {
             .b_missing => {
                 return Expr{ .data = .{ .e_missing = E.Missing{} }, .loc = loc };
             },
-
             .b_identifier => |b| {
                 return wrapper.wrapIdentifier(loc, b.ref);
             },
@@ -349,7 +363,7 @@ pub const Binding = struct {
                         if (b.has_spread and i == exprs.len - 1) {
                             break :convert Expr.init(E.Spread, E.Spread{ .value = expr }, expr.loc);
                         } else if (item.default_value) |default| {
-                            break :convert Expr.assign(expr, default, wrapper.allocator);
+                            break :convert Expr.assign(expr, default);
                         } else {
                             break :convert expr;
                         }
@@ -359,30 +373,29 @@ pub const Binding = struct {
                 return Expr.init(E.Array, E.Array{ .items = ExprNodeList.init(exprs), .is_single_line = b.is_single_line }, loc);
             },
             .b_object => |b| {
-                var properties = wrapper
+                const properties = wrapper
                     .allocator
                     .alloc(G.Property, b.properties.len) catch unreachable;
-                var i: usize = 0;
-                while (i < properties.len) : (i += 1) {
-                    const item = b.properties[i];
-                    properties[i] = G.Property{
+                for (properties, b.properties) |*property, item| {
+                    property.* = .{
                         .flags = item.flags,
                         .key = item.key,
                         .kind = if (item.flags.contains(.is_spread))
-                            G.Property.Kind.spread
+                            .spread
                         else
-                            G.Property.Kind.normal,
+                            .normal,
                         .value = toExpr(&item.value, wrapper),
                         .initializer = item.default_value,
                     };
                 }
-                return Expr.init(E.Object, E.Object{
-                    .properties = G.Property.List.init(properties),
-                    .is_single_line = b.is_single_line,
-                }, loc);
-            },
-            else => {
-                Global.panic("Interanl error", .{});
+                return Expr.init(
+                    E.Object,
+                    E.Object{
+                        .properties = G.Property.List.init(properties),
+                        .is_single_line = b.is_single_line,
+                    },
+                    loc,
+                );
             },
         }
     }
@@ -390,12 +403,11 @@ pub const Binding = struct {
     pub const Tag = enum(u5) {
         b_identifier,
         b_array,
-        b_property,
         b_object,
         b_missing,
 
-        pub fn jsonStringify(self: @This(), opts: anytype, o: anytype) !void {
-            return try std.json.stringify(@tagName(self), opts, o);
+        pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            return try writer.write(@tagName(self));
         }
     };
 
@@ -409,9 +421,6 @@ pub const Binding = struct {
             },
             *B.Array => {
                 return Binding{ .loc = loc, .data = B{ .b_array = t } };
-            },
-            *B.Property => {
-                return Binding{ .loc = loc, .data = B{ .b_property = t } };
             },
             *B.Object => {
                 return Binding{ .loc = loc, .data = B{ .b_object = t } };
@@ -429,22 +438,17 @@ pub const Binding = struct {
         icount += 1;
         switch (@TypeOf(t)) {
             B.Identifier => {
-                var data = allocator.create(B.Identifier) catch unreachable;
+                const data = allocator.create(B.Identifier) catch unreachable;
                 data.* = t;
                 return Binding{ .loc = loc, .data = B{ .b_identifier = data } };
             },
             B.Array => {
-                var data = allocator.create(B.Array) catch unreachable;
+                const data = allocator.create(B.Array) catch unreachable;
                 data.* = t;
                 return Binding{ .loc = loc, .data = B{ .b_array = data } };
             },
-            B.Property => {
-                var data = allocator.create(B.Property) catch unreachable;
-                data.* = t;
-                return Binding{ .loc = loc, .data = B{ .b_property = data } };
-            },
             B.Object => {
-                var data = allocator.create(B.Object) catch unreachable;
+                const data = allocator.create(B.Object) catch unreachable;
                 data.* = t;
                 return Binding{ .loc = loc, .data = B{ .b_object = data } };
             },
@@ -458,13 +462,31 @@ pub const Binding = struct {
     }
 };
 
-/// B is for Binding!
-/// These are the types of bindings that can be used in the AST.
+/// B is for Binding! Bindings are on the left side of variable
+/// declarations (s_local), which is how destructuring assignments
+/// are represented in memory. Consider a basic example.
+///
+///     let hello = world;
+///         ^       ^
+///         |       E.Identifier
+///         B.Identifier
+///
+/// Bindings can be nested
+///
+///                B.Array
+///                | B.Identifier
+///                | |
+///     let { foo: [ bar ] } = ...
+///         ----------------
+///         B.Object
 pub const B = union(Binding.Tag) {
+    // let x = ...
     b_identifier: *B.Identifier,
+    // let [a, b] = ...
     b_array: *B.Array,
-    b_property: *B.Property,
+    // let { a, b: c } = ...
     b_object: *B.Object,
+    // this is used to represent array holes
     b_missing: B.Missing,
 
     pub const Identifier = struct {
@@ -474,11 +496,16 @@ pub const B = union(Binding.Tag) {
     pub const Property = struct {
         flags: Flags.Property.Set = Flags.Property.None,
         key: ExprNodeIndex,
-        value: BindingNodeIndex,
-        default_value: ?ExprNodeIndex = null,
+        value: Binding,
+        default_value: ?Expr = null,
     };
 
-    pub const Object = struct { properties: []Property, is_single_line: bool = false };
+    pub const Object = struct {
+        properties: []B.Property,
+        is_single_line: bool = false,
+
+        pub const Property = B.Property;
+    };
 
     pub const Array = struct {
         items: []ArrayBinding,
@@ -487,11 +514,44 @@ pub const B = union(Binding.Tag) {
     };
 
     pub const Missing = struct {};
+
+    /// This hash function is currently only used for React Fast Refresh transform.
+    /// This doesn't include the `is_single_line` properties, as they only affect whitespace.
+    pub fn writeToHasher(b: B, hasher: anytype, symbol_table: anytype) void {
+        switch (b) {
+            .b_identifier => |id| {
+                const original_name = id.ref.getSymbol(symbol_table).original_name;
+                writeAnyToHasher(hasher, .{ std.meta.activeTag(b), original_name.len });
+            },
+            .b_array => |array| {
+                writeAnyToHasher(hasher, .{ std.meta.activeTag(b), array.has_spread, array.items.len });
+                for (array.items) |item| {
+                    writeAnyToHasher(hasher, .{item.default_value != null});
+                    if (item.default_value) |default| {
+                        default.data.writeToHasher(hasher, symbol_table);
+                    }
+                    item.binding.data.writeToHasher(hasher, symbol_table);
+                }
+            },
+            .b_object => |object| {
+                writeAnyToHasher(hasher, .{ std.meta.activeTag(b), object.properties.len });
+                for (object.properties) |property| {
+                    writeAnyToHasher(hasher, .{ property.default_value != null, property.flags });
+                    if (property.default_value) |default| {
+                        default.data.writeToHasher(hasher, symbol_table);
+                    }
+                    property.key.data.writeToHasher(hasher, symbol_table);
+                    property.value.data.writeToHasher(hasher, symbol_table);
+                }
+            },
+            .b_missing => {},
+        }
+    }
 };
 
 pub const ClauseItem = struct {
     alias: string,
-    alias_loc: logger.Loc,
+    alias_loc: logger.Loc = logger.Loc.Empty,
     name: LocRef,
 
     /// This is the original name of the symbol stored in "Name". It's needed for
@@ -502,15 +562,202 @@ pub const ClauseItem = struct {
     /// In this case both "foo" and "bar" are aliases because it's a re-export.
     /// We need to preserve both aliases in case the symbol is renamed. In this
     /// example, "foo" is "OriginalName" and "bar" is "Alias".
-    original_name: string,
+    original_name: string = "",
 
     pub const default_alias: string = "default";
+};
+
+pub const SlotCounts = struct {
+    slots: Symbol.SlotNamespace.CountsArray = Symbol.SlotNamespace.CountsArray.initFill(0),
+
+    pub fn unionMax(this: *SlotCounts, other: SlotCounts) void {
+        for (&this.slots.values, other.slots.values) |*a, b| {
+            if (a.* < b) a.* = b;
+        }
+    }
+};
+
+const char_freq_count = 64;
+pub const CharAndCount = struct {
+    char: u8 = 0,
+    count: i32 = 0,
+    index: usize = 0,
+
+    pub const Array = [char_freq_count]CharAndCount;
+
+    pub fn lessThan(_: void, a: CharAndCount, b: CharAndCount) bool {
+        if (a.count != b.count) {
+            return a.count > b.count;
+        }
+
+        if (a.index != b.index) {
+            return a.index < b.index;
+        }
+
+        return a.char < b.char;
+    }
+};
+
+pub const CharFreq = struct {
+    const Vector = @Vector(char_freq_count, i32);
+    const Buffer = [char_freq_count]i32;
+
+    freqs: Buffer align(1) = undefined,
+
+    const scan_big_chunk_size = 32;
+    pub fn scan(this: *CharFreq, text: string, delta: i32) void {
+        if (delta == 0)
+            return;
+
+        if (text.len < scan_big_chunk_size) {
+            scanSmall(&this.freqs, text, delta);
+        } else {
+            scanBig(&this.freqs, text, delta);
+        }
+    }
+
+    fn scanBig(out: *align(1) Buffer, text: string, delta: i32) void {
+        // https://zig.godbolt.org/z/P5dPojWGK
+        var freqs = out.*;
+        defer out.* = freqs;
+        var deltas: [256]i32 = [_]i32{0} ** 256;
+        var remain = text;
+
+        bun.assert(remain.len >= scan_big_chunk_size);
+
+        const unrolled = remain.len - (remain.len % scan_big_chunk_size);
+        const remain_end = remain.ptr + unrolled;
+        var unrolled_ptr = remain.ptr;
+        remain = remain[unrolled..];
+
+        while (unrolled_ptr != remain_end) : (unrolled_ptr += scan_big_chunk_size) {
+            const chunk = unrolled_ptr[0..scan_big_chunk_size].*;
+            inline for (0..scan_big_chunk_size) |i| {
+                deltas[@as(usize, chunk[i])] += delta;
+            }
+        }
+
+        for (remain) |c| {
+            deltas[@as(usize, c)] += delta;
+        }
+
+        freqs[0..26].* = deltas['a' .. 'a' + 26].*;
+        freqs[26 .. 26 * 2].* = deltas['A' .. 'A' + 26].*;
+        freqs[26 * 2 .. 62].* = deltas['0' .. '0' + 10].*;
+        freqs[62] = deltas['_'];
+        freqs[63] = deltas['$'];
+    }
+
+    fn scanSmall(out: *align(1) Buffer, text: string, delta: i32) void {
+        var freqs: [char_freq_count]i32 = out.*;
+        defer out.* = freqs;
+
+        for (text) |c| {
+            const i: usize = switch (c) {
+                'a'...'z' => @as(usize, @intCast(c)) - 'a',
+                'A'...'Z' => @as(usize, @intCast(c)) - ('A' - 26),
+                '0'...'9' => @as(usize, @intCast(c)) + (53 - '0'),
+                '_' => 62,
+                '$' => 63,
+                else => continue,
+            };
+            freqs[i] += delta;
+        }
+    }
+
+    pub fn include(this: *CharFreq, other: CharFreq) void {
+        // https://zig.godbolt.org/z/Mq8eK6K9s
+        const left: @Vector(char_freq_count, i32) = this.freqs;
+        const right: @Vector(char_freq_count, i32) = other.freqs;
+
+        this.freqs = left + right;
+    }
+
+    pub fn compile(this: *const CharFreq, allocator: std.mem.Allocator) NameMinifier {
+        const array: CharAndCount.Array = brk: {
+            var _array: CharAndCount.Array = undefined;
+
+            for (&_array, NameMinifier.default_tail, this.freqs, 0..) |*dest, char, freq, i| {
+                dest.* = CharAndCount{
+                    .char = char,
+                    .index = i,
+                    .count = freq,
+                };
+            }
+
+            std.sort.pdq(CharAndCount, &_array, {}, CharAndCount.lessThan);
+
+            break :brk _array;
+        };
+
+        var minifier = NameMinifier.init(allocator);
+        minifier.head.ensureTotalCapacityPrecise(NameMinifier.default_head.len) catch unreachable;
+        minifier.tail.ensureTotalCapacityPrecise(NameMinifier.default_tail.len) catch unreachable;
+        // TODO: investigate counting number of < 0 and > 0 and pre-allocating
+        for (array) |item| {
+            if (item.char < '0' or item.char > '9') {
+                minifier.head.append(item.char) catch unreachable;
+            }
+            minifier.tail.append(item.char) catch unreachable;
+        }
+
+        return minifier;
+    }
+};
+
+pub const NameMinifier = struct {
+    head: std.ArrayList(u8),
+    tail: std.ArrayList(u8),
+
+    pub const default_head = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_$";
+    pub const default_tail = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_$";
+
+    pub fn init(allocator: std.mem.Allocator) NameMinifier {
+        return .{
+            .head = std.ArrayList(u8).init(allocator),
+            .tail = std.ArrayList(u8).init(allocator),
+        };
+    }
+
+    pub fn numberToMinifiedName(this: *NameMinifier, name: *std.ArrayList(u8), _i: isize) !void {
+        name.clearRetainingCapacity();
+        var i = _i;
+        var j = @as(usize, @intCast(@mod(i, 54)));
+        try name.appendSlice(this.head.items[j .. j + 1]);
+        i = @divFloor(i, 54);
+
+        while (i > 0) {
+            i -= 1;
+            j = @as(usize, @intCast(@mod(i, char_freq_count)));
+            try name.appendSlice(this.tail.items[j .. j + 1]);
+            i = @divFloor(i, char_freq_count);
+        }
+    }
+
+    pub fn defaultNumberToMinifiedName(allocator: std.mem.Allocator, _i: isize) !string {
+        var i = _i;
+        var j = @as(usize, @intCast(@mod(i, 54)));
+        var name = std.ArrayList(u8).init(allocator);
+        try name.appendSlice(default_head[j .. j + 1]);
+        i = @divFloor(i, 54);
+
+        while (i > 0) {
+            i -= 1;
+            j = @as(usize, @intCast(@mod(i, char_freq_count)));
+            try name.appendSlice(default_tail[j .. j + 1]);
+            i = @divFloor(i, char_freq_count);
+        }
+
+        return name.items;
+    }
 };
 
 pub const G = struct {
     pub const Decl = struct {
         binding: BindingNodeIndex,
         value: ?ExprNodeIndex = null,
+
+        pub const List = BabyList(Decl);
     };
 
     pub const NamespaceAlias = struct {
@@ -539,6 +786,45 @@ pub const G = struct {
         body_loc: logger.Loc = logger.Loc.Empty,
         close_brace_loc: logger.Loc = logger.Loc.Empty,
         properties: []Property = &([_]Property{}),
+        has_decorators: bool = false,
+
+        pub fn canBeMoved(this: *const Class) bool {
+            if (this.extends != null)
+                return false;
+
+            if (this.has_decorators) {
+                return false;
+            }
+
+            for (this.properties) |property| {
+                if (property.kind == .class_static_block)
+                    return false;
+
+                const flags = property.flags;
+                if (flags.contains(.is_computed) or flags.contains(.is_spread)) {
+                    return false;
+                }
+
+                if (property.kind == .normal) {
+                    if (flags.contains(.is_static)) {
+                        for ([2]?Expr{ property.value, property.initializer }) |val_| {
+                            if (val_) |val| {
+                                switch (val.data) {
+                                    .e_arrow, .e_function => {},
+                                    else => {
+                                        if (!val.canBeMoved()) {
+                                            return false;
+                                        }
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            return true;
+        }
     };
 
     // invalid shadowing if left as Comment
@@ -550,38 +836,62 @@ pub const G = struct {
     };
 
     pub const Property = struct {
+        /// This is used when parsing a pattern that uses default values:
+        ///
+        ///   [a = 1] = [];
+        ///   ({a = 1} = {});
+        ///
+        /// It's also used for class fields:
+        ///
+        ///   class Foo { a = 1 }
+        ///
+        initializer: ?ExprNodeIndex = null,
+        kind: Kind = .normal,
+        flags: Flags.Property.Set = Flags.Property.None,
+
         class_static_block: ?*ClassStaticBlock = null,
-        ts_decorators: ExprNodeList = ExprNodeList{},
+        ts_decorators: ExprNodeList = .{},
         // Key is optional for spread
         key: ?ExprNodeIndex = null,
 
         // This is omitted for class fields
         value: ?ExprNodeIndex = null,
 
-        // This is used when parsing a pattern that uses default values:
-        //
-        //   [a = 1] = [];
-        //   ({a = 1} = {});
-        //
-        // It's also used for class fields:
-        //
-        //   class Foo { a = 1 }
-        //
-        initializer: ?ExprNodeIndex = null,
-        kind: Kind = Kind.normal,
-        flags: Flags.Property.Set = Flags.Property.None,
+        ts_metadata: TypeScript.Metadata = .m_none,
 
         pub const List = BabyList(Property);
+
+        pub fn deepClone(this: *const Property, allocator: std.mem.Allocator) !Property {
+            var class_static_block: ?*ClassStaticBlock = null;
+            if (this.class_static_block != null) {
+                class_static_block = bun.create(allocator, ClassStaticBlock, .{
+                    .loc = this.class_static_block.?.loc,
+                    .stmts = try this.class_static_block.?.stmts.clone(allocator),
+                });
+            }
+            return .{
+                .initializer = if (this.initializer) |init| try init.deepClone(allocator) else null,
+                .kind = this.kind,
+                .flags = this.flags,
+                .class_static_block = class_static_block,
+                .ts_decorators = try this.ts_decorators.deepClone(allocator),
+                .key = if (this.key) |key| try key.deepClone(allocator) else null,
+                .value = if (this.value) |value| try value.deepClone(allocator) else null,
+                .ts_metadata = this.ts_metadata,
+            };
+        }
 
         pub const Kind = enum(u3) {
             normal,
             get,
             set,
             spread,
+            declare,
+            abstract,
             class_static_block,
 
-            pub fn jsonStringify(self: @This(), opts: anytype, o: anytype) !void {
-                return try std.json.stringify(@tagName(self), opts, o);
+            pub fn jsonStringify(self: @This(), writer: anytype) !void {
+                return try writer.write(@tagName(self));
             }
         };
     };
@@ -592,15 +902,36 @@ pub const G = struct {
     };
 
     pub const Fn = struct {
-        name: ?LocRef,
-        open_parens_loc: logger.Loc,
-        args: []Arg = &([_]Arg{}),
+        name: ?LocRef = null,
+        open_parens_loc: logger.Loc = logger.Loc.Empty,
+        args: []Arg = &.{},
         // This was originally nullable, but doing so I believe caused a miscompilation
         // Specifically, the body was always null.
-        body: FnBody = FnBody{ .loc = logger.Loc.Empty, .stmts = &([_]StmtNodeIndex{}) },
+        body: FnBody = .{ .loc = logger.Loc.Empty, .stmts = &.{} },
         arguments_ref: ?Ref = null,
 
         flags: Flags.Function.Set = Flags.Function.None,
+
+        return_ts_metadata: TypeScript.Metadata = .m_none,
+
+        pub fn deepClone(this: *const Fn, allocator: std.mem.Allocator) !Fn {
+            const args = try allocator.alloc(Arg, this.args.len);
+            for (0..args.len) |i| {
+                args[i] = try this.args[i].deepClone(allocator);
+            }
+            return .{
+                .name = this.name,
+                .open_parens_loc = this.open_parens_loc,
+                .args = args,
+                .body = .{
+                    .loc = this.body.loc,
+                    .stmts = this.body.stmts,
+                },
+                .arguments_ref = this.arguments_ref,
+                .flags = this.flags,
+                .return_ts_metadata = this.return_ts_metadata,
+            };
+        }
     };
     pub const Arg = struct {
         ts_decorators: ExprNodeList = ExprNodeList{},
@@ -609,187 +940,263 @@ pub const G = struct {
 
         // "constructor(public x: boolean) {}"
         is_typescript_ctor_field: bool = false,
+
+        ts_metadata: TypeScript.Metadata = .m_none,
+
+        pub fn deepClone(this: *const Arg, allocator: std.mem.Allocator) !Arg {
+            return .{
+                .ts_decorators = try this.ts_decorators.deepClone(allocator),
+                .binding = this.binding,
+                .default = if (this.default) |d| try d.deepClone(allocator) else null,
+                .is_typescript_ctor_field = this.is_typescript_ctor_field,
+                .ts_metadata = this.ts_metadata,
+            };
+        }
     };
 };
 
 pub const Symbol = struct {
-    // This is the name that came from the parser. Printed names may be renamed
-    // during minification or to avoid name collisions. Do not use the original
-    // name during printing.
+    /// This is the name that came from the parser. Printed names may be renamed
+    /// during minification or to avoid name collisions. Do not use the original
+    /// name during printing.
     original_name: string,
 
-    // This is used for symbols that represent items in the import clause of an
-    // ES6 import statement. These should always be referenced by EImportIdentifier
-    // instead of an EIdentifier. When this is present, the expression should
-    // be printed as a property access off the namespace instead of as a bare
-    // identifier.
-    //
-    // For correctness, this must be stored on the symbol instead of indirectly
-    // associated with the Ref for the symbol somehow. In ES6 "flat bundling"
-    // mode, re-exported symbols are collapsed using MergeSymbols() and renamed
-    // symbols from other files that end up at this symbol must be able to tell
-    // if it has a namespace alias.
+    /// This is used for symbols that represent items in the import clause of an
+    /// ES6 import statement. These should always be referenced by EImportIdentifier
+    /// instead of an EIdentifier. When this is present, the expression should
+    /// be printed as a property access off the namespace instead of as a bare
+    /// identifier.
+    ///
+    /// For correctness, this must be stored on the symbol instead of indirectly
+    /// associated with the Ref for the symbol somehow. In ES6 "flat bundling"
+    /// mode, re-exported symbols are collapsed using MergeSymbols() and renamed
+    /// symbols from other files that end up at this symbol must be able to tell
+    /// if it has a namespace alias.
     namespace_alias: ?G.NamespaceAlias = null,
 
-    // Used by the parser for single pass parsing.
+    /// Used by the parser for single pass parsing.
     link: Ref = Ref.None,
 
-    // An estimate of the number of uses of this symbol. This is used to detect
-    // whether a symbol is used or not. For example, TypeScript imports that are
-    // unused must be removed because they are probably type-only imports. This
-    // is an estimate and may not be completely accurate due to oversights in the
-    // code. But it should always be non-zero when the symbol is used.
+    /// An estimate of the number of uses of this symbol. This is used to detect
+    /// whether a symbol is used or not. For example, TypeScript imports that are
+    /// unused must be removed because they are probably type-only imports. This
+    /// is an estimate and may not be completely accurate due to oversights in the
+    /// code. But it should always be non-zero when the symbol is used.
     use_count_estimate: u32 = 0,
 
-    // This is for generating cross-chunk imports and exports for code splitting.
-    chunk_index: ?u32 = null,
+    /// This is for generating cross-chunk imports and exports for code splitting.
+    ///
+    /// Do not use this directly. Use `chunkIndex()` instead.
+    chunk_index: u32 = invalid_chunk_index,
 
-    // This is used for minification. Symbols that are declared in sibling scopes
-    // can share a name. A good heuristic (from Google Closure Compiler) is to
-    // assign names to symbols from sibling scopes in declaration order. That way
-    // local variable names are reused in each global function like this, which
-    // improves gzip compression:
-    //
-    //   function x(a, b) { ... }
-    //   function y(a, b, c) { ... }
-    //
-    // The parser fills this in for symbols inside nested scopes. There are three
-    // slot namespaces: regular symbols, label symbols, and private symbols.
-    nested_scope_slot: ?u32 = null,
+    /// This is used for minification. Symbols that are declared in sibling scopes
+    /// can share a name. A good heuristic (from Google Closure Compiler) is to
+    /// assign names to symbols from sibling scopes in declaration order. That way
+    /// local variable names are reused in each global function like this, which
+    /// improves gzip compression:
+    ///
+    ///   function x(a, b) { ... }
+    ///   function y(a, b, c) { ... }
+    ///
+    /// The parser fills this in for symbols inside nested scopes. There are three
+    /// slot namespaces: regular symbols, label symbols, and private symbols.
+    ///
+    /// Do not use this directly. Use `nestedScopeSlot()` instead.
+    nested_scope_slot: u32 = invalid_nested_scope_slot,
 
+    did_keep_name: bool = true,
+
+    must_start_with_capital_letter_for_jsx: bool = false,
+
+    /// The kind of symbol. This is used to determine how to print the symbol
+    /// and how to deal with conflicts, renaming, etc.
     kind: Kind = Kind.other,
 
-    // Certain symbols must not be renamed or minified. For example, the
-    // "arguments" variable is declared by the runtime for every function.
-    // Renaming can also break any identifier used inside a "with" statement.
+    /// Certain symbols must not be renamed or minified. For example, the
+    /// "arguments" variable is declared by the runtime for every function.
+    /// Renaming can also break any identifier used inside a "with" statement.
     must_not_be_renamed: bool = false,
 
-    // We automatically generate import items for property accesses off of
-    // namespace imports. This lets us remove the expensive namespace imports
-    // while bundling in many cases, replacing them with a cheap import item
-    // instead:
-    //
-    //   import * as ns from 'path'
-    //   ns.foo()
-    //
-    // That can often be replaced by this, which avoids needing the namespace:
-    //
-    //   import {foo} from 'path'
-    //   foo()
-    //
-    // However, if the import is actually missing then we don't want to report a
-    // compile-time error like we do for real import items. This status lets us
-    // avoid this. We also need to be able to replace such import items with
-    // undefined, which this status is also used for.
+    /// We automatically generate import items for property accesses off of
+    /// namespace imports. This lets us remove the expensive namespace imports
+    /// while bundling in many cases, replacing them with a cheap import item
+    /// instead:
+    ///
+    ///   import * as ns from 'path'
+    ///   ns.foo()
+    ///
+    /// That can often be replaced by this, which avoids needing the namespace:
+    ///
+    ///   import {foo} from 'path'
+    ///   foo()
+    ///
+    /// However, if the import is actually missing then we don't want to report a
+    /// compile-time error like we do for real import items. This status lets us
+    /// avoid this. We also need to be able to replace such import items with
+    /// undefined, which this status is also used for.
     import_item_status: ImportItemStatus = ImportItemStatus.none,
 
-    // Sometimes we lower private symbols even if they are supported. For example,
-    // consider the following TypeScript code:
-    //
-    //   class Foo {
-    //     #foo = 123
-    //     bar = this.#foo
-    //   }
-    //
-    // If "useDefineForClassFields: false" is set in "tsconfig.json", then "bar"
-    // must use assignment semantics instead of define semantics. We can compile
-    // that to this code:
-    //
-    //   class Foo {
-    //     constructor() {
-    //       this.#foo = 123;
-    //       this.bar = this.#foo;
-    //     }
-    //     #foo;
-    //   }
-    //
-    // However, we can't do the same for static fields:
-    //
-    //   class Foo {
-    //     static #foo = 123
-    //     static bar = this.#foo
-    //   }
-    //
-    // Compiling these static fields to something like this would be invalid:
-    //
-    //   class Foo {
-    //     static #foo;
-    //   }
-    //   Foo.#foo = 123;
-    //   Foo.bar = Foo.#foo;
-    //
-    // Thus "#foo" must be lowered even though it's supported. Another case is
-    // when we're converting top-level class declarations to class expressions
-    // to avoid the TDZ and the class shadowing symbol is referenced within the
-    // class body:
-    //
-    //   class Foo {
-    //     static #foo = Foo
-    //   }
-    //
-    // This cannot be converted into something like this:
-    //
-    //   var Foo = class {
-    //     static #foo;
-    //   };
-    //   Foo.#foo = Foo;
-    //
+    /// --- Not actually used yet -----------------------------------------------
+    /// Sometimes we lower private symbols even if they are supported. For example,
+    /// consider the following TypeScript code:
+    ///
+    ///   class Foo {
+    ///     #foo = 123
+    ///     bar = this.#foo
+    ///   }
+    ///
+    /// If "useDefineForClassFields: false" is set in "tsconfig.json", then "bar"
+    /// must use assignment semantics instead of define semantics. We can compile
+    /// that to this code:
+    ///
+    ///   class Foo {
+    ///     constructor() {
+    ///       this.#foo = 123;
+    ///       this.bar = this.#foo;
+    ///     }
+    ///     #foo;
+    ///   }
+    ///
+    /// However, we can't do the same for static fields:
+    ///
+    ///   class Foo {
+    ///     static #foo = 123
+    ///     static bar = this.#foo
+    ///   }
+    ///
+    /// Compiling these static fields to something like this would be invalid:
+    ///
+    ///   class Foo {
+    ///     static #foo;
+    ///   }
+    ///   Foo.#foo = 123;
+    ///   Foo.bar = Foo.#foo;
+    ///
+    /// Thus "#foo" must be lowered even though it's supported. Another case is
+    /// when we're converting top-level class declarations to class expressions
+    /// to avoid the TDZ and the class shadowing symbol is referenced within the
+    /// class body:
+    ///
+    ///   class Foo {
+    ///     static #foo = Foo
+    ///   }
+    ///
+    /// This cannot be converted into something like this:
+    ///
+    ///   var Foo = class {
+    ///     static #foo;
+    ///   };
+    ///   Foo.#foo = Foo;
+    ///
+    /// --- Not actually used yet -----------------------------------------------
     private_symbol_must_be_lowered: bool = false,
 
+    remove_overwritten_function_declaration: bool = false,
+
+    /// In debug mode, sometimes its helpful to know what source file
+    /// A symbol came from. This is used for that.
+    ///
+    /// We don't want this in non-debug mode because it increases the size of
+    /// the symbol table.
+    debug_mode_source_index: if (Environment.allow_assert)
+        Index.Int
+    else
+        u0 = 0,
+
+    const invalid_chunk_index = std.math.maxInt(u32);
+    pub const invalid_nested_scope_slot = std.math.maxInt(u32);
+
+    pub const SlotNamespace = enum {
+        must_not_be_renamed,
+        default,
+        label,
+        private_name,
+        mangled_prop,
+
+        pub const CountsArray = std.EnumArray(SlotNamespace, u32);
+    };
+
+    /// This is for generating cross-chunk imports and exports for code splitting.
+    pub inline fn chunkIndex(this: *const Symbol) ?u32 {
+        const i = this.chunk_index;
+        return if (i == invalid_chunk_index) null else i;
+    }
+
+    pub inline fn nestedScopeSlot(this: *const Symbol) ?u32 {
+        const i = this.nested_scope_slot;
+        return if (i == invalid_nested_scope_slot) null else i;
+    }
+
+    pub fn slotNamespace(this: *const Symbol) SlotNamespace {
+        const kind = this.kind;
+
+        if (kind == .unbound or this.must_not_be_renamed) {
+            return .must_not_be_renamed;
+        }
+
+        if (kind.isPrivate()) {
+            return .private_name;
+        }
+
+        return switch (kind) {
+            // .mangled_prop => .mangled_prop,
+            .label => .label,
+            else => .default,
+        };
+    }
+
     pub inline fn hasLink(this: *const Symbol) bool {
-        return !this.link.isNull();
+        return this.link.tag != .invalid;
     }
 
     pub const Kind = enum {
-
-        // An unbound symbol is one that isn't declared in the file it's referenced
-        // in. For example, using "window" without declaring it will be unbound.
+        /// An unbound symbol is one that isn't declared in the file it's referenced
+        /// in. For example, using "window" without declaring it will be unbound.
         unbound,
 
-        // This has special merging behavior. You're allowed to re-declare these
-        // symbols more than once in the same scope. These symbols are also hoisted
-        // out of the scope they are declared in to the closest containing function
-        // or module scope. These are the symbols with this kind:
-        //
-        // - Function arguments
-        // - Function statements
-        // - Variables declared using "var"
-        //
+        /// This has special merging behavior. You're allowed to re-declare these
+        /// symbols more than once in the same scope. These symbols are also hoisted
+        /// out of the scope they are declared in to the closest containing function
+        /// or module scope. These are the symbols with this kind:
+        ///
+        /// - Function arguments
+        /// - Function statements
+        /// - Variables declared using "var"
         hoisted,
         hoisted_function,
 
-        // There's a weird special case where catch variables declared using a simple
-        // identifier (i.e. not a binding pattern) block hoisted variables instead of
-        // becoming an error:
-        //
-        //   var e = 0;
-        //   try { throw 1 } catch (e) {
-        //     print(e) // 1
-        //     var e = 2
-        //     print(e) // 2
-        //   }
-        //   print(e) // 0 (since the hoisting stops at the catch block boundary)
-        //
-        // However, other forms are still a syntax error:
-        //
-        //   try {} catch (e) { let e }
-        //   try {} catch ({e}) { var e }
-        //
-        // This symbol is for handling this weird special case.
+        /// There's a weird special case where catch variables declared using a simple
+        /// identifier (i.e. not a binding pattern) block hoisted variables instead of
+        /// becoming an error:
+        ///
+        ///   var e = 0;
+        ///   try { throw 1 } catch (e) {
+        ///     print(e) // 1
+        ///     var e = 2
+        ///     print(e) // 2
+        ///   }
+        ///   print(e) // 0 (since the hoisting stops at the catch block boundary)
+        ///
+        /// However, other forms are still a syntax error:
+        ///
+        ///   try {} catch (e) { let e }
+        ///   try {} catch ({e}) { var e }
+        ///
+        /// This symbol is for handling this weird special case.
         catch_identifier,
 
-        // Generator and async functions are not hoisted, but still have special
-        // properties such as being able to overwrite previous functions with the
-        // same name
+        /// Generator and async functions are not hoisted, but still have special
+        /// properties such as being able to overwrite previous functions with the
+        /// same name
         generator_or_async_function,
 
-        // This is the special "arguments" variable inside functions
+        /// This is the special "arguments" variable inside functions
         arguments,
 
-        // Classes can merge with TypeScript namespaces.
+        /// Classes can merge with TypeScript namespaces.
         class,
 
-        // A class-private identifier (i.e. "#foo").
+        /// A class-private identifier (i.e. "#foo").
         private_field,
         private_method,
         private_get,
@@ -801,35 +1208,79 @@ pub const Symbol = struct {
         private_static_set,
         private_static_get_set_pair,
 
-        // Labels are in their own namespace
+        /// Labels are in their own namespace
         label,
 
-        // TypeScript enums can merge with TypeScript namespaces and other TypeScript
-        // enums.
+        /// TypeScript enums can merge with TypeScript namespaces and other TypeScript
+        /// enums.
         ts_enum,
 
-        // TypeScript namespaces can merge with classes, functions, TypeScript enums,
-        // and other TypeScript namespaces.
+        /// TypeScript namespaces can merge with classes, functions, TypeScript enums,
+        /// and other TypeScript namespaces.
         ts_namespace,
 
-        // In TypeScript, imports are allowed to silently collide with symbols within
-        // the module. Presumably this is because the imports may be type-only.
+        /// In TypeScript, imports are allowed to silently collide with symbols within
+        /// the module. Presumably this is because the imports may be type-only.
+        /// Import statement namespace references should NOT have this set.
         import,
 
-        // Assigning to a "const" symbol will throw a TypeError at runtime
-        cconst,
+        /// Assigning to a "const" symbol will throw a TypeError at runtime
+        constant,
 
-        // This annotates all other symbols that don't have special behavior.
+        /// This annotates all other symbols that don't have special behavior.
         other,
 
-        pub fn jsonStringify(self: @This(), opts: anytype, o: anytype) !void {
-            return try std.json.stringify(@tagName(self), opts, o);
+        pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            return try writer.write(@tagName(self));
+        }
+
+        pub inline fn isPrivate(kind: Symbol.Kind) bool {
+            return @intFromEnum(kind) >= @intFromEnum(Symbol.Kind.private_field) and @intFromEnum(kind) <= @intFromEnum(Symbol.Kind.private_static_get_set_pair);
+        }
+
+        pub inline fn isHoisted(kind: Symbol.Kind) bool {
+            return switch (kind) {
+                .hoisted, .hoisted_function => true,
+                else => false,
+            };
+        }
+
+        pub inline fn isHoistedOrFunction(kind: Symbol.Kind) bool {
+            return switch (kind) {
+                .hoisted, .hoisted_function, .generator_or_async_function => true,
+                else => false,
+            };
+        }
+
+        pub inline fn isFunction(kind: Symbol.Kind) bool {
+            return switch (kind) {
+                .hoisted_function, .generator_or_async_function => true,
+                else => false,
+            };
         }
     };
+
+    pub const isKindPrivate = Symbol.Kind.isPrivate;
+    pub const isKindHoisted = Symbol.Kind.isHoisted;
+    pub const isKindHoistedOrFunction = Symbol.Kind.isHoistedOrFunction;
+    pub const isKindFunction = Symbol.Kind.isFunction;
 
     pub const Use = struct {
         count_estimate: u32 = 0,
     };
+
+    pub const List = BabyList(Symbol);
+    pub const NestedList = BabyList(List);
+
+    pub fn mergeContentsWith(this: *Symbol, old: *Symbol) void {
+        this.use_count_estimate += old.use_count_estimate;
+        if (old.must_not_be_renamed) {
+            this.original_name = old.original_name;
+            this.must_not_be_renamed = true;
+        }
+
+        // TODO: MustStartWithCapitalLetterForJSX
+    }
 
     pub const Map = struct {
         // This could be represented as a "map[Ref]Symbol" but a two-level array was
@@ -839,34 +1290,94 @@ pub const Symbol = struct {
         // single inner array, so you can join the maps together by just make a
         // single outer array containing all of the inner arrays. See the comment on
         // "Ref" for more detail.
-        symbols_for_source: [][]Symbol,
+        symbols_for_source: NestedList = .{},
 
-        pub fn get(self: *Map, ref: Ref) ?*Symbol {
-            if (Ref.isSourceIndexNull(ref.sourceIndex()) or ref.isSourceContentsSlice()) {
-                return null;
+        pub fn dump(this: Map) void {
+            defer Output.flush();
+            for (this.symbols_for_source.slice(), 0..) |symbols, i| {
+                Output.prettyln("\n\n-- Source ID: {d} ({d} symbols) --\n\n", .{ i, symbols.len });
+                for (symbols.slice(), 0..) |symbol, inner_index| {
+                    Output.prettyln(
+                        " name: {s}\n  tag: {s}\n       {any}\n",
+                        .{
+                            symbol.original_name, @tagName(symbol.kind),
+                            if (symbol.hasLink()) symbol.link else Ref{
+                                .source_index = @as(Ref.Int, @truncate(i)),
+                                .inner_index = @as(Ref.Int, @truncate(inner_index)),
+                                .tag = .symbol,
+                            },
+                        },
+                    );
+                }
             }
-
-            return &self.symbols_for_source[ref.sourceIndex()][ref.innerIndex()];
         }
 
-        pub fn getConst(self: *Map, ref: Ref) ?*const Symbol {
+        pub fn assignChunkIndex(this: *Map, decls_: DeclaredSymbol.List, chunk_index: u32) void {
+            const Iterator = struct {
+                map: *Map,
+                chunk_index: u32,
+
+                pub fn next(self: @This(), ref: Ref) void {
+                    var symbol = self.map.get(ref).?;
+                    symbol.chunk_index = self.chunk_index;
+                }
+            };
+            var decls = decls_;
+
+            DeclaredSymbol.forEachTopLevelSymbol(&decls, Iterator{ .map = this, .chunk_index = chunk_index }, Iterator.next);
+        }
+
+        pub fn merge(this: *Map, old: Ref, new: Ref) Ref {
+            if (old.eql(new)) {
+                return new;
+            }
+
+            var old_symbol = this.get(old).?;
+            if (old_symbol.hasLink()) {
+                const old_link = old_symbol.link;
+                old_symbol.link = this.merge(old_link, new);
+                return old_symbol.link;
+            }
+
+            var new_symbol = this.get(new).?;
+
+            if (new_symbol.hasLink()) {
+                const new_link = new_symbol.link;
+                new_symbol.link = this.merge(old, new_link);
+                return new_symbol.link;
+            }
+
+            old_symbol.link = new;
+            new_symbol.mergeContentsWith(old_symbol);
+            return new;
+        }
+
+        pub fn get(self: *const Map, ref: Ref) ?*Symbol {
             if (Ref.isSourceIndexNull(ref.sourceIndex()) or ref.isSourceContentsSlice()) {
                 return null;
             }
 
-            return &self.symbols_for_source[ref.sourceIndex()][ref.innerIndex()];
+            return self.symbols_for_source.at(ref.sourceIndex()).mut(ref.innerIndex());
+        }
+
+        pub fn getConst(self: *const Map, ref: Ref) ?*const Symbol {
+            if (Ref.isSourceIndexNull(ref.sourceIndex()) or ref.isSourceContentsSlice()) {
+                return null;
+            }
+
+            return self.symbols_for_source.at(ref.sourceIndex()).at(ref.innerIndex());
         }
 
         pub fn init(sourceCount: usize, allocator: std.mem.Allocator) !Map {
-            var symbols_for_source: [][]Symbol = try allocator.alloc([]Symbol, sourceCount);
+            const symbols_for_source: NestedList = NestedList.init(try allocator.alloc([]Symbol, sourceCount));
             return Map{ .symbols_for_source = symbols_for_source };
         }
 
-        pub fn initList(list: [][]Symbol) Map {
+        pub fn initList(list: NestedList) Map {
             return Map{ .symbols_for_source = list };
         }
 
-        pub fn getWithLink(symbols: *Map, ref: Ref) ?*Symbol {
+        pub fn getWithLink(symbols: *const Map, ref: Ref) ?*Symbol {
             var symbol: *Symbol = symbols.get(ref) orelse return null;
             if (symbol.hasLink()) {
                 return symbols.get(symbol.link) orelse symbol;
@@ -882,79 +1393,49 @@ pub const Symbol = struct {
             return symbol;
         }
 
-        pub fn follow(symbols: *Map, ref: Ref) Ref {
-            if (symbols.get(ref)) |symbol| {
-                const link = symbol.link;
-                if (link.isNull())
-                    return ref;
-
-                if (link.eql(ref)) {
-                    symbol.link = ref;
+        pub fn followAll(symbols: *Map) void {
+            const trace = bun.tracy.traceNamed(@src(), "Symbols.followAll");
+            defer trace.end();
+            for (symbols.symbols_for_source.slice()) |list| {
+                for (list.slice()) |*symbol| {
+                    if (!symbol.hasLink()) continue;
+                    symbol.link = follow(symbols, symbol.link);
                 }
-
-                return symbol.link;
-            } else {
-                return ref;
             }
         }
+
+        /// Equivalent to followSymbols in esbuild
+        pub fn follow(symbols: *const Map, ref: Ref) Ref {
+            var symbol = symbols.get(ref) orelse return ref;
+            if (!symbol.hasLink()) {
+                return ref;
+            }
+
+            const link = follow(symbols, symbol.link);
+
+            if (!symbol.link.eql(link)) {
+                symbol.link = link;
+            }
+
+            return link;
+        }
     };
-
-    pub inline fn isKindPrivate(kind: Symbol.Kind) bool {
-        return @enumToInt(kind) >= @enumToInt(Symbol.Kind.private_field) and @enumToInt(kind) <= @enumToInt(Symbol.Kind.private_static_get_set_pair);
-    }
-
-    pub inline fn isKindHoisted(kind: Symbol.Kind) bool {
-        return switch (kind) {
-            .hoisted, .hoisted_function => true,
-            else => false,
-        };
-    }
 
     pub inline fn isHoisted(self: *const Symbol) bool {
         return Symbol.isKindHoisted(self.kind);
     }
-
-    pub inline fn isKindHoistedOrFunction(kind: Symbol.Kind) bool {
-        return switch (kind) {
-            .hoisted, .hoisted_function, .generator_or_async_function => true,
-            else => false,
-        };
-    }
-
-    pub inline fn isKindFunction(kind: Symbol.Kind) bool {
-        return switch (kind) {
-            .hoisted_function, .generator_or_async_function => true,
-            else => false,
-        };
-    }
-
-    pub fn isReactComponentishName(symbol: *const Symbol) bool {
-        switch (symbol.kind) {
-            .hoisted, .hoisted_function, .cconst, .class, .other => {
-                return switch (symbol.original_name[0]) {
-                    'A'...'Z' => true,
-                    else => false,
-                };
-            },
-
-            else => {
-                return false;
-            },
-        }
-    }
 };
 
-pub const OptionalChain = enum(u2) {
-
-    // "a?.b"
+pub const OptionalChain = enum(u1) {
+    /// "a?.b"
     start,
 
-    // "a?.b.c" => ".c" is OptionalChainContinue
-    // "(a?.b).c" => ".c" is OptionalChain null
-    ccontinue,
+    /// "a?.b.c" => ".c" is .continuation
+    /// "(a?.b).c" => ".c" is null
+    continuation,
 
-    pub fn jsonStringify(self: @This(), opts: anytype, o: anytype) !void {
-        return try std.json.stringify(@tagName(self), opts, o);
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        return try writer.write(@tagName(self));
     }
 };
 
@@ -975,22 +1456,74 @@ pub const E = struct {
             return this.items.slice();
         }
 
-        pub fn toJS(this: @This(), ctx: JSC.C.JSContextRef, exception: JSC.C.ExceptionRef) JSC.C.JSValueRef {
-            var stack = std.heap.stackFallback(32 * @sizeOf(ExprNodeList), JSC.getAllocator(ctx));
-            var allocator = stack.get();
-            var results = allocator.alloc(JSC.C.JSValueRef, this.items.len) catch {
-                return JSC.C.JSValueMakeUndefined(ctx);
-            };
-            defer if (stack.fixed_buffer_allocator.end_index >= stack.fixed_buffer_allocator.buffer.len - 1) allocator.free(results);
+        pub fn inlineSpreadOfArrayLiterals(
+            this: *Array,
+            allocator: std.mem.Allocator,
+            estimated_count: usize,
+        ) !ExprNodeList {
+            var out = try allocator.alloc(
+                Expr,
+                // This over-allocates a little but it's fine
+                estimated_count + @as(usize, this.items.len),
+            );
+            var remain = out;
+            for (this.items.slice()) |item| {
+                switch (item.data) {
+                    .e_spread => |val| {
+                        if (val.value.data == .e_array) {
+                            for (val.value.data.e_array.items.slice()) |inner_item| {
+                                if (inner_item.data == .e_missing) {
+                                    remain[0] = Expr.init(E.Undefined, .{}, inner_item.loc);
+                                    remain = remain[1..];
+                                } else {
+                                    remain[0] = inner_item;
+                                    remain = remain[1..];
+                                }
+                            }
 
-            var i: usize = 0;
-            const items = this.items.slice();
-            while (i < results.len) : (i += 1) {
-                results[i] = items[i].toJS(ctx, exception);
+                            // skip empty arrays
+                            // don't include the inlined spread.
+                            continue;
+                        }
+                        // non-arrays are kept in
+                    },
+                    else => {},
+                }
+
+                remain[0] = item;
+                remain = remain[1..];
             }
 
-            return JSC.C.JSObjectMakeArray(ctx, results.len, results.ptr, exception);
+            return ExprNodeList.init(out[0 .. out.len - remain.len]);
         }
+
+        pub fn toJS(this: @This(), allocator: std.mem.Allocator, globalObject: *JSC.JSGlobalObject) ToJSError!JSC.JSValue {
+            const items = this.items.slice();
+            var array = JSC.JSValue.createEmptyArray(globalObject, items.len);
+            array.protect();
+            defer array.unprotect();
+            for (items, 0..) |expr, j| {
+                array.putIndex(globalObject, @as(u32, @truncate(j)), try expr.data.toJS(allocator, globalObject));
+            }
+
+            return array;
+        }
+
+        /// Assumes each item in the array is a string
+        pub fn alphabetizeStrings(this: *Array) void {
+            if (comptime Environment.allow_assert) {
+                for (this.items.slice()) |item| {
+                    bun.assert(item.data == .e_string);
+                }
+            }
+            std.sort.pdq(Expr, this.items.slice(), {}, Sorter.isLessThan);
+        }
+
+        const Sorter = struct {
+            pub fn isLessThan(ctx: void, lhs: Expr, rhs: Expr) bool {
+                return strings.cmpStringsAsc(ctx, lhs.data.e_string.data, rhs.data.e_string.data);
+            }
+        };
     };
 
     pub const Unary = struct {
@@ -1006,7 +1539,7 @@ pub const E = struct {
 
     pub const Boolean = struct {
         value: bool,
-        pub fn toJS(this: @This(), ctx: JSC.C.JSContextRef, _: JSC.C.ExceptionRef) JSC.C.JSValueRef {
+        pub fn toJS(this: @This(), ctx: JSC.C.JSContextRef) JSC.C.JSValueRef {
             return JSC.C.JSValueMakeBoolean(ctx, this.value);
         }
     };
@@ -1028,6 +1561,12 @@ pub const E = struct {
         range: logger.Range,
     };
     pub const ImportMeta = struct {};
+    pub const ImportMetaMain = struct {
+        /// If we want to print `!import.meta.main`, set this flag to true
+        /// instead of wrapping in a unary not. This way, the printer can easily
+        /// print `require.main != module` instead of `!(require.main == module)`
+        inverted: bool = false,
+    };
 
     pub const Call = struct {
         // Node:
@@ -1085,13 +1624,13 @@ pub const E = struct {
         target: ExprNodeIndex,
         optional_chain: ?OptionalChain = null,
 
-        pub fn hasSameFlagsAs(a: *Index, b: *Index) bool {
+        pub fn hasSameFlagsAs(a: *E.Index, b: *E.Index) bool {
             return (a.optional_chain == b.optional_chain);
         }
     };
 
     pub const Arrow = struct {
-        args: []G.Arg,
+        args: []G.Arg = &[_]G.Arg{},
         body: G.FnBody,
 
         is_async: bool = false,
@@ -1130,32 +1669,51 @@ pub const E = struct {
         }
     };
 
-    // This is similar to an EIdentifier but it represents a reference to an ES6
-    // import item.
-    //
-    // Depending on how the code is linked, the file containing this EImportIdentifier
-    // may or may not be in the same module group as the file it was imported from.
-    //
-    // If it's the same module group than we can just merge the import item symbol
-    // with the corresponding symbol that was imported, effectively renaming them
-    // to be the same thing and statically binding them together.
-    //
-    // But if it's a different module group, then the import must be dynamically
-    // evaluated using a property access off the corresponding namespace symbol,
-    // which represents the result of a require() call.
-    //
-    // It's stored as a separate type so it's not easy to confuse with a plain
-    // identifier. For example, it'd be bad if code trying to convert "{x: x}" into
-    // "{x}" shorthand syntax wasn't aware that the "x" in this case is actually
-    // "{x: importedNamespace.x}". This separate type forces code to opt-in to
-    // doing this instead of opt-out.
+    /// This is similar to an `Identifier` but it represents a reference to an ES6
+    /// import item.
+    ///
+    /// Depending on how the code is linked, the file containing this EImportIdentifier
+    /// may or may not be in the same module group as the file it was imported from.
+    ///
+    /// If it's the same module group than we can just merge the import item symbol
+    /// with the corresponding symbol that was imported, effectively renaming them
+    /// to be the same thing and statically binding them together.
+    ///
+    /// But if it's a different module group, then the import must be dynamically
+    /// evaluated using a property access off the corresponding namespace symbol,
+    /// which represents the result of a require() call.
+    ///
+    /// It's stored as a separate type so it's not easy to confuse with a plain
+    /// identifier. For example, it'd be bad if code trying to convert "{x: x}" into
+    /// "{x}" shorthand syntax wasn't aware that the "x" in this case is actually
+    /// "{x: importedNamespace.x}". This separate type forces code to opt-in to
+    /// doing this instead of opt-out.
     pub const ImportIdentifier = struct {
         ref: Ref = Ref.None,
 
-        // If true, this was originally an identifier expression such as "foo". If
-        // false, this could potentially have been a member access expression such
-        // as "ns.foo" off of an imported namespace object.
+        /// If true, this was originally an identifier expression such as "foo". If
+        /// false, this could potentially have been a member access expression such
+        /// as "ns.foo" off of an imported namespace object.
         was_originally_identifier: bool = false,
+    };
+
+    /// This is a dot expression on exports, such as `exports.<ref>`. It is given
+    /// it's own AST node to allow CommonJS unwrapping, in which this can just be
+    /// the identifier in the Ref
+    pub const CommonJSExportIdentifier = struct {
+        ref: Ref = Ref.None,
+        base: Base = .exports,
+
+        /// The original variant of the dot expression must be known so that in the case that we
+        /// - fail to convert this to ESM
+        /// - ALSO see an assignment to `module.exports` (commonjs_module_exports_assigned_deoptimized)
+        /// It must be known if `exports` or `module.exports` was written in source
+        /// code, as the distinction will alter behavior. The fixup happens in the printer when
+        /// printing this node.
+        pub const Base = enum {
+            exports,
+            module_dot_exports,
+        };
     };
 
     // This is similar to EIdentifier but it represents class-private fields and
@@ -1179,7 +1737,7 @@ pub const E = struct {
     ///     - static the function is React.jsxsDEV, "jsxs" instead of "jsx"
     ///     - one child? the function is React.jsxDEV,
     ///     - no children? the function is React.jsxDEV and children is an empty array.
-    /// `isStaticChildren`: https://github.com/facebook/react/blob/4ca62cac45c288878d2532e5056981d177f9fdac/packages/react/src/jsx/ReactJSXElementValidator.js#L369-L384 
+    /// `isStaticChildren`: https://github.com/facebook/react/blob/4ca62cac45c288878d2532e5056981d177f9fdac/packages/react/src/jsx/ReactJSXElementValidator.js#L369-L384
     ///     This flag means children is an array of JSX Elements literals.
     ///     The documentation on this is sparse, but it appears that
     ///     React just calls Object.freeze on the children array.
@@ -1201,8 +1759,8 @@ pub const E = struct {
         /// JSX element children <div>{this_is_a_child_element}</div>
         children: ExprNodeList = ExprNodeList{},
 
-        /// key is the key prop like <ListItem key="foo">
-        key: ?ExprNodeIndex = null,
+        // needed to make sure parse and visit happen in the same order
+        key_prop_index: i32 = -1,
 
         flags: Flags.JSXElement.Bitset = Flags.JSXElement.Bitset{},
 
@@ -1225,40 +1783,90 @@ pub const E = struct {
     };
 
     pub const Missing = struct {
-        pub fn jsonStringify(_: *const @This(), opts: anytype, o: anytype) !void {
-            return try std.json.stringify(null, opts, o);
+        pub fn jsonStringify(_: *const @This(), writer: anytype) !void {
+            return try writer.write(null);
         }
     };
 
     pub const Number = struct {
         value: f64,
 
+        const double_digit = [_]string{ "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31", "32", "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46", "47", "48", "49", "50", "51", "52", "53", "54", "55", "56", "57", "58", "59", "60", "61", "62", "63", "64", "65", "66", "67", "68", "69", "70", "71", "72", "73", "74", "75", "76", "77", "78", "79", "80", "81", "82", "83", "84", "85", "86", "87", "88", "89", "90", "91", "92", "93", "94", "95", "96", "97", "98", "99", "100" };
+        const neg_double_digit = [_]string{ "-0", "-1", "-2", "-3", "-4", "-5", "-6", "-7", "-8", "-9", "-10", "-11", "-12", "-13", "-14", "-15", "-16", "-17", "-18", "-19", "-20", "-21", "-22", "-23", "-24", "-25", "-26", "-27", "-28", "-29", "-30", "-31", "-32", "-33", "-34", "-35", "-36", "-37", "-38", "-39", "-40", "-41", "-42", "-43", "-44", "-45", "-46", "-47", "-48", "-49", "-50", "-51", "-52", "-53", "-54", "-55", "-56", "-57", "-58", "-59", "-60", "-61", "-62", "-63", "-64", "-65", "-66", "-67", "-68", "-69", "-70", "-71", "-72", "-73", "-74", "-75", "-76", "-77", "-78", "-79", "-80", "-81", "-82", "-83", "-84", "-85", "-86", "-87", "-88", "-89", "-90", "-91", "-92", "-93", "-94", "-95", "-96", "-97", "-98", "-99", "-100" };
+
+        /// String concatenation with numbers is required by the TypeScript compiler for
+        /// "constant expression" handling in enums. We can match the behavior of a JS VM
+        /// by calling out to the APIs in WebKit which are responsible for this operation.
+        ///
+        /// This can return `null` in wasm builds to avoid linking JSC
+        pub fn toString(this: Number, allocator: std.mem.Allocator) ?string {
+            return toStringFromF64(this.value, allocator);
+        }
+
+        pub fn toStringFromF64(value: f64, allocator: std.mem.Allocator) ?string {
+            if (value == @trunc(value) and (value < std.math.maxInt(i32) and value > std.math.minInt(i32))) {
+                const int_value = @as(i64, @intFromFloat(value));
+                const abs = @as(u64, @intCast(@abs(int_value)));
+
+                // do not allocate for a small set of constant numbers: -100 through 100
+                if (abs < double_digit.len) {
+                    return if (int_value < 0)
+                        neg_double_digit[abs]
+                    else
+                        double_digit[abs];
+                }
+
+                return std.fmt.allocPrint(allocator, "{d}", .{@as(i32, @intCast(int_value))}) catch return null;
+            }
+
+            if (std.math.isNan(value)) {
+                return "NaN";
+            }
+
+            if (std.math.isNegativeInf(value)) {
+                return "-Infinity";
+            }
+
+            if (std.math.isInf(value)) {
+                return "Infinity";
+            }
+
+            if (Environment.isNative) {
+                var buf: [124]u8 = undefined;
+                return allocator.dupe(u8, bun.fmt.FormatDouble.dtoa(&buf, value)) catch bun.outOfMemory();
+            } else {
+                // do not attempt to implement the spec here, it would be error prone.
+            }
+
+            return null;
+        }
+
         pub inline fn toU64(self: Number) u64 {
-            @setRuntimeSafety(false);
-            return @floatToInt(u64, @maximum(@trunc(self.value), 0));
+            return self.to(u64);
         }
 
         pub inline fn toUsize(self: Number) usize {
-            @setRuntimeSafety(false);
-            return @floatToInt(usize, @maximum(@trunc(self.value), 0));
+            return self.to(usize);
         }
 
         pub inline fn toU32(self: Number) u32 {
-            @setRuntimeSafety(false);
-            return @floatToInt(u32, @maximum(@trunc(self.value), 0));
+            return self.to(u32);
         }
 
         pub inline fn toU16(self: Number) u16 {
-            @setRuntimeSafety(false);
-            return @floatToInt(u16, @maximum(@trunc(self.value), 0));
+            return self.to(u16);
         }
 
-        pub fn jsonStringify(self: *const Number, opts: anytype, o: anytype) !void {
-            return try std.json.stringify(self.value, opts, o);
+        pub fn to(self: Number, comptime T: type) T {
+            return @as(T, @intFromFloat(@min(@max(@trunc(self.value), 0), comptime @min(std.math.floatMax(f64), std.math.maxInt(T)))));
         }
 
-        pub fn toJS(this: @This(), _: JSC.C.JSContextRef, _: JSC.C.ExceptionRef) JSC.C.JSValueRef {
-            return JSC.JSValue.jsNumber(this.value).asObjectRef();
+        pub fn jsonStringify(self: *const Number, writer: anytype) !void {
+            return try writer.write(self.value);
+        }
+
+        pub fn toJS(this: @This()) JSC.JSValue {
+            return JSC.JSValue.jsNumber(this.value);
         }
     };
 
@@ -1267,11 +1875,11 @@ pub const E = struct {
 
         pub var empty = BigInt{ .value = "" };
 
-        pub fn jsonStringify(self: *const @This(), opts: anytype, o: anytype) !void {
-            return try std.json.stringify(self.value, opts, o);
+        pub fn jsonStringify(self: *const @This(), writer: anytype) !void {
+            return try writer.write(self.value);
         }
 
-        pub fn toJS(_: @This(), _: JSC.C.JSContextRef, _: JSC.C.ExceptionRef) JSC.C.JSValueRef {
+        pub fn toJS(_: @This()) JSC.JSValue {
             // TODO:
             return JSC.JSValue.jsNumber(0);
         }
@@ -1290,49 +1898,51 @@ pub const E = struct {
         pub const Rope = struct {
             head: Expr,
             next: ?*Rope = null,
-            const OOM = error{OutOfMemory};
             pub fn append(this: *Rope, expr: Expr, allocator: std.mem.Allocator) OOM!*Rope {
                 if (this.next) |next| {
                     return try next.append(expr, allocator);
                 }
 
-                var rope = try allocator.create(Rope);
-                rope.* = .{
-                    .head = expr,
-                };
+                const rope = try allocator.create(Rope);
+                rope.* = .{ .head = expr };
                 this.next = rope;
                 return rope;
             }
         };
 
-        // pub fn toJS(this: Object, ctx: JSC.C.JSContextRef, exception: JSC.C.ExceptionRef) JSC.C.JSValueRef {
-        //     const Creator = struct {
-        //         object: Object,
-        //         pub fn create(this: *@This(), obj: *JSObject, global: *JSGlobalObject) void {
-        //             var iter = this.query.iter();
-        //             var str: ZigString = undefined;
-        //             while (iter.next(&query_string_values_buf)) |entry| {
-        //                 str = ZigString.init(entry.name);
-
-        //                 std.debug.assert(entry.values.len > 0);
-        //                 if (entry.values.len > 1) {
-        //                     var values = query_string_value_refs_buf[0..entry.values.len];
-        //                     for (entry.values) |value, i| {
-        //                         values[i] = ZigString.init(value);
-        //                     }
-        //                     obj.putRecord(global, &str, values.ptr, values.len);
-        //                 } else {
-        //                     query_string_value_refs_buf[0] = ZigString.init(entry.values[0]);
-
-        //                     obj.putRecord(global, &str, &query_string_value_refs_buf, 1);
-        //                 }
-        //             }
-        //         }
-        //     };
-        // }
-
         pub fn get(self: *const Object, key: string) ?Expr {
             return if (asProperty(self, key)) |query| query.expr else @as(?Expr, null);
+        }
+
+        pub fn toJS(this: *Object, allocator: std.mem.Allocator, globalObject: *JSC.JSGlobalObject) ToJSError!JSC.JSValue {
+            var obj = JSC.JSValue.createEmptyObject(globalObject, this.properties.len);
+            obj.protect();
+            defer obj.unprotect();
+            const props: []const G.Property = this.properties.slice();
+            for (props) |prop| {
+                if (prop.kind != .normal or prop.class_static_block != null or prop.key == null or prop.key.?.data != .e_string or prop.value == null) {
+                    return error.@"Cannot convert argument type to JS";
+                }
+                var key = prop.key.?.data.e_string.toZigString(allocator);
+                obj.put(globalObject, &key, try prop.value.?.toJS(allocator, globalObject));
+            }
+
+            return obj;
+        }
+
+        pub fn put(self: *Object, allocator: std.mem.Allocator, key: string, expr: Expr) !void {
+            if (asProperty(self, key)) |query| {
+                self.properties.ptr[query.i].value = expr;
+            } else {
+                try self.properties.push(allocator, .{
+                    .key = Expr.init(E.String, E.String.init(key), expr.loc),
+                    .value = expr,
+                });
+            }
+        }
+
+        pub fn putString(self: *Object, allocator: std.mem.Allocator, key: string, value: string) !void {
+            return try put(self, allocator, key, Expr.init(E.String, E.String.init(value), logger.Loc.Empty));
         }
 
         pub const SetError = error{ OutOfMemory, Clobber };
@@ -1502,13 +2112,13 @@ pub const E = struct {
             for (obj.properties.slice()) |prop| {
                 const key = prop.key orelse continue;
                 if (std.meta.activeTag(key.data) != .e_string) continue;
-                if (key.eql(string, name)) return true;
+                if (key.data.e_string.eql(string, name)) return true;
             }
             return false;
         }
 
         pub fn asProperty(obj: *const Object, name: string) ?Expr.Query {
-            for (obj.properties.slice()) |prop, i| {
+            for (obj.properties.slice(), 0..) |prop, i| {
                 const value = prop.value orelse continue;
                 const key = prop.key orelse continue;
                 if (std.meta.activeTag(key.data) != .e_string) continue;
@@ -1517,7 +2127,7 @@ pub const E = struct {
                     return Expr.Query{
                         .expr = value,
                         .loc = key.loc,
-                        .i = @truncate(u32, i),
+                        .i = @as(u32, @truncate(i)),
                     };
                 }
             }
@@ -1525,29 +2135,35 @@ pub const E = struct {
             return null;
         }
 
+        /// Assumes each key in the property is a string
         pub fn alphabetizeProperties(this: *Object) void {
-            std.sort.sort(G.Property, this.properties.slice(), void{}, Sorter.isLessThan);
+            if (comptime Environment.allow_assert) {
+                for (this.properties.slice()) |prop| {
+                    bun.assert(prop.key.?.data == .e_string);
+                }
+            }
+            std.sort.pdq(G.Property, this.properties.slice(), {}, Sorter.isLessThan);
         }
 
         pub fn packageJSONSort(this: *Object) void {
-            std.sort.sort(G.Property, this.properties.slice(), void{}, PackageJSONSort.Fields.isLessThan);
+            std.sort.pdq(G.Property, this.properties.slice(), {}, PackageJSONSort.Fields.isLessThan);
         }
 
         const PackageJSONSort = struct {
             const Fields = enum(u8) {
-                name,
-                version,
-                author,
-                repository,
-                config,
-                main,
-                module,
-                dependencies,
-                devDependencies,
-                optionalDependencies,
-                peerDependencies,
-                exports,
-                __fake,
+                name = 0,
+                version = 1,
+                author = 2,
+                repository = 3,
+                config = 4,
+                main = 5,
+                module = 6,
+                dependencies = 7,
+                devDependencies = 8,
+                optionalDependencies = 9,
+                peerDependencies = 10,
+                exports = 11,
+                __fake = 12,
 
                 pub const Map = ComptimeStringMap(Fields, .{
                     .{ "name", Fields.name },
@@ -1563,18 +2179,17 @@ pub const E = struct {
                     .{ "peerDependencies", Fields.peerDependencies },
                     .{ "exports", Fields.exports },
                 });
-                const max_key_size = 12;
 
                 pub fn isLessThan(ctx: void, lhs: G.Property, rhs: G.Property) bool {
-                    var lhs_key_size: u8 = @enumToInt(Fields.__fake);
-                    var rhs_key_size: u8 = @enumToInt(Fields.__fake);
+                    var lhs_key_size: u8 = @intFromEnum(Fields.__fake);
+                    var rhs_key_size: u8 = @intFromEnum(Fields.__fake);
 
                     if (lhs.key != null and lhs.key.?.data == .e_string) {
-                        lhs_key_size = @enumToInt(Map.get(lhs.key.?.data.e_string.data) orelse Fields.__fake);
+                        lhs_key_size = @intFromEnum(Map.get(lhs.key.?.data.e_string.data) orelse Fields.__fake);
                     }
 
                     if (rhs.key != null and rhs.key.?.data == .e_string) {
-                        rhs_key_size = @enumToInt(Map.get(rhs.key.?.data.e_string.data) orelse Fields.__fake);
+                        rhs_key_size = @intFromEnum(Map.get(rhs.key.?.data.e_string.data) orelse Fields.__fake);
                     }
 
                     return switch (std.math.order(lhs_key_size, rhs_key_size)) {
@@ -1599,6 +2214,7 @@ pub const E = struct {
     pub const String = struct {
         // A version of this where `utf8` and `value` are stored in a packed union, with len as a single u32 was attempted.
         // It did not improve benchmarks. Neither did converting this from a heap-allocated type to a stack-allocated type.
+        // TODO: change this to *const anyopaque and change all uses to either .slice8() or .slice16()
         data: []const u8 = "",
         prefer_template: bool = false,
 
@@ -1610,17 +2226,26 @@ pub const E = struct {
         rope_len: u32 = 0,
         is_utf16: bool = false,
 
-        pub var class = E.String{ .data = "class" };
+        pub fn isIdentifier(this: *String, allocator: std.mem.Allocator) bool {
+            if (!this.isUTF8()) {
+                return bun.js_lexer.isIdentifierUTF16(this.slice16());
+            }
+
+            return bun.js_lexer.isIdentifier(this.slice(allocator));
+        }
+
+        pub const class = E.String{ .data = "class" };
+
         pub fn push(this: *String, other: *String) void {
-            std.debug.assert(this.isUTF8());
-            std.debug.assert(other.isUTF8());
+            bun.assert(this.isUTF8());
+            bun.assert(other.isUTF8());
 
             if (other.rope_len == 0) {
-                other.rope_len = @truncate(u32, other.data.len);
+                other.rope_len = @truncate(other.data.len);
             }
 
             if (this.rope_len == 0) {
-                this.rope_len = @truncate(u32, this.data.len);
+                this.rope_len = @truncate(this.data.len);
             }
 
             this.rope_len += other.rope_len;
@@ -1628,9 +2253,33 @@ pub const E = struct {
                 this.next = other;
                 this.end = other;
             } else {
-                this.end.?.next = other;
+                var end = this.end.?;
+                while (end.next != null) end = end.end.?;
+                end.next = other;
                 this.end = other;
             }
+        }
+
+        /// Cloning the rope string is rarely needed, see `foldStringAddition`'s
+        /// comments and the 'edgecase/EnumInliningRopeStringPoison' test
+        pub fn cloneRopeNodes(s: String) String {
+            var root = s;
+
+            if (root.next != null) {
+                var current: ?*String = &root;
+                while (true) {
+                    const node = current.?;
+                    if (node.next) |next| {
+                        node.next = Expr.Data.Store.append(String, next.*);
+                        current = node.next;
+                    } else {
+                        root.end = node;
+                        break;
+                    }
+                }
+            }
+
+            return root;
         }
 
         pub fn toUTF8(this: *String, allocator: std.mem.Allocator) !void {
@@ -1643,45 +2292,51 @@ pub const E = struct {
             const Value = @TypeOf(value);
             if (Value == []u16 or Value == []const u16) {
                 return .{
-                    .data = @ptrCast([*]const u8, value.ptr)[0..value.len],
+                    .data = @as([*]const u8, @ptrCast(value.ptr))[0..value.len],
                     .is_utf16 = true,
                 };
             }
-            return .{
-                .data = value,
-            };
+
+            return .{ .data = value };
+        }
+
+        /// E.String containing non-ascii characters may not fully work.
+        /// https://github.com/oven-sh/bun/issues/11963
+        /// More investigation is needed.
+        pub fn initReEncodeUTF8(utf8: []const u8, allocator: std.mem.Allocator) String {
+            return if (bun.strings.isAllASCII(utf8))
+                init(utf8)
+            else
+                init(bun.strings.toUTF16AllocForReal(allocator, utf8, false, false) catch bun.outOfMemory());
+        }
+
+        pub fn slice8(this: *const String) []const u8 {
+            bun.assert(!this.is_utf16);
+            return this.data;
         }
 
         pub fn slice16(this: *const String) []const u16 {
-            std.debug.assert(this.is_utf16);
-            return @ptrCast([*]const u16, @alignCast(@alignOf(u16), this.data.ptr))[0..this.data.len];
+            bun.assert(this.is_utf16);
+            return @as([*]const u16, @ptrCast(@alignCast(this.data.ptr)))[0..this.data.len];
         }
 
-        pub fn resovleRopeIfNeeded(this: *String, allocator: std.mem.Allocator) void {
+        pub fn resolveRopeIfNeeded(this: *String, allocator: std.mem.Allocator) void {
             if (this.next == null or !this.isUTF8()) return;
-            var bytes = allocator.alloc(u8, this.rope_len) catch unreachable;
-            var ptr = bytes.ptr;
-            var remain = bytes.len;
-            @memcpy(ptr, this.data.ptr, this.data.len);
-            ptr += this.data.len;
-            remain -= this.data.len;
+            var bytes = std.ArrayList(u8).initCapacity(allocator, this.rope_len) catch bun.outOfMemory();
+
+            bytes.appendSliceAssumeCapacity(this.data);
             var str = this.next;
-            while (str) |strin| {
-                @memcpy(ptr, strin.data.ptr, strin.data.len);
-                ptr += strin.data.len;
-                remain -= strin.data.len;
-                var prev = strin;
-                str = strin.next;
-                prev.next = null;
-                prev.end = null;
+            while (str) |part| {
+                bytes.appendSlice(part.data) catch bun.outOfMemory();
+                str = part.next;
             }
-            this.data = bytes;
+            this.data = bytes.items;
             this.next = null;
         }
 
         pub fn slice(this: *String, allocator: std.mem.Allocator) []const u8 {
-            this.resovleRopeIfNeeded(allocator);
-            return @ptrCast([*]const u8, @alignCast(@alignOf(u8), this.data.ptr))[0..this.data.len];
+            this.resolveRopeIfNeeded(allocator);
+            return this.string(allocator) catch bun.outOfMemory();
         }
 
         pub var empty = String{};
@@ -1696,6 +2351,36 @@ pub const E = struct {
                 .prefer_template = str.prefer_template,
                 .is_utf16 = !str.isUTF8(),
             };
+        }
+
+        pub fn cloneSliceIfNecessary(str: *const String, allocator: std.mem.Allocator) !bun.string {
+            if (Expr.Data.Store.memory_allocator) |mem| {
+                if (mem == GlobalStoreHandle.global_store_ast) {
+                    return str.string(allocator);
+                }
+            }
+
+            if (str.isUTF8()) {
+                return allocator.dupe(u8, str.string(allocator) catch unreachable);
+            }
+
+            return str.string(allocator);
+        }
+
+        pub fn javascriptLength(s: *const String) ?u32 {
+            if (s.rope_len > 0) {
+                // We only support ascii ropes for now
+                return s.rope_len;
+            }
+
+            if (s.isUTF8()) {
+                if (!strings.isAllASCII(s.data)) {
+                    return null;
+                }
+                return @truncate(s.data.len);
+            }
+
+            return @truncate(s.slice16().len);
         }
 
         pub inline fn len(s: *const String) usize {
@@ -1719,13 +2404,13 @@ pub const E = struct {
                 switch (_t) {
                     @This() => {
                         if (other.isUTF8()) {
-                            return strings.eql(s.data, other.data);
+                            return strings.eqlLong(s.data, other.data, true);
                         } else {
                             return strings.utf16EqlString(other.slice16(), s.data);
                         }
                     },
                     bun.string => {
-                        return strings.eql(s.data, other);
+                        return strings.eqlLong(s.data, other, true);
                     },
                     []u16, []const u16 => {
                         return strings.utf16EqlString(other, s.data);
@@ -1756,7 +2441,7 @@ pub const E = struct {
             }
         }
 
-        pub fn eqlComptime(s: *const String, comptime value: anytype) bool {
+        pub fn eqlComptime(s: *const String, comptime value: []const u8) bool {
             return if (s.isUTF8())
                 strings.eqlComptime(s.data, value)
             else
@@ -1773,9 +2458,25 @@ pub const E = struct {
                 strings.eqlComptimeUTF16(s.slice16()[0..value.len], value);
         }
 
-        pub fn string(s: *const String, allocator: std.mem.Allocator) !bun.string {
+        pub fn string(s: *const String, allocator: std.mem.Allocator) OOM!bun.string {
             if (s.isUTF8()) {
                 return s.data;
+            } else {
+                return strings.toUTF8Alloc(allocator, s.slice16());
+            }
+        }
+
+        pub fn stringZ(s: *const String, allocator: std.mem.Allocator) OOM!bun.stringZ {
+            if (s.isUTF8()) {
+                return allocator.dupeZ(u8, s.data);
+            } else {
+                return strings.toUTF8AllocZ(allocator, s.slice16());
+            }
+        }
+
+        pub fn stringCloned(s: *const String, allocator: std.mem.Allocator) OOM!bun.string {
+            if (s.isUTF8()) {
+                return allocator.dupe(u8, s.data);
             } else {
                 return strings.toUTF8Alloc(allocator, s.slice16());
             }
@@ -1786,25 +2487,85 @@ pub const E = struct {
 
             if (s.isUTF8()) {
                 // hash utf-8
-                return std.hash.Wyhash.hash(0, s.data);
+                return bun.hash(s.data);
             } else {
                 // hash utf-16
-                return std.hash.Wyhash.hash(0, @ptrCast([*]const u8, s.slice16().ptr)[0 .. s.slice16().len * 2]);
+                return bun.hash(@as([*]const u8, @ptrCast(s.slice16().ptr))[0 .. s.slice16().len * 2]);
             }
         }
 
-        pub fn jsonStringify(s: *const String, options: anytype, writer: anytype) !void {
+        pub fn toJS(s: *String, allocator: std.mem.Allocator, globalObject: *JSC.JSGlobalObject) !JSC.JSValue {
+            s.resolveRopeIfNeeded(allocator);
+            if (!s.isPresent()) {
+                var emp = bun.String.empty;
+                return emp.toJS(globalObject);
+            }
+
+            if (s.isUTF8()) {
+                if (try strings.toUTF16Alloc(allocator, s.slice8(), false, false)) |utf16| {
+                    var out, const chars = bun.String.createUninitialized(.utf16, utf16.len);
+                    @memcpy(chars, utf16);
+                    return out.transferToJS(globalObject);
+                } else {
+                    var out, const chars = bun.String.createUninitialized(.latin1, s.slice8().len);
+                    @memcpy(chars, s.slice8());
+                    return out.transferToJS(globalObject);
+                }
+            } else {
+                var out, const chars = bun.String.createUninitialized(.utf16, s.slice16().len);
+                @memcpy(chars, s.slice16());
+                return out.transferToJS(globalObject);
+            }
+        }
+
+        pub fn toZigString(s: *String, allocator: std.mem.Allocator) JSC.ZigString {
+            if (s.isUTF8()) {
+                return JSC.ZigString.fromUTF8(s.slice(allocator));
+            } else {
+                return JSC.ZigString.initUTF16(s.slice16());
+            }
+        }
+
+        pub fn format(s: String, comptime fmt: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+            comptime bun.assert(fmt.len == 0);
+
+            try writer.writeAll("E.String");
+            if (s.next == null) {
+                try writer.writeAll("(");
+                if (s.isUTF8()) {
+                    try writer.print("\"{s}\"", .{s.data});
+                } else {
+                    try writer.print("\"{}\"", .{bun.fmt.utf16(s.slice16())});
+                }
+                try writer.writeAll(")");
+            } else {
+                try writer.writeAll("(rope: [");
+                var it: ?*const String = &s;
+                while (it) |part| {
+                    if (part.isUTF8()) {
+                        try writer.print("\"{s}\"", .{part.data});
+                    } else {
+                        try writer.print("\"{}\"", .{bun.fmt.utf16(part.slice16())});
+                    }
+                    it = part.next;
+                    if (it != null) try writer.writeAll(" ");
+                }
+                try writer.writeAll("])");
+            }
+        }
+
+        pub fn jsonStringify(s: *const String, writer: anytype) !void {
             var buf = [_]u8{0} ** 4096;
             var i: usize = 0;
             for (s.slice16()) |char| {
-                buf[i] = @intCast(u8, char);
+                buf[i] = @as(u8, @intCast(char));
                 i += 1;
                 if (i >= 4096) {
                     break;
                 }
             }
 
-            return try std.json.stringify(buf[0..i], options, writer);
+            return try writer.write(buf[0..i]);
         }
     };
 
@@ -1812,13 +2573,124 @@ pub const E = struct {
     pub const TemplatePart = struct {
         value: ExprNodeIndex,
         tail_loc: logger.Loc,
-        tail: E.String,
+        tail: Template.Contents,
     };
 
     pub const Template = struct {
         tag: ?ExprNodeIndex = null,
-        head: E.String,
-        parts: []TemplatePart = &([_]TemplatePart{}),
+        parts: []TemplatePart = &.{},
+        head: Contents,
+
+        pub const Contents = union(Tag) {
+            cooked: E.String,
+            raw: string,
+
+            const Tag = enum {
+                cooked,
+                raw,
+            };
+
+            pub fn isUTF8(contents: Contents) bool {
+                return contents == .cooked and contents.cooked.isUTF8();
+            }
+        };
+
+        /// "`a${'b'}c`" => "`abc`"
+        pub fn fold(
+            this: *Template,
+            allocator: std.mem.Allocator,
+            loc: logger.Loc,
+        ) Expr {
+            if (this.tag != null or (this.head == .cooked and !this.head.cooked.isUTF8())) {
+                // we only fold utf-8/ascii for now
+                return Expr{
+                    .data = .{ .e_template = this },
+                    .loc = loc,
+                };
+            }
+
+            bun.assert(this.head == .cooked);
+
+            if (this.parts.len == 0) {
+                return Expr.init(E.String, this.head.cooked, loc);
+            }
+
+            var parts = std.ArrayList(TemplatePart).initCapacity(allocator, this.parts.len) catch unreachable;
+            var head = Expr.init(E.String, this.head.cooked, loc);
+            for (this.parts) |part_src| {
+                var part = part_src;
+                bun.assert(part.tail == .cooked);
+
+                part.value = part.value.unwrapInlined();
+
+                switch (part.value.data) {
+                    .e_number => {
+                        if (part.value.data.e_number.toString(allocator)) |s| {
+                            part.value = Expr.init(E.String, E.String.init(s), part.value.loc);
+                        }
+                    },
+                    .e_null => {
+                        part.value = Expr.init(E.String, E.String.init("null"), part.value.loc);
+                    },
+                    .e_boolean => {
+                        part.value = Expr.init(E.String, E.String.init(if (part.value.data.e_boolean.value)
+                            "true"
+                        else
+                            "false"), part.value.loc);
+                    },
+                    .e_undefined => {
+                        part.value = Expr.init(E.String, E.String.init("undefined"), part.value.loc);
+                    },
+                    .e_big_int => |value| {
+                        part.value = Expr.init(E.String, E.String.init(value.value), part.value.loc);
+                    },
+                    else => {},
+                }
+
+                if (part.value.data == .e_string and part.tail.cooked.isUTF8() and part.value.data.e_string.isUTF8()) {
+                    if (parts.items.len == 0) {
+                        if (part.value.data.e_string.len() > 0) {
+                            head.data.e_string.push(Expr.init(E.String, part.value.data.e_string.*, logger.Loc.Empty).data.e_string);
+                        }
+
+                        if (part.tail.cooked.len() > 0) {
+                            head.data.e_string.push(Expr.init(E.String, part.tail.cooked, part.tail_loc).data.e_string);
+                        }
+
+                        continue;
+                    } else {
+                        var prev_part = &parts.items[parts.items.len - 1];
+                        bun.assert(prev_part.tail == .cooked);
+
+                        if (prev_part.tail.cooked.isUTF8()) {
+                            if (part.value.data.e_string.len() > 0) {
+                                prev_part.tail.cooked.push(Expr.init(E.String, part.value.data.e_string.*, logger.Loc.Empty).data.e_string);
+                            }
+
+                            if (part.tail.cooked.len() > 0) {
+                                prev_part.tail.cooked.push(Expr.init(E.String, part.tail.cooked, part.tail_loc).data.e_string);
+                            }
+                        } else {
+                            parts.appendAssumeCapacity(part);
+                        }
+                    }
+                } else {
+                    parts.appendAssumeCapacity(part);
+                }
+            }
+
+            if (parts.items.len == 0) {
+                parts.deinit();
+                head.data.e_string.resolveRopeIfNeeded(allocator);
+                return head;
+            }
+
+            return Expr.init(E.Template, .{
+                .tag = null,
+                .parts = parts.items,
+                .head = .{ .cooked = head.data.e_string.* },
+            }, loc);
+        }
     };
 
     pub const RegExp = struct {
@@ -1864,8 +2736,8 @@ pub const E = struct {
             return "";
         }
 
-        pub fn jsonStringify(self: *const RegExp, opts: anytype, o: anytype) !void {
-            return try std.json.stringify(self.value, opts, o);
+        pub fn jsonStringify(self: *const RegExp, writer: anytype) !void {
+            return try writer.write(self.value);
         }
     };
 
@@ -1886,27 +2758,73 @@ pub const E = struct {
         no: ExprNodeIndex,
     };
 
-    pub const Require = struct {
+    pub const RequireString = struct {
         import_record_index: u32 = 0,
+
+        unwrapped_id: u32 = std.math.maxInt(u32),
     };
 
-    pub const RequireOrRequireResolve = struct {
+    pub const RequireResolveString = struct {
         import_record_index: u32 = 0,
+
+        // close_paren_loc: logger.Loc = logger.Loc.Empty,
+    };
+
+    pub const InlinedEnum = struct {
+        value: ExprNodeIndex,
+        comment: string,
     };
 
     pub const Import = struct {
         expr: ExprNodeIndex,
+        options: ExprNodeIndex = Expr.empty,
         import_record_index: u32,
 
-        // Comments inside "import()" expressions have special meaning for Webpack.
-        // Preserving comments inside these expressions makes it possible to use
-        // esbuild as a TypeScript-to-JavaScript frontend for Webpack to improve
-        // performance. We intentionally do not interpret these comments in esbuild
-        // because esbuild is not Webpack. But we do preserve them since doing so is
-        // harmless, easy to maintain, and useful to people. See the Webpack docs for
-        // more info: https://webpack.js.org/api/module-methods/#magic-comments.
-        // TODO:
-        leading_interior_comments: []G.Comment = &([_]G.Comment{}),
+        /// TODO:
+        /// Comments inside "import()" expressions have special meaning for Webpack.
+        /// Preserving comments inside these expressions makes it possible to use
+        /// esbuild as a TypeScript-to-JavaScript frontend for Webpack to improve
+        /// performance. We intentionally do not interpret these comments in esbuild
+        /// because esbuild is not Webpack. But we do preserve them since doing so is
+        /// harmless, easy to maintain, and useful to people. See the Webpack docs for
+        /// more info: https://webpack.js.org/api/module-methods/#magic-comments.
+        // leading_interior_comments: []G.Comment = &([_]G.Comment{}),
+
+        pub fn isImportRecordNull(this: *const Import) bool {
+            return this.import_record_index == std.math.maxInt(u32);
+        }
+
+        pub fn importRecordTag(import: *const Import) ?ImportRecord.Tag {
+            const obj = import.options.data.as(.e_object) orelse
+                return null;
+            const with = obj.get("with") orelse obj.get("assert") orelse
+                return null;
+            const with_obj = with.data.as(.e_object) orelse
+                return null;
+            const str = (with_obj.get("type") orelse
+                return null).data.as(.e_string) orelse
+                return null;
+
+            if (str.eqlComptime("json")) {
+                return .with_type_json;
+            } else if (str.eqlComptime("toml")) {
+                return .with_type_toml;
+            } else if (str.eqlComptime("text")) {
+                return .with_type_text;
+            } else if (str.eqlComptime("file")) {
+                return .with_type_file;
+            } else if (str.eqlComptime("sqlite")) {
+                const embed = brk: {
+                    const embed = with_obj.get("embed") orelse break :brk false;
+                    const embed_str = embed.data.as(.e_string) orelse break :brk false;
+                    break :brk embed_str.eqlComptime("true");
+                };
+
+                return if (embed) .with_type_sqlite_embedded else .with_type_sqlite;
+            }
+
+            return null;
+        }
     };
 };
 
@@ -1914,23 +2832,52 @@ pub const Stmt = struct {
     loc: logger.Loc,
     data: Data,
 
+    pub const Batcher = bun.Batcher(Stmt);
+
+    pub fn assign(a: Expr, b: Expr) Stmt {
+        return Stmt.alloc(
+            S.SExpr,
+            S.SExpr{
+                .value = Expr.assign(a, b),
+            },
+            a.loc,
+        );
+    }
+
     const Serializable = struct {
-        @"type": Tag,
+        type: Tag,
         object: string,
         value: Data,
         loc: logger.Loc,
     };
 
-    pub fn jsonStringify(self: *const Stmt, options: anytype, writer: anytype) !void {
-        return try std.json.stringify(Serializable{ .@"type" = std.meta.activeTag(self.data), .object = "stmt", .value = self.data, .loc = self.loc }, options, writer);
+    pub fn jsonStringify(self: *const Stmt, writer: anytype) !void {
+        return try writer.write(Serializable{ .type = std.meta.activeTag(self.data), .object = "stmt", .value = self.data, .loc = self.loc });
     }
 
     pub fn isTypeScript(self: *Stmt) bool {
         return @as(Stmt.Tag, self.data) == .s_type_script;
     }
 
+    pub fn isSuperCall(self: Stmt) bool {
+        return self.data == .s_expr and self.data.s_expr.value.data == .e_call and self.data.s_expr.value.data.e_call.target.data == .e_super;
+    }
+
+    pub fn isMissingExpr(self: Stmt) bool {
+        return self.data == .s_expr and self.data.s_expr.value.data == .e_missing;
+    }
+
     pub fn empty() Stmt {
         return Stmt{ .data = .{ .s_empty = None }, .loc = logger.Loc{} };
+    }
+
+    pub fn toEmpty(this: Stmt) Stmt {
+        return .{
+            .data = .{
+                .s_empty = None,
+            },
+            .loc = this.loc,
+        };
     }
 
     const None = S.Empty{};
@@ -1938,6 +2885,7 @@ pub const Stmt = struct {
     pub var icount: usize = 0;
     pub fn init(comptime StatementType: type, origData: *StatementType, loc: logger.Loc) Stmt {
         icount += 1;
+
         return switch (comptime StatementType) {
             S.Empty => Stmt{ .loc = loc, .data = Data{ .s_empty = S.Empty{} } },
             S.Block => Stmt.comptime_init("s_block", S.Block, origData, loc),
@@ -1948,7 +2896,6 @@ pub const Stmt = struct {
             S.Debugger => Stmt.comptime_init("s_debugger", S.Debugger, origData, loc),
             S.Directive => Stmt.comptime_init("s_directive", S.Directive, origData, loc),
             S.DoWhile => Stmt.comptime_init("s_do_while", S.DoWhile, origData, loc),
-            S.Empty => Stmt.comptime_init("s_empty", S.Empty, origData, loc),
             S.Enum => Stmt.comptime_init("s_enum", S.Enum, origData, loc),
             S.ExportClause => Stmt.comptime_init("s_export_clause", S.ExportClause, origData, loc),
             S.ExportDefault => Stmt.comptime_init("s_export_default", S.ExportDefault, origData, loc),
@@ -1963,7 +2910,6 @@ pub const Stmt = struct {
             S.If => Stmt.comptime_init("s_if", S.If, origData, loc),
             S.Import => Stmt.comptime_init("s_import", S.Import, origData, loc),
             S.Label => Stmt.comptime_init("s_label", S.Label, origData, loc),
-            S.LazyExport => Stmt.comptime_init("s_lazy_export", S.LazyExport, origData, loc),
             S.Local => Stmt.comptime_init("s_local", S.Local, origData, loc),
             S.Namespace => Stmt.comptime_init("s_namespace", S.Namespace, origData, loc),
             S.Return => Stmt.comptime_init("s_return", S.Return, origData, loc),
@@ -1977,7 +2923,24 @@ pub const Stmt = struct {
         };
     }
     inline fn comptime_alloc(comptime tag_name: string, comptime typename: type, origData: anytype, loc: logger.Loc) Stmt {
-        return Stmt{ .loc = loc, .data = @unionInit(Data, tag_name, Data.Store.append(typename, origData)) };
+        return Stmt{
+            .loc = loc,
+            .data = @unionInit(
+                Data,
+                tag_name,
+                Data.Store.append(
+                    typename,
+                    origData,
+                ),
+            ),
+        };
+    }
+
+    fn allocateData(allocator: std.mem.Allocator, comptime tag_name: string, comptime typename: type, origData: anytype, loc: logger.Loc) Stmt {
+        const value = allocator.create(@TypeOf(origData)) catch unreachable;
+        value.* = origData;
+
+        return comptime_init(tag_name, *typename, value, loc);
     }
 
     inline fn comptime_init(comptime tag_name: string, comptime TypeName: type, origData: TypeName, loc: logger.Loc) Stmt {
@@ -1985,6 +2948,8 @@ pub const Stmt = struct {
     }
 
     pub fn alloc(comptime StatementData: type, origData: StatementData, loc: logger.Loc) Stmt {
+        Stmt.Data.Store.assert();
+
         icount += 1;
         return switch (StatementData) {
             S.Block => Stmt.comptime_alloc("s_block", S.Block, origData, loc),
@@ -2010,7 +2975,6 @@ pub const Stmt = struct {
             S.If => Stmt.comptime_alloc("s_if", S.If, origData, loc),
             S.Import => Stmt.comptime_alloc("s_import", S.Import, origData, loc),
             S.Label => Stmt.comptime_alloc("s_label", S.Label, origData, loc),
-            S.LazyExport => Stmt.comptime_alloc("s_lazy_export", S.LazyExport, origData, loc),
             S.Local => Stmt.comptime_alloc("s_local", S.Local, origData, loc),
             S.Namespace => Stmt.comptime_alloc("s_namespace", S.Namespace, origData, loc),
             S.Return => Stmt.comptime_alloc("s_return", S.Return, origData, loc),
@@ -2024,16 +2988,64 @@ pub const Stmt = struct {
         };
     }
 
-    pub const Tag = enum(u6) {
+    pub const Disabler = bun.DebugOnlyDisabler(@This());
+
+    /// When the lifetime of an Stmt.Data's pointer must exist longer than reset() is called, use this function.
+    /// Be careful to free the memory (or use an allocator that does it for you)
+    /// Also, prefer Stmt.init or Stmt.alloc when possible. This will be slower.
+    pub fn allocate(allocator: std.mem.Allocator, comptime StatementData: type, origData: StatementData, loc: logger.Loc) Stmt {
+        Stmt.Data.Store.assert();
+
+        icount += 1;
+        return switch (StatementData) {
+            S.Block => Stmt.allocateData(allocator, "s_block", S.Block, origData, loc),
+            S.Break => Stmt.allocateData(allocator, "s_break", S.Break, origData, loc),
+            S.Class => Stmt.allocateData(allocator, "s_class", S.Class, origData, loc),
+            S.Comment => Stmt.allocateData(allocator, "s_comment", S.Comment, origData, loc),
+            S.Continue => Stmt.allocateData(allocator, "s_continue", S.Continue, origData, loc),
+            S.Debugger => Stmt{ .loc = loc, .data = .{ .s_debugger = origData } },
+            S.Directive => Stmt.allocateData(allocator, "s_directive", S.Directive, origData, loc),
+            S.DoWhile => Stmt.allocateData(allocator, "s_do_while", S.DoWhile, origData, loc),
+            S.Empty => Stmt{ .loc = loc, .data = Data{ .s_empty = S.Empty{} } },
+            S.Enum => Stmt.allocateData(allocator, "s_enum", S.Enum, origData, loc),
+            S.ExportClause => Stmt.allocateData(allocator, "s_export_clause", S.ExportClause, origData, loc),
+            S.ExportDefault => Stmt.allocateData(allocator, "s_export_default", S.ExportDefault, origData, loc),
+            S.ExportEquals => Stmt.allocateData(allocator, "s_export_equals", S.ExportEquals, origData, loc),
+            S.ExportFrom => Stmt.allocateData(allocator, "s_export_from", S.ExportFrom, origData, loc),
+            S.ExportStar => Stmt.allocateData(allocator, "s_export_star", S.ExportStar, origData, loc),
+            S.SExpr => Stmt.allocateData(allocator, "s_expr", S.SExpr, origData, loc),
+            S.ForIn => Stmt.allocateData(allocator, "s_for_in", S.ForIn, origData, loc),
+            S.ForOf => Stmt.allocateData(allocator, "s_for_of", S.ForOf, origData, loc),
+            S.For => Stmt.allocateData(allocator, "s_for", S.For, origData, loc),
+            S.Function => Stmt.allocateData(allocator, "s_function", S.Function, origData, loc),
+            S.If => Stmt.allocateData(allocator, "s_if", S.If, origData, loc),
+            S.Import => Stmt.allocateData(allocator, "s_import", S.Import, origData, loc),
+            S.Label => Stmt.allocateData(allocator, "s_label", S.Label, origData, loc),
+            S.Local => Stmt.allocateData(allocator, "s_local", S.Local, origData, loc),
+            S.Namespace => Stmt.allocateData(allocator, "s_namespace", S.Namespace, origData, loc),
+            S.Return => Stmt.allocateData(allocator, "s_return", S.Return, origData, loc),
+            S.Switch => Stmt.allocateData(allocator, "s_switch", S.Switch, origData, loc),
+            S.Throw => Stmt.allocateData(allocator, "s_throw", S.Throw, origData, loc),
+            S.Try => Stmt.allocateData(allocator, "s_try", S.Try, origData, loc),
+            S.TypeScript => Stmt{ .loc = loc, .data = Data{ .s_type_script = S.TypeScript{} } },
+            S.While => Stmt.allocateData(allocator, "s_while", S.While, origData, loc),
+            S.With => Stmt.allocateData(allocator, "s_with", S.With, origData, loc),
+            else => @compileError("Invalid type in Stmt.init"),
+        };
+    }
+
+    pub fn allocateExpr(allocator: std.mem.Allocator, expr: Expr) Stmt {
+        return Stmt.allocate(allocator, S.SExpr, S.SExpr{ .value = expr }, expr.loc);
+    }
+
+    pub const Tag = enum {
         s_block,
         s_break,
         s_class,
         s_comment,
         s_continue,
-        s_debugger,
         s_directive,
         s_do_while,
-        s_empty,
         s_enum,
         s_export_clause,
         s_export_default,
@@ -2048,19 +3060,21 @@ pub const Stmt = struct {
         s_if,
         s_import,
         s_label,
-        s_lazy_export,
         s_local,
         s_namespace,
         s_return,
         s_switch,
         s_throw,
         s_try,
-        s_type_script,
         s_while,
         s_with,
+        s_type_script,
+        s_empty,
+        s_debugger,
+        s_lazy_export,
 
-        pub fn jsonStringify(self: @This(), opts: anytype, o: anytype) !void {
-            return try std.json.stringify(@tagName(self), opts, o);
+        pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            return try writer.write(@tagName(self));
         }
 
         pub fn isExportLike(tag: Tag) bool {
@@ -2093,7 +3107,6 @@ pub const Stmt = struct {
         s_if: *S.If,
         s_import: *S.Import,
         s_label: *S.Label,
-        s_lazy_export: *S.LazyExport,
         s_local: *S.Local,
         s_namespace: *S.Namespace,
         s_return: *S.Return,
@@ -2107,8 +3120,16 @@ pub const Stmt = struct {
         s_empty: S.Empty, // special case, its a zero value type
         s_debugger: S.Debugger,
 
+        s_lazy_export: *Expr.Data,
+
+        comptime {
+            if (@sizeOf(Stmt) > 24) {
+                @compileLog("Expected Stmt to be <= 24 bytes, but it is", @sizeOf(Stmt), " bytes");
+            }
+        }
+
         pub const Store = struct {
-            const Union = [_]type{
+            const StoreType = NewStore(&.{
                 S.Block,
                 S.Break,
                 S.Class,
@@ -2130,51 +3151,64 @@ pub const Stmt = struct {
                 S.If,
                 S.Import,
                 S.Label,
-                S.LazyExport,
                 S.Local,
                 S.Namespace,
                 S.Return,
                 S.Switch,
                 S.Throw,
                 S.Try,
-                S.TypeScript,
                 S.While,
                 S.With,
-            };
-            pub const All = NewBaseStore(Union, 128);
+            }, 128);
 
-            threadlocal var has_inited = false;
+            pub threadlocal var instance: ?*StoreType = null;
+            pub threadlocal var memory_allocator: ?*ASTMemoryAllocator = null;
             pub threadlocal var disable_reset = false;
-            pub fn create(allocator: std.mem.Allocator) void {
-                if (has_inited) {
+
+            pub fn create() void {
+                if (instance != null or memory_allocator != null) {
                     return;
                 }
 
-                has_inited = true;
-                _ = All.init(allocator);
+                instance = StoreType.init();
             }
 
             pub fn reset() void {
-                if (disable_reset) return;
-                All.reset();
+                if (disable_reset or memory_allocator != null) return;
+                instance.?.reset();
             }
 
             pub fn deinit() void {
-                if (!has_inited) return;
-                All.deinit();
-                has_inited = false;
+                if (instance == null or memory_allocator != null) return;
+                instance.?.deinit();
+                instance = null;
             }
 
-            pub fn append(comptime ValueType: type, value: anytype) *ValueType {
-                return All.append(ValueType, value);
+            pub inline fn assert() void {
+                if (comptime Environment.allow_assert) {
+                    if (instance == null and memory_allocator == null)
+                        bun.unreachablePanic("Store must be init'd", .{});
+                }
             }
 
-            pub fn toOwnedSlice() []*Store.All.Block {
-                if (!has_inited or Store.All._self.overflow.used == 0 or disable_reset) return &[_]*Store.All.Block{};
-                return Store.All.reclaim();
+            pub fn append(comptime T: type, value: T) *T {
+                if (memory_allocator) |allocator| {
+                    return allocator.append(T, value);
+                }
+
+                Disabler.assert();
+                return instance.?.append(T, value);
             }
         };
     };
+
+    pub fn StoredData(tag: Tag) type {
+        const T = std.meta.FieldType(Data, tag);
+        return switch (@typeInfo(T)) {
+            .Pointer => |ptr| ptr.child,
+            else => T,
+        };
+    }
 
     pub fn caresAboutScope(self: *Stmt) bool {
         return switch (self.data) {
@@ -2183,7 +3217,7 @@ pub const Stmt = struct {
             },
 
             .s_local => |local| {
-                return local.kind != S.Kind.k_var;
+                return local.kind != .k_var;
             },
             else => {
                 return true;
@@ -2195,6 +3229,31 @@ pub const Stmt = struct {
 pub const Expr = struct {
     loc: logger.Loc,
     data: Data,
+
+    pub const empty = Expr{ .data = .{ .e_missing = E.Missing{} }, .loc = logger.Loc.Empty };
+
+    pub fn isAnonymousNamed(expr: Expr) bool {
+        return switch (expr.data) {
+            .e_arrow => true,
+            .e_function => |func| func.func.name == null,
+            .e_class => |class| class.class_name == null,
+            else => false,
+        };
+    }
+
+    pub fn clone(this: Expr, allocator: std.mem.Allocator) !Expr {
+        return .{
+            .loc = this.loc,
+            .data = try this.data.clone(allocator),
+        };
+    }
+
+    pub fn deepClone(this: Expr, allocator: std.mem.Allocator) anyerror!Expr {
+        return .{
+            .loc = this.loc,
+            .data = try this.data.deepClone(allocator),
+        };
+    }
 
     pub fn wrapInArrow(this: Expr, allocator: std.mem.Allocator) !Expr {
         var stmts = try allocator.alloc(Stmt, 1);
@@ -2209,20 +3268,44 @@ pub const Expr = struct {
         }, this.loc);
     }
 
+    pub fn canBeInlinedFromPropertyAccess(this: Expr) bool {
+        return switch (this.data) {
+            // if the array has a spread we must keep it
+            // https://github.com/oven-sh/bun/issues/2594
+            .e_spread => false,
+
+            .e_missing => false,
+            else => true,
+        };
+    }
+
+    pub fn canBeConstValue(this: Expr) bool {
+        return this.data.canBeConstValue();
+    }
+
+    pub fn canBeMoved(expr: Expr) bool {
+        return expr.data.canBeMoved();
+    }
+
+    pub fn unwrapInlined(expr: Expr) Expr {
+        if (expr.data.as(.e_inlined_enum)) |inlined| return inlined.value;
+        return expr;
+    }
+
     pub fn fromBlob(
         blob: *const JSC.WebCore.Blob,
         allocator: std.mem.Allocator,
-        mime_type_: ?HTTP.MimeType,
+        mime_type_: ?MimeType,
         log: *logger.Log,
         loc: logger.Loc,
     ) !Expr {
-        var bytes = blob.sharedView();
+        const bytes = blob.sharedView();
 
-        const mime_type = mime_type_ orelse HTTP.MimeType.init(blob.content_type);
+        const mime_type = mime_type_ orelse MimeType.init(blob.content_type, null, null);
 
         if (mime_type.category == .json) {
             var source = logger.Source.initPathString("fetch.json", bytes);
-            var out_expr = JSONParser.ParseJSONForMacro(&source, log, allocator) catch {
+            var out_expr = JSONParser.parseForMacro(&source, log, allocator) catch {
                 return error.MacroFailed;
             };
             out_expr.loc = loc;
@@ -2280,7 +3363,7 @@ pub const Expr = struct {
     pub fn hasAnyPropertyNamed(expr: *const Expr, comptime names: []const string) bool {
         if (std.meta.activeTag(expr.data) != .e_object) return false;
         const obj = expr.data.e_object;
-        if (@ptrToInt(obj.properties.ptr) == 0) return false;
+        if (@intFromPtr(obj.properties.ptr) == 0) return false;
 
         for (obj.properties.slice()) |prop| {
             if (prop.value == null) continue;
@@ -2293,12 +3376,115 @@ pub const Expr = struct {
         return false;
     }
 
-    pub fn toJS(this: Expr, ctx: JSC.C.JSContextRef, exception: JSC.C.ExceptionRef) JSC.C.JSValueRef {
-        return this.data.toJS(ctx, exception);
+    pub fn toJS(this: Expr, allocator: std.mem.Allocator, globalObject: *JSC.JSGlobalObject) ToJSError!JSC.JSValue {
+        return this.data.toJS(allocator, globalObject);
+    }
+
+    pub inline fn isArray(this: *const Expr) bool {
+        return this.data == .e_array;
+    }
+
+    pub inline fn isObject(this: *const Expr) bool {
+        return this.data == .e_object;
     }
 
     pub fn get(expr: *const Expr, name: string) ?Expr {
         return if (asProperty(expr, name)) |query| query.expr else null;
+    }
+
+    /// Don't use this if you care about performance.
+    ///
+    /// Sets the value of a property, creating it if it doesn't exist.
+    /// `expr` must be an object.
+    pub fn set(expr: *Expr, allocator: std.mem.Allocator, name: string, value: Expr) OOM!void {
+        bun.assertWithLocation(expr.isObject(), @src());
+        for (0..expr.data.e_object.properties.len) |i| {
+            const prop = &expr.data.e_object.properties.ptr[i];
+            const key = prop.key orelse continue;
+            if (std.meta.activeTag(key.data) != .e_string) continue;
+            if (key.data.e_string.eql(string, name)) {
+                prop.value = value;
+                return;
+            }
+        }
+
+        var new_props = expr.data.e_object.properties.listManaged(allocator);
+        try new_props.append(.{
+            .key = Expr.init(E.String, .{ .data = name }, logger.Loc.Empty),
+            .value = value,
+        });
+
+        expr.data.e_object.properties = BabyList(G.Property).fromList(new_props);
+    }
+
+    /// Don't use this if you care about performance.
+    ///
+    /// Sets the value of a property to a string, creating it if it doesn't exist.
+    /// `expr` must be an object.
+    pub fn setString(expr: *Expr, allocator: std.mem.Allocator, name: string, value: string) OOM!void {
+        bun.assertWithLocation(expr.isObject(), @src());
+        for (0..expr.data.e_object.properties.len) |i| {
+            const prop = &expr.data.e_object.properties.ptr[i];
+            const key = prop.key orelse continue;
+            if (std.meta.activeTag(key.data) != .e_string) continue;
+            if (key.data.e_string.eql(string, name)) {
+                prop.value = Expr.init(E.String, .{ .data = value }, logger.Loc.Empty);
+                return;
+            }
+        }
+
+        var new_props = expr.data.e_object.properties.listManaged(allocator);
+        try new_props.append(.{
+            .key = Expr.init(E.String, .{ .data = name }, logger.Loc.Empty),
+            .value = Expr.init(E.String, .{ .data = value }, logger.Loc.Empty),
+        });
+
+        expr.data.e_object.properties = BabyList(G.Property).fromList(new_props);
+    }
+
+    pub fn getObject(expr: *const Expr, name: string) ?Expr {
+        if (expr.asProperty(name)) |query| {
+            if (query.expr.isObject()) {
+                return query.expr;
+            }
+        }
+        return null;
+    }
+
+    pub fn getString(expr: *const Expr, allocator: std.mem.Allocator, name: string) OOM!?struct { string, logger.Loc } {
+        if (asProperty(expr, name)) |q| {
+            if (q.expr.asString(allocator)) |str| {
+                return .{
+                    str,
+                    q.expr.loc,
+                };
+            }
+        }
+        return null;
+    }
+
+    pub fn getNumber(expr: *const Expr, name: string) ?struct { f64, logger.Loc } {
+        if (asProperty(expr, name)) |q| {
+            if (q.expr.asNumber()) |num| {
+                return .{
+                    num,
+                    q.expr.loc,
+                };
+            }
+        }
+        return null;
+    }
+
+    pub fn getStringCloned(expr: *const Expr, allocator: std.mem.Allocator, name: string) OOM!?string {
+        return if (asProperty(expr, name)) |q| q.expr.asStringCloned(allocator) else null;
+    }
+
+    pub fn getStringClonedZ(expr: *const Expr, allocator: std.mem.Allocator, name: string) OOM!?stringZ {
+        return if (asProperty(expr, name)) |q| q.expr.asStringZ(allocator) else null;
+    }
+
+    pub fn getArray(expr: *const Expr, name: string) ?ArrayIterator {
+        return if (asProperty(expr, name)) |q| q.expr.asArray() else null;
     }
 
     pub fn getRope(self: *const Expr, rope: *const E.Object.Rope) ?E.Object.RopeQuery {
@@ -2342,9 +3528,42 @@ pub const Expr = struct {
     pub fn asProperty(expr: *const Expr, name: string) ?Query {
         if (std.meta.activeTag(expr.data) != .e_object) return null;
         const obj = expr.data.e_object;
-        if (@ptrToInt(obj.properties.ptr) == 0) return null;
+        if (@intFromPtr(obj.properties.ptr) == 0) return null;
 
         return obj.asProperty(name);
+    }
+
+    pub fn asPropertyStringMap(expr: *const Expr, name: string, allocator: std.mem.Allocator) ?*bun.StringArrayHashMap(string) {
+        if (std.meta.activeTag(expr.data) != .e_object) return null;
+        const obj_ = expr.data.e_object;
+        if (@intFromPtr(obj_.properties.ptr) == 0) return null;
+        const query = obj_.asProperty(name) orelse return null;
+        if (query.expr.data != .e_object) return null;
+
+        const obj = query.expr.data.e_object;
+        var count: usize = 0;
+        for (obj.properties.slice()) |prop| {
+            const key = prop.key.?.asString(allocator) orelse continue;
+            const value = prop.value.?.asString(allocator) orelse continue;
+            count += @as(usize, @intFromBool(key.len > 0 and value.len > 0));
+        }
+
+        if (count == 0) return null;
+        var map = bun.StringArrayHashMap(string).init(allocator);
+        map.ensureUnusedCapacity(count) catch return null;
+
+        for (obj.properties.slice()) |prop| {
+            const key = prop.key.?.asString(allocator) orelse continue;
+            const value = prop.value.?.asString(allocator) orelse continue;
+
+            if (!(key.len > 0 and value.len > 0)) continue;
+
+            map.putAssumeCapacity(key, value);
+        }
+
+        const ptr = allocator.create(bun.StringArrayHashMap(string)) catch unreachable;
+        ptr.* = map;
+        return ptr;
     }
 
     pub const ArrayIterator = struct {
@@ -2363,17 +3582,61 @@ pub const Expr = struct {
     pub fn asArray(expr: *const Expr) ?ArrayIterator {
         if (std.meta.activeTag(expr.data) != .e_array) return null;
         const array = expr.data.e_array;
-        if (array.items.len == 0 or @ptrToInt(array.items.ptr) == 0) return null;
+        if (array.items.len == 0 or @intFromPtr(array.items.ptr) == 0) return null;
 
         return ArrayIterator{ .array = array, .index = 0 };
     }
 
-    pub inline fn asString(expr: *const Expr, allocator: std.mem.Allocator) ?string {
+    pub inline fn asUtf8StringLiteral(expr: *const Expr) ?string {
+        if (expr.data == .e_string) {
+            bun.debugAssert(expr.data.e_string.next == null);
+            return expr.data.e_string.data;
+        }
+        return null;
+    }
+
+    pub inline fn asStringLiteral(expr: *const Expr, allocator: std.mem.Allocator) ?string {
         if (std.meta.activeTag(expr.data) != .e_string) return null;
+        return expr.data.e_string.string(allocator) catch null;
+    }
 
-        const key_str = expr.data.e_string;
+    pub inline fn isString(expr: *const Expr) bool {
+        return switch (expr.data) {
+            .e_string => true,
+            else => false,
+        };
+    }
 
-        return if (key_str.isUTF8()) key_str.data else key_str.string(allocator) catch null;
+    pub inline fn asString(expr: *const Expr, allocator: std.mem.Allocator) ?string {
+        switch (expr.data) {
+            .e_string => |str| return str.string(allocator) catch bun.outOfMemory(),
+            else => return null,
+        }
+    }
+    pub inline fn asStringHash(expr: *const Expr, allocator: std.mem.Allocator, comptime hash_fn: *const fn (buf: []const u8) callconv(.Inline) u64) OOM!?u64 {
+        switch (expr.data) {
+            .e_string => |str| {
+                if (str.isUTF8()) return hash_fn(str.data);
+                const utf8_str = try str.string(allocator);
+                defer allocator.free(utf8_str);
+                return hash_fn(utf8_str);
+            },
+            else => return null,
+        }
+    }
+
+    pub inline fn asStringCloned(expr: *const Expr, allocator: std.mem.Allocator) OOM!?string {
+        switch (expr.data) {
+            .e_string => |str| return try str.stringCloned(allocator),
+            else => return null,
+        }
+    }
+
+    pub inline fn asStringZ(expr: *const Expr, allocator: std.mem.Allocator) OOM!?stringZ {
+        switch (expr.data) {
+            .e_string => |str| return try str.stringZ(allocator),
+            else => return null,
+        }
     }
 
     pub fn asBool(
@@ -2384,10 +3647,16 @@ pub const Expr = struct {
         return expr.data.e_boolean.value;
     }
 
+    pub fn asNumber(expr: *const Expr) ?f64 {
+        if (expr.data != .e_number) return null;
+
+        return expr.data.e_number.value;
+    }
+
     pub const EFlags = enum { none, ts_decorator };
 
     const Serializable = struct {
-        @"type": Tag,
+        type: Tag,
         object: string,
         value: Data,
         loc: logger.Loc,
@@ -2453,7 +3722,7 @@ pub const Expr = struct {
     }
 
     pub fn joinAllWithComma(all: []Expr, allocator: std.mem.Allocator) Expr {
-        std.debug.assert(all.len > 0);
+        bun.assert(all.len > 0);
         switch (all.len) {
             1 => {
                 return all[0];
@@ -2462,18 +3731,16 @@ pub const Expr = struct {
                 return Expr.joinWithComma(all[0], all[1], allocator);
             },
             else => {
-                var i: usize = 1;
                 var expr = all[0];
-                while (i < all.len) : (i += 1) {
+                for (1..all.len) |i| {
                     expr = Expr.joinWithComma(expr, all[i], allocator);
                 }
-
                 return expr;
             },
         }
     }
 
-    pub fn joinAllWithCommaCallback(all: []Expr, comptime Context: type, ctx: Context, callback: (fn (ctx: anytype, expr: anytype) ?Expr), allocator: std.mem.Allocator) ?Expr {
+    pub fn joinAllWithCommaCallback(all: []Expr, comptime Context: type, ctx: Context, comptime callback: (fn (ctx: anytype, expr: Expr) ?Expr), allocator: std.mem.Allocator) ?Expr {
         switch (all.len) {
             0 => return null,
             1 => {
@@ -2511,33 +3778,15 @@ pub const Expr = struct {
         }
     }
 
-    pub fn jsonStringify(self: *const @This(), options: anytype, writer: anytype) !void {
-        return try std.json.stringify(Serializable{ .@"type" = std.meta.activeTag(self.data), .object = "expr", .value = self.data, .loc = self.loc }, options, writer);
+    pub fn jsonStringify(self: *const @This(), writer: anytype) !void {
+        return try writer.write(Serializable{ .type = std.meta.activeTag(self.data), .object = "expr", .value = self.data, .loc = self.loc });
     }
 
     pub fn extractNumericValues(left: Expr.Data, right: Expr.Data) ?[2]f64 {
-        if (!(@as(Expr.Tag, left) == .e_number and @as(Expr.Tag, right) == .e_number)) {
-            return null;
-        }
-
-        return [2]f64{ left.e_number.value, right.e_number.value };
-    }
-
-    pub fn isAnonymousNamed(e: *Expr) bool {
-        switch (e.data) {
-            .e_arrow => {
-                return true;
-            },
-            .e_function => |func| {
-                return func.func.name == null;
-            },
-            .e_class => |class| {
-                return class.class_name == null;
-            },
-            else => {
-                return false;
-            },
-        }
+        return .{
+            left.extractNumericValue() orelse return null,
+            right.extractNumericValue() orelse return null,
+        };
     }
 
     pub var icount: usize = 0;
@@ -2547,15 +3796,23 @@ pub const Expr = struct {
     var false_bool = E.Boolean{ .value = false };
     var bool_values = [_]*E.Boolean{ &false_bool, &true_bool };
 
-    pub fn init(comptime Type: type, st: Type, loc: logger.Loc) Expr {
+    /// When the lifetime of an Expr.Data's pointer must exist longer than reset() is called, use this function.
+    /// Be careful to free the memory (or use an allocator that does it for you)
+    /// Also, prefer Expr.init or Expr.alloc when possible. This will be slower.
+    pub fn allocate(allocator: std.mem.Allocator, comptime Type: type, st: Type, loc: logger.Loc) Expr {
         icount += 1;
+        Data.Store.assert();
 
         switch (Type) {
             E.Array => {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_array = Data.Store.All.append(Type, st),
+                        .e_array = brk: {
+                            const item = allocator.create(Type) catch unreachable;
+                            item.* = st;
+                            break :brk item;
+                        },
                     },
                 };
             },
@@ -2563,7 +3820,11 @@ pub const Expr = struct {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_class = Data.Store.All.append(Type, st),
+                        .e_class = brk: {
+                            const item = allocator.create(Type) catch unreachable;
+                            item.* = st;
+                            break :brk item;
+                        },
                     },
                 };
             },
@@ -2571,7 +3832,11 @@ pub const Expr = struct {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_unary = Data.Store.All.append(Type, st),
+                        .e_unary = brk: {
+                            const item = allocator.create(Type) catch unreachable;
+                            item.* = st;
+                            break :brk item;
+                        },
                     },
                 };
             },
@@ -2579,7 +3844,11 @@ pub const Expr = struct {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_binary = Data.Store.All.append(Type, st),
+                        .e_binary = brk: {
+                            const item = allocator.create(Type) catch unreachable;
+                            item.* = st;
+                            break :brk item;
+                        },
                     },
                 };
             },
@@ -2627,7 +3896,11 @@ pub const Expr = struct {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_new = Data.Store.All.append(Type, st),
+                        .e_new = brk: {
+                            const item = allocator.create(Type) catch unreachable;
+                            item.* = st;
+                            break :brk item;
+                        },
                     },
                 };
             },
@@ -2643,7 +3916,11 @@ pub const Expr = struct {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_function = Data.Store.All.append(Type, st),
+                        .e_function = brk: {
+                            const item = allocator.create(Type) catch unreachable;
+                            item.* = st;
+                            break :brk item;
+                        },
                     },
                 };
             },
@@ -2659,7 +3936,11 @@ pub const Expr = struct {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_call = Data.Store.All.append(Type, st),
+                        .e_call = brk: {
+                            const item = allocator.create(Type) catch unreachable;
+                            item.* = st;
+                            break :brk item;
+                        },
                     },
                 };
             },
@@ -2667,7 +3948,11 @@ pub const Expr = struct {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_dot = Data.Store.All.append(Type, st),
+                        .e_dot = brk: {
+                            const item = allocator.create(Type) catch unreachable;
+                            item.* = st;
+                            break :brk item;
+                        },
                     },
                 };
             },
@@ -2675,7 +3960,11 @@ pub const Expr = struct {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_index = Data.Store.All.append(Type, st),
+                        .e_index = brk: {
+                            const item = allocator.create(Type) catch unreachable;
+                            item.* = st;
+                            break :brk item;
+                        },
                     },
                 };
             },
@@ -2683,7 +3972,11 @@ pub const Expr = struct {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_arrow = Data.Store.All.append(Type, st),
+                        .e_arrow = brk: {
+                            const item = allocator.create(Type) catch unreachable;
+                            item.* = st;
+                            break :brk item;
+                        },
                     },
                 };
             },
@@ -2711,6 +4004,17 @@ pub const Expr = struct {
                     },
                 };
             },
+            E.CommonJSExportIdentifier => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_commonjs_export_identifier = .{
+                            .ref = st.ref,
+                        },
+                    },
+                };
+            },
+
             E.PrivateIdentifier => {
                 return Expr{
                     .loc = loc,
@@ -2723,7 +4027,11 @@ pub const Expr = struct {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_jsx_element = Data.Store.All.append(Type, st),
+                        .e_jsx_element = brk: {
+                            const item = allocator.create(Type) catch unreachable;
+                            item.* = st;
+                            break :brk item;
+                        },
                     },
                 };
             },
@@ -2742,7 +4050,11 @@ pub const Expr = struct {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_big_int = Data.Store.All.append(Type, st),
+                        .e_big_int = brk: {
+                            const item = allocator.create(Type) catch unreachable;
+                            item.* = st;
+                            break :brk item;
+                        },
                     },
                 };
             },
@@ -2750,7 +4062,11 @@ pub const Expr = struct {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_object = Data.Store.All.append(Type, st),
+                        .e_object = brk: {
+                            const item = allocator.create(Type) catch unreachable;
+                            item.* = st;
+                            break :brk item;
+                        },
                     },
                 };
             },
@@ -2758,7 +4074,11 @@ pub const Expr = struct {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_spread = Data.Store.All.append(Type, st),
+                        .e_spread = brk: {
+                            const item = allocator.create(Type) catch unreachable;
+                            item.* = st;
+                            break :brk item;
+                        },
                     },
                 };
             },
@@ -2766,14 +4086,17 @@ pub const Expr = struct {
                 if (comptime Environment.isDebug) {
                     // Sanity check: assert string is not a null ptr
                     if (st.data.len > 0 and st.isUTF8()) {
-                        std.debug.assert(@ptrToInt(st.data.ptr) > 0);
-                        std.debug.assert(st.data[0] > 0);
+                        bun.assert(@intFromPtr(st.data.ptr) > 0);
                     }
                 }
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_string = Data.Store.All.append(Type, st),
+                        .e_string = brk: {
+                            const item = allocator.create(Type) catch unreachable;
+                            item.* = st;
+                            break :brk item;
+                        },
                     },
                 };
             },
@@ -2781,7 +4104,11 @@ pub const Expr = struct {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_template_part = Data.Store.All.append(Type, st),
+                        .e_template_part = brk: {
+                            const item = allocator.create(Type) catch unreachable;
+                            item.* = st;
+                            break :brk item;
+                        },
                     },
                 };
             },
@@ -2789,7 +4116,11 @@ pub const Expr = struct {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_template = Data.Store.All.append(Type, st),
+                        .e_template = brk: {
+                            const item = allocator.create(Type) catch unreachable;
+                            item.* = st;
+                            break :brk item;
+                        },
                     },
                 };
             },
@@ -2797,7 +4128,11 @@ pub const Expr = struct {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_reg_exp = Data.Store.All.append(Type, st),
+                        .e_reg_exp = brk: {
+                            const item = allocator.create(Type) catch unreachable;
+                            item.* = st;
+                            break :brk item;
+                        },
                     },
                 };
             },
@@ -2805,7 +4140,11 @@ pub const Expr = struct {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_await = Data.Store.All.append(Type, st),
+                        .e_await = brk: {
+                            const item = allocator.create(Type) catch unreachable;
+                            item.* = st;
+                            break :brk item;
+                        },
                     },
                 };
             },
@@ -2813,7 +4152,11 @@ pub const Expr = struct {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_yield = Data.Store.All.append(Type, st),
+                        .e_yield = brk: {
+                            const item = allocator.create(Type) catch unreachable;
+                            item.* = st;
+                            break :brk item;
+                        },
                     },
                 };
             },
@@ -2821,15 +4164,19 @@ pub const Expr = struct {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_if = Data.Store.All.append(Type, st),
+                        .e_if = brk: {
+                            const item = allocator.create(Type) catch unreachable;
+                            item.* = st;
+                            break :brk item;
+                        },
                     },
                 };
             },
-            E.RequireOrRequireResolve => {
+            E.RequireResolveString => {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_require_or_require_resolve = st,
+                        .e_require_resolve_string = st,
                     },
                 };
             },
@@ -2837,15 +4184,19 @@ pub const Expr = struct {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_import = Data.Store.All.append(Type, st),
+                        .e_import = brk: {
+                            const item = allocator.create(Type) catch unreachable;
+                            item.* = st;
+                            break :brk item;
+                        },
                     },
                 };
             },
-            E.Require => {
+            E.RequireString => {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_require = st,
+                        .e_require_string = st,
                     },
                 };
             },
@@ -2853,7 +4204,11 @@ pub const Expr = struct {
                 return Expr{
                     .loc = loc,
                     .data = Data{
-                        .e_string = Data.Store.All.append(@TypeOf(st.*), st.*),
+                        .e_string = brk: {
+                            const item = allocator.create(Type) catch unreachable;
+                            item.* = st.*;
+                            break :brk item;
+                        },
                     },
                 };
             },
@@ -2864,56 +4219,413 @@ pub const Expr = struct {
         }
     }
 
-    pub const Tag = enum(u6) {
+    pub const Disabler = bun.DebugOnlyDisabler(@This());
+
+    pub fn init(comptime Type: type, st: Type, loc: logger.Loc) Expr {
+        icount += 1;
+        Data.Store.assert();
+
+        switch (Type) {
+            E.Array => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_array = Data.Store.append(Type, st),
+                    },
+                };
+            },
+            E.Class => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_class = Data.Store.append(Type, st),
+                    },
+                };
+            },
+            E.Unary => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_unary = Data.Store.append(Type, st),
+                    },
+                };
+            },
+            E.Binary => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_binary = Data.Store.append(Type, st),
+                    },
+                };
+            },
+            E.This => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_this = st,
+                    },
+                };
+            },
+            E.Boolean => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_boolean = st,
+                    },
+                };
+            },
+            E.Super => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_super = st,
+                    },
+                };
+            },
+            E.Null => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_null = st,
+                    },
+                };
+            },
+            E.Undefined => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_undefined = st,
+                    },
+                };
+            },
+            E.New => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_new = Data.Store.append(Type, st),
+                    },
+                };
+            },
+            E.NewTarget => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_new_target = st,
+                    },
+                };
+            },
+            E.Function => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_function = Data.Store.append(Type, st),
+                    },
+                };
+            },
+            E.ImportMeta => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_import_meta = st,
+                    },
+                };
+            },
+            E.Call => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_call = Data.Store.append(Type, st),
+                    },
+                };
+            },
+            E.Dot => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_dot = Data.Store.append(Type, st),
+                    },
+                };
+            },
+            E.Index => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_index = Data.Store.append(Type, st),
+                    },
+                };
+            },
+            E.Arrow => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_arrow = Data.Store.append(Type, st),
+                    },
+                };
+            },
+            E.Identifier => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_identifier = E.Identifier{
+                            .ref = st.ref,
+                            .must_keep_due_to_with_stmt = st.must_keep_due_to_with_stmt,
+                            .can_be_removed_if_unused = st.can_be_removed_if_unused,
+                            .call_can_be_unwrapped_if_unused = st.call_can_be_unwrapped_if_unused,
+                        },
+                    },
+                };
+            },
+            E.ImportIdentifier => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_import_identifier = .{
+                            .ref = st.ref,
+                            .was_originally_identifier = st.was_originally_identifier,
+                        },
+                    },
+                };
+            },
+            E.CommonJSExportIdentifier => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_commonjs_export_identifier = .{
+                            .ref = st.ref,
+                            .base = st.base,
+                        },
+                    },
+                };
+            },
+            E.PrivateIdentifier => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_private_identifier = st,
+                    },
+                };
+            },
+            E.JSXElement => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_jsx_element = Data.Store.append(Type, st),
+                    },
+                };
+            },
+            E.Missing => {
+                return Expr{ .loc = loc, .data = Data{ .e_missing = E.Missing{} } };
+            },
+            E.Number => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_number = st,
+                    },
+                };
+            },
+            E.BigInt => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_big_int = Data.Store.append(Type, st),
+                    },
+                };
+            },
+            E.Object => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_object = Data.Store.append(Type, st),
+                    },
+                };
+            },
+            E.Spread => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_spread = Data.Store.append(Type, st),
+                    },
+                };
+            },
+            E.String => {
+                if (comptime Environment.isDebug) {
+                    // Sanity check: assert string is not a null ptr
+                    if (st.data.len > 0 and st.isUTF8()) {
+                        bun.assert(@intFromPtr(st.data.ptr) > 0);
+                    }
+                }
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_string = Data.Store.append(Type, st),
+                    },
+                };
+            },
+            E.TemplatePart => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_template_part = Data.Store.append(Type, st),
+                    },
+                };
+            },
+            E.Template => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_template = Data.Store.append(Type, st),
+                    },
+                };
+            },
+            E.RegExp => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_reg_exp = Data.Store.append(Type, st),
+                    },
+                };
+            },
+            E.Await => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_await = Data.Store.append(Type, st),
+                    },
+                };
+            },
+            E.Yield => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_yield = Data.Store.append(Type, st),
+                    },
+                };
+            },
+            E.If => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_if = Data.Store.append(Type, st),
+                    },
+                };
+            },
+            E.RequireResolveString => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_require_resolve_string = st,
+                    },
+                };
+            },
+            E.Import => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_import = Data.Store.append(Type, st),
+                    },
+                };
+            },
+            E.RequireString => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_require_string = st,
+                    },
+                };
+            },
+            *E.String => {
+                return Expr{
+                    .loc = loc,
+                    .data = Data{
+                        .e_string = Data.Store.append(@TypeOf(st.*), st.*),
+                    },
+                };
+            },
+            E.InlinedEnum => return .{ .loc = loc, .data = .{
+                .e_inlined_enum = Data.Store.append(@TypeOf(st), st),
+            } },
+
+            else => {
+                @compileError("Invalid type passed to Expr.init: " ++ @typeName(Type));
+            },
+        }
+    }
+
+    pub fn isPrimitiveLiteral(this: Expr) bool {
+        return @as(Tag, this.data).isPrimitiveLiteral();
+    }
+
+    pub fn isRef(this: Expr, ref: Ref) bool {
+        return switch (this.data) {
+            .e_import_identifier => |import_identifier| import_identifier.ref.eql(ref),
+            .e_identifier => |ident| ident.ref.eql(ref),
+            else => false,
+        };
+    }
+
+    pub const Tag = enum {
         e_array,
         e_unary,
         e_binary,
-        e_boolean,
-        e_super,
-        e_null,
-        e_undefined,
+        e_class,
         e_new,
         e_function,
-        e_new_target,
-        e_import_meta,
         e_call,
         e_dot,
         e_index,
         e_arrow,
-        e_identifier,
-        e_import_identifier,
-        e_private_identifier,
         e_jsx_element,
-        e_missing,
-        e_number,
-        e_big_int,
         e_object,
         e_spread,
-        e_string,
         e_template_part,
         e_template,
         e_reg_exp,
         e_await,
         e_yield,
         e_if,
-        e_require_or_require_resolve,
         e_import,
+        e_identifier,
+        e_import_identifier,
+        e_private_identifier,
+        e_commonjs_export_identifier,
+        e_module_dot_exports,
+        e_boolean,
+        e_number,
+        e_big_int,
+        e_string,
+        e_require_string,
+        e_require_resolve_string,
+        e_require_call_target,
+        e_require_resolve_call_target,
+        e_missing,
         e_this,
-        e_class,
-        e_require,
+        e_super,
+        e_null,
+        e_undefined,
+        e_new_target,
+        e_import_meta,
+        e_import_meta_main,
+        e_require_main,
+        e_inlined_enum,
 
-        // This should never make it to the printer
-        inline_identifier,
+        // object, regex and array may have had side effects
+        pub fn isPrimitiveLiteral(tag: Tag) bool {
+            return switch (tag) {
+                .e_null, .e_undefined, .e_string, .e_boolean, .e_number, .e_big_int => true,
+                else => false,
+            };
+        }
 
         pub fn typeof(tag: Tag) ?string {
             return switch (tag) {
-                .e_null => "object",
+                .e_array, .e_object, .e_null, .e_reg_exp => "object",
                 .e_undefined => "undefined",
                 .e_boolean => "boolean",
                 .e_number => "number",
                 .e_big_int => "bigint",
                 .e_string => "string",
-                .e_function, .e_arrow => "function",
+                .e_class, .e_function, .e_arrow => "function",
                 else => null,
             };
         }
@@ -2951,17 +4663,17 @@ pub const Expr = struct {
                 .e_await => writer.writeAll("await"),
                 .e_yield => writer.writeAll("yield"),
                 .e_if => writer.writeAll("if"),
-                .e_require_or_require_resolve => writer.writeAll("require_or_require_resolve"),
+                .e_require_resolve_string => writer.writeAll("require_or_require_resolve"),
                 .e_import => writer.writeAll("import"),
                 .e_this => writer.writeAll("this"),
                 .e_class => writer.writeAll("class"),
-                .e_require => writer.writeAll("require"),
+                .e_require_string => writer.writeAll("require"),
                 else => writer.writeAll(@tagName(tag)),
             };
         }
 
-        pub fn jsonStringify(self: @This(), opts: anytype, o: anytype) !void {
-            return try std.json.stringify(@tagName(self), opts, o);
+        pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            return try writer.write(@tagName(self));
         }
 
         pub fn isArray(self: Tag) bool {
@@ -3294,9 +5006,9 @@ pub const Expr = struct {
                 },
             }
         }
-        pub fn isRequireOrRequireResolve(self: Tag) bool {
+        pub fn isRequireResolveString(self: Tag) bool {
             switch (self) {
-                .e_require_or_require_resolve => {
+                .e_require_resolve_string => {
                     return true;
                 },
                 else => {
@@ -3348,7 +5060,7 @@ pub const Expr = struct {
         return false;
     }
 
-    pub fn assign(a: Expr, b: Expr, _: std.mem.Allocator) Expr {
+    pub fn assign(a: Expr, b: Expr) Expr {
         return init(E.Binary, E.Binary{
             .op = .bin_assign,
             .left = a,
@@ -3449,6 +5161,9 @@ pub const Expr = struct {
                     else => {},
                 }
             },
+            .e_inlined_enum => |inlined| {
+                return maybeSimplifyNot(inlined.value, allocator);
+            },
 
             else => {},
         }
@@ -3456,14 +5171,33 @@ pub const Expr = struct {
         return null;
     }
 
-    pub fn assignStmt(a: Expr, b: Expr, allocator: std.mem.Allocator) Stmt {
-        return Stmt.alloc(
-            S.SExpr,
-            S.SExpr{
-                .value = Expr.assign(a, b, allocator),
-            },
-            a.loc,
-        );
+    pub fn toStringExprWithoutSideEffects(expr: Expr, allocator: std.mem.Allocator) ?Expr {
+        const unwrapped = expr.unwrapInlined();
+        const slice = switch (unwrapped.data) {
+            .e_null => "null",
+            .e_string => return expr,
+            .e_undefined => "undefined",
+            .e_boolean => |data| if (data.value) "true" else "false",
+            .e_big_int => |bigint| bigint.value,
+            .e_number => |num| if (num.toString(allocator)) |str|
+                str
+            else
+                null,
+            .e_reg_exp => |regexp| regexp.value,
+            .e_dot => |dot| @as(?[]const u8, brk: {
+                // This is dumb but some JavaScript obfuscators use this to generate string literals
+                if (bun.strings.eqlComptime(dot.name, "constructor")) {
+                    break :brk switch (dot.target.data) {
+                        .e_string => "function String() { [native code] }",
+                        .e_reg_exp => "function RegExp() { [native code] }",
+                        else => null,
+                    };
+                }
+                break :brk null;
+            }),
+            else => null,
+        };
+        return if (slice) |s| Expr.init(E.String, E.String.init(s), expr.loc) else null;
     }
 
     pub fn isOptionalChain(self: *const @This()) bool {
@@ -3482,20 +5216,20 @@ pub const Expr = struct {
     pub const PrimitiveType = enum {
         unknown,
         mixed,
-        @"null",
-        @"undefined",
+        null,
+        undefined,
         boolean,
         number,
-        @"string",
+        string,
         bigint,
 
         pub const static = std.enums.EnumSet(PrimitiveType).init(.{
-            .@"mixed" = true,
-            .@"null" = true,
-            .@"undefined" = true,
-            .@"boolean" = true,
-            .@"number" = true,
-            .@"string" = true,
+            .mixed = true,
+            .null = true,
+            .undefined = true,
+            .boolean = true,
+            .number = true,
+            .string = true,
             // for our purposes, bigint is dynamic
             // it is technically static though
             // .@"bigint" = true,
@@ -3514,9 +5248,6 @@ pub const Expr = struct {
             else
                 .mixed;
         }
-
-        //  This can be used when the returned type is either one or the other
-
     };
 
     pub const Data = union(Tag) {
@@ -3546,14 +5277,18 @@ pub const Expr = struct {
         e_identifier: E.Identifier,
         e_import_identifier: E.ImportIdentifier,
         e_private_identifier: E.PrivateIdentifier,
+        e_commonjs_export_identifier: E.CommonJSExportIdentifier,
+        e_module_dot_exports,
 
         e_boolean: E.Boolean,
         e_number: E.Number,
         e_big_int: *E.BigInt,
         e_string: *E.String,
 
-        e_require: E.Require,
-        e_require_or_require_resolve: E.RequireOrRequireResolve,
+        e_require_string: E.RequireString,
+        e_require_resolve_string: E.RequireResolveString,
+        e_require_call_target,
+        e_require_resolve_call_target,
 
         e_missing: E.Missing,
         e_this: E.This,
@@ -3563,19 +5298,550 @@ pub const Expr = struct {
         e_new_target: E.NewTarget,
         e_import_meta: E.ImportMeta,
 
-        // This type should not exist outside of MacroContext
-        // If it ends up in JSParser or JSPrinter, it is a bug.
-        inline_identifier: i32,
+        e_import_meta_main: E.ImportMetaMain,
+        e_require_main,
+
+        e_inlined_enum: *E.InlinedEnum,
+
+        comptime {
+            bun.assert_eql(@sizeOf(Data), 24); // Do not increase the size of Expr
+        }
+
+        pub fn as(data: Data, comptime tag: Tag) ?std.meta.FieldType(Data, tag) {
+            return if (data == tag) @field(data, @tagName(tag)) else null;
+        }
+
+        pub fn clone(this: Expr.Data, allocator: std.mem.Allocator) !Data {
+            return switch (this) {
+                .e_array => |el| {
+                    const item = try allocator.create(std.meta.Child(@TypeOf(this.e_array)));
+                    item.* = el.*;
+                    return .{ .e_array = item };
+                },
+                .e_unary => |el| {
+                    const item = try allocator.create(std.meta.Child(@TypeOf(this.e_unary)));
+                    item.* = el.*;
+                    return .{ .e_unary = item };
+                },
+                .e_binary => |el| {
+                    const item = try allocator.create(std.meta.Child(@TypeOf(this.e_binary)));
+                    item.* = el.*;
+                    return .{ .e_binary = item };
+                },
+                .e_class => |el| {
+                    const item = try allocator.create(std.meta.Child(@TypeOf(this.e_class)));
+                    item.* = el.*;
+                    return .{ .e_class = item };
+                },
+                .e_new => |el| {
+                    const item = try allocator.create(std.meta.Child(@TypeOf(this.e_new)));
+                    item.* = el.*;
+                    return .{ .e_new = item };
+                },
+                .e_function => |el| {
+                    const item = try allocator.create(std.meta.Child(@TypeOf(this.e_function)));
+                    item.* = el.*;
+                    return .{ .e_function = item };
+                },
+                .e_call => |el| {
+                    const item = try allocator.create(std.meta.Child(@TypeOf(this.e_call)));
+                    item.* = el.*;
+                    return .{ .e_call = item };
+                },
+                .e_dot => |el| {
+                    const item = try allocator.create(std.meta.Child(@TypeOf(this.e_dot)));
+                    item.* = el.*;
+                    return .{ .e_dot = item };
+                },
+                .e_index => |el| {
+                    const item = try allocator.create(std.meta.Child(@TypeOf(this.e_index)));
+                    item.* = el.*;
+                    return .{ .e_index = item };
+                },
+                .e_arrow => |el| {
+                    const item = try allocator.create(std.meta.Child(@TypeOf(this.e_arrow)));
+                    item.* = el.*;
+                    return .{ .e_arrow = item };
+                },
+                .e_jsx_element => |el| {
+                    const item = try allocator.create(std.meta.Child(@TypeOf(this.e_jsx_element)));
+                    item.* = el.*;
+                    return .{ .e_jsx_element = item };
+                },
+                .e_object => |el| {
+                    const item = try allocator.create(std.meta.Child(@TypeOf(this.e_object)));
+                    item.* = el.*;
+                    return .{ .e_object = item };
+                },
+                .e_spread => |el| {
+                    const item = try allocator.create(std.meta.Child(@TypeOf(this.e_spread)));
+                    item.* = el.*;
+                    return .{ .e_spread = item };
+                },
+                .e_template_part => |el| {
+                    const item = try allocator.create(std.meta.Child(@TypeOf(this.e_template_part)));
+                    item.* = el.*;
+                    return .{ .e_template_part = item };
+                },
+                .e_template => |el| {
+                    const item = try allocator.create(std.meta.Child(@TypeOf(this.e_template)));
+                    item.* = el.*;
+                    return .{ .e_template = item };
+                },
+                .e_reg_exp => |el| {
+                    const item = try allocator.create(std.meta.Child(@TypeOf(this.e_reg_exp)));
+                    item.* = el.*;
+                    return .{ .e_reg_exp = item };
+                },
+                .e_await => |el| {
+                    const item = try allocator.create(std.meta.Child(@TypeOf(this.e_await)));
+                    item.* = el.*;
+                    return .{ .e_await = item };
+                },
+                .e_yield => |el| {
+                    const item = try allocator.create(std.meta.Child(@TypeOf(this.e_yield)));
+                    item.* = el.*;
+                    return .{ .e_yield = item };
+                },
+                .e_if => |el| {
+                    const item = try allocator.create(std.meta.Child(@TypeOf(this.e_if)));
+                    item.* = el.*;
+                    return .{ .e_if = item };
+                },
+                .e_import => |el| {
+                    const item = try allocator.create(std.meta.Child(@TypeOf(this.e_import)));
+                    item.* = el.*;
+                    return .{ .e_import = item };
+                },
+                .e_big_int => |el| {
+                    const item = try allocator.create(std.meta.Child(@TypeOf(this.e_big_int)));
+                    item.* = el.*;
+                    return .{ .e_big_int = item };
+                },
+                .e_string => |el| {
+                    const item = try allocator.create(std.meta.Child(@TypeOf(this.e_string)));
+                    item.* = el.*;
+                    return .{ .e_string = item };
+                },
+                .e_inlined_enum => |el| {
+                    const item = try allocator.create(std.meta.Child(@TypeOf(this.e_inlined_enum)));
+                    item.* = el.*;
+                    return .{ .e_inlined_enum = item };
+                },
+                else => this,
+            };
+        }
+
+        pub fn deepClone(this: Expr.Data, allocator: std.mem.Allocator) !Data {
+            return switch (this) {
+                .e_array => |el| {
+                    const items = try el.items.deepClone(allocator);
+                    const item = bun.create(allocator, E.Array, .{
+                        .items = items,
+                        .comma_after_spread = el.comma_after_spread,
+                        .was_originally_macro = el.was_originally_macro,
+                        .is_single_line = el.is_single_line,
+                        .is_parenthesized = el.is_parenthesized,
+                        .close_bracket_loc = el.close_bracket_loc,
+                    });
+                    return .{ .e_array = item };
+                },
+                .e_unary => |el| {
+                    const item = bun.create(allocator, E.Unary, .{
+                        .op = el.op,
+                        .value = try el.value.deepClone(allocator),
+                    });
+                    return .{ .e_unary = item };
+                },
+                .e_binary => |el| {
+                    const item = bun.create(allocator, E.Binary, .{
+                        .op = el.op,
+                        .left = try el.left.deepClone(allocator),
+                        .right = try el.right.deepClone(allocator),
+                    });
+                    return .{ .e_binary = item };
+                },
+                .e_class => |el| {
+                    const properties = try allocator.alloc(G.Property, el.properties.len);
+                    for (el.properties, 0..) |prop, i| {
+                        properties[i] = try prop.deepClone(allocator);
+                    }
+
+                    const item = bun.create(allocator, E.Class, .{
+                        .class_keyword = el.class_keyword,
+                        .ts_decorators = try el.ts_decorators.deepClone(allocator),
+                        .class_name = el.class_name,
+                        .extends = if (el.extends) |e| try e.deepClone(allocator) else null,
+                        .body_loc = el.body_loc,
+                        .close_brace_loc = el.close_brace_loc,
+                        .properties = properties,
+                        .has_decorators = el.has_decorators,
+                    });
+                    return .{ .e_class = item };
+                },
+                .e_new => |el| {
+                    const item = bun.create(allocator, E.New, .{
+                        .target = try el.target.deepClone(allocator),
+                        .args = try el.args.deepClone(allocator),
+                        .can_be_unwrapped_if_unused = el.can_be_unwrapped_if_unused,
+                        .close_parens_loc = el.close_parens_loc,
+                    });
+
+                    return .{ .e_new = item };
+                },
+                .e_function => |el| {
+                    const item = bun.create(allocator, E.Function, .{
+                        .func = try el.func.deepClone(allocator),
+                    });
+                    return .{ .e_function = item };
+                },
+                .e_call => |el| {
+                    const item = bun.create(allocator, E.Call, .{
+                        .target = try el.target.deepClone(allocator),
+                        .args = try el.args.deepClone(allocator),
+                        .optional_chain = el.optional_chain,
+                        .is_direct_eval = el.is_direct_eval,
+                        .close_paren_loc = el.close_paren_loc,
+                        .can_be_unwrapped_if_unused = el.can_be_unwrapped_if_unused,
+                        .was_jsx_element = el.was_jsx_element,
+                    });
+                    return .{ .e_call = item };
+                },
+                .e_dot => |el| {
+                    const item = bun.create(allocator, E.Dot, .{
+                        .target = try el.target.deepClone(allocator),
+                        .name = el.name,
+                        .name_loc = el.name_loc,
+                        .optional_chain = el.optional_chain,
+                        .can_be_removed_if_unused = el.can_be_removed_if_unused,
+                        .call_can_be_unwrapped_if_unused = el.call_can_be_unwrapped_if_unused,
+                    });
+                    return .{ .e_dot = item };
+                },
+                .e_index => |el| {
+                    const item = bun.create(allocator, E.Index, .{
+                        .target = try el.target.deepClone(allocator),
+                        .index = try el.index.deepClone(allocator),
+                        .optional_chain = el.optional_chain,
+                    });
+                    return .{ .e_index = item };
+                },
+                .e_arrow => |el| {
+                    const args = try allocator.alloc(G.Arg, el.args.len);
+                    for (0..args.len) |i| {
+                        args[i] = try el.args[i].deepClone(allocator);
+                    }
+                    const item = bun.create(allocator, E.Arrow, .{
+                        .args = args,
+                        .body = el.body,
+                        .is_async = el.is_async,
+                        .has_rest_arg = el.has_rest_arg,
+                        .prefer_expr = el.prefer_expr,
+                    });
+
+                    return .{ .e_arrow = item };
+                },
+                .e_jsx_element => |el| {
+                    const item = bun.create(allocator, E.JSXElement, .{
+                        .tag = if (el.tag) |tag| try tag.deepClone(allocator) else null,
+                        .properties = try el.properties.deepClone(allocator),
+                        .children = try el.children.deepClone(allocator),
+                        .key_prop_index = el.key_prop_index,
+                        .flags = el.flags,
+                        .close_tag_loc = el.close_tag_loc,
+                    });
+                    return .{ .e_jsx_element = item };
+                },
+                .e_object => |el| {
+                    const item = bun.create(allocator, E.Object, .{
+                        .properties = try el.properties.deepClone(allocator),
+                        .comma_after_spread = el.comma_after_spread,
+                        .is_single_line = el.is_single_line,
+                        .is_parenthesized = el.is_parenthesized,
+                        .was_originally_macro = el.was_originally_macro,
+                        .close_brace_loc = el.close_brace_loc,
+                    });
+                    return .{ .e_object = item };
+                },
+                .e_spread => |el| {
+                    const item = bun.create(allocator, E.Spread, .{
+                        .value = try el.value.deepClone(allocator),
+                    });
+                    return .{ .e_spread = item };
+                },
+                .e_template_part => |el| {
+                    const item = bun.create(allocator, E.TemplatePart, .{
+                        .value = try el.value.deepClone(allocator),
+                        .tail_loc = el.tail_loc,
+                        .tail = el.tail,
+                    });
+                    return .{ .e_template_part = item };
+                },
+                .e_template => |el| {
+                    const item = bun.create(allocator, E.Template, .{
+                        .tag = if (el.tag) |tag| try tag.deepClone(allocator) else null,
+                        .parts = el.parts,
+                        .head = el.head,
+                    });
+                    return .{ .e_template = item };
+                },
+                .e_reg_exp => |el| {
+                    const item = bun.create(allocator, E.RegExp, .{
+                        .value = el.value,
+                        .flags_offset = el.flags_offset,
+                    });
+                    return .{ .e_reg_exp = item };
+                },
+                .e_await => |el| {
+                    const item = bun.create(allocator, E.Await, .{
+                        .value = try el.value.deepClone(allocator),
+                    });
+                    return .{ .e_await = item };
+                },
+                .e_yield => |el| {
+                    const item = bun.create(allocator, E.Yield, .{
+                        .value = if (el.value) |value| try value.deepClone(allocator) else null,
+                        .is_star = el.is_star,
+                    });
+                    return .{ .e_yield = item };
+                },
+                .e_if => |el| {
+                    const item = bun.create(allocator, E.If, .{
+                        .test_ = try el.test_.deepClone(allocator),
+                        .yes = try el.yes.deepClone(allocator),
+                        .no = try el.no.deepClone(allocator),
+                    });
+                    return .{ .e_if = item };
+                },
+                .e_import => |el| {
+                    const item = bun.create(allocator, E.Import, .{
+                        .expr = try el.expr.deepClone(allocator),
+                        .options = try el.options.deepClone(allocator),
+                        .import_record_index = el.import_record_index,
+                    });
+                    return .{ .e_import = item };
+                },
+                .e_big_int => |el| {
+                    const item = bun.create(allocator, E.BigInt, .{
+                        .value = el.value,
+                    });
+                    return .{ .e_big_int = item };
+                },
+                .e_string => |el| {
+                    const item = bun.create(allocator, E.String, .{
+                        .data = el.data,
+                        .prefer_template = el.prefer_template,
+                        .next = el.next,
+                        .end = el.end,
+                        .rope_len = el.rope_len,
+                        .is_utf16 = el.is_utf16,
+                    });
+                    return .{ .e_string = item };
+                },
+                .e_inlined_enum => |el| {
+                    const item = bun.create(allocator, E.InlinedEnum, .{
+                        .value = el.value,
+                        .comment = el.comment,
+                    });
+                    return .{ .e_inlined_enum = item };
+                },
+                else => this,
+            };
+        }
+
+        /// `hasher` should be something with 'pub fn update([]const u8) void';
+        /// symbol table is passed to serialize `Ref` as an identifier names instead of a nondeterministic numbers
+        pub fn writeToHasher(this: Expr.Data, hasher: anytype, symbol_table: anytype) void {
+            writeAnyToHasher(hasher, std.meta.activeTag(this));
+            switch (this) {
+                .e_array => |e| {
+                    writeAnyToHasher(hasher, .{
+                        e.is_single_line,
+                        e.is_parenthesized,
+                        e.was_originally_macro,
+                        e.items.len,
+                    });
+                    for (e.items.slice()) |item| {
+                        item.data.writeToHasher(hasher, symbol_table);
+                    }
+                },
+                .e_unary => |e| {
+                    writeAnyToHasher(hasher, .{e.op});
+                    e.value.data.writeToHasher(hasher, symbol_table);
+                },
+                .e_binary => |e| {
+                    writeAnyToHasher(hasher, .{e.op});
+                    e.left.data.writeToHasher(hasher, symbol_table);
+                    e.right.data.writeToHasher(hasher, symbol_table);
+                },
+                .e_class => |e| {
+                    _ = e; // autofix
+                },
+                inline .e_new, .e_call => |e| {
+                    _ = e; // autofix
+                },
+                .e_function => |e| {
+                    _ = e; // autofix
+                },
+                .e_dot => |e| {
+                    writeAnyToHasher(hasher, .{ e.optional_chain, e.name.len });
+                    e.target.data.writeToHasher(hasher, symbol_table);
+                    hasher.update(e.name);
+                },
+                .e_index => |e| {
+                    writeAnyToHasher(hasher, .{e.optional_chain});
+                    e.target.data.writeToHasher(hasher, symbol_table);
+                    e.index.data.writeToHasher(hasher, symbol_table);
+                },
+                .e_arrow => |e| {
+                    _ = e; // autofix
+                },
+                .e_jsx_element => |e| {
+                    _ = e; // autofix
+                },
+                .e_object => |e| {
+                    _ = e; // autofix
+                },
+                inline .e_spread, .e_await => |e| {
+                    e.value.data.writeToHasher(hasher, symbol_table);
+                },
+                inline .e_yield => |e| {
+                    writeAnyToHasher(hasher, .{ e.is_star, e.value });
+                    if (e.value) |value|
+                        value.data.writeToHasher(hasher, symbol_table);
+                },
+                .e_template_part => {
+                    // TODO: delete e_template_part as hit has zero usages
+                },
+                .e_template => |e| {
+                    _ = e; // autofix
+                },
+                .e_if => |e| {
+                    _ = e; // autofix
+                },
+                .e_import => |e| {
+                    _ = e; // autofix
+
+                },
+                inline .e_identifier,
+                .e_import_identifier,
+                .e_private_identifier,
+                .e_commonjs_export_identifier,
+                => |e| {
+                    const symbol = e.ref.getSymbol(symbol_table);
+                    hasher.update(symbol.original_name);
+                },
+                inline .e_boolean, .e_number => |e| {
+                    writeAnyToHasher(hasher, e.value);
+                },
+                inline .e_big_int, .e_reg_exp => |e| {
+                    hasher.update(e.value);
+                },
+
+                .e_string => |e| {
+                    var next: ?*E.String = e;
+                    if (next) |current| {
+                        if (current.isUTF8()) {
+                            hasher.update(current.data);
+                        } else {
+                            hasher.update(bun.reinterpretSlice(u8, current.slice16()));
+                        }
+                        next = current.next;
+                        hasher.update("\x00");
+                    }
+                },
+                inline .e_require_string, .e_require_resolve_string => |e| {
+                    writeAnyToHasher(hasher, e.import_record_index); // preferably, i'd like to write the filepath
+                },
+
+                .e_import_meta_main => |e| {
+                    writeAnyToHasher(hasher, e.inverted);
+                },
+                .e_inlined_enum => |e| {
+                    // pretend there is no comment
+                    e.value.data.writeToHasher(hasher, symbol_table);
+                },
+
+                // no data
+                .e_require_call_target,
+                .e_require_resolve_call_target,
+                .e_missing,
+                .e_this,
+                .e_super,
+                .e_null,
+                .e_undefined,
+                .e_new_target,
+                .e_require_main,
+                .e_import_meta,
+                .e_module_dot_exports,
+                => {},
+            }
+        }
+
+        /// "const values" here refers to expressions that can participate in constant
+        /// inlining, as they have no side effects on instantiation, and there would be
+        /// no observable difference if duplicated. This is a subset of canBeMoved()
+        pub fn canBeConstValue(this: Expr.Data) bool {
+            return switch (this) {
+                .e_number,
+                .e_boolean,
+                .e_null,
+                .e_undefined,
+                .e_inlined_enum,
+                => true,
+                .e_string => |str| str.next == null,
+                .e_array => |array| array.was_originally_macro,
+                .e_object => |object| object.was_originally_macro,
+                else => false,
+            };
+        }
+
+        /// Expressions that can be moved are those that do not have side
+        /// effects on their own. This is used to determine what can be moved
+        /// outside of a module wrapper (__esm/__commonJS).
+        pub fn canBeMoved(data: Expr.Data) bool {
+            return switch (data) {
+                // TODO: identifiers can be removed if unused, however code that
+                // moves expressions around sometimes does so incorrectly when
+                // doing destructures. test case: https://github.com/oven-sh/bun/issues/14027
+                // .e_identifier => |id| id.can_be_removed_if_unused,
+
+                .e_class => |class| class.canBeMoved(),
+
+                .e_arrow,
+                .e_function,
+
+                .e_number,
+                .e_boolean,
+                .e_null,
+                .e_undefined,
+                // .e_reg_exp,
+                .e_big_int,
+                .e_string,
+                .e_inlined_enum,
+                .e_import_meta,
+                => true,
+
+                .e_template => |template| template.tag == null and template.parts.len == 0,
+
+                .e_array => |array| array.was_originally_macro,
+                .e_object => |object| object.was_originally_macro,
+
+                // TODO: experiment with allowing some e_binary, e_unary, e_if as movable
+
+                else => false,
+            };
+        }
 
         pub fn knownPrimitive(data: Expr.Data) PrimitiveType {
             return switch (data) {
                 .e_big_int => .bigint,
                 .e_boolean => .boolean,
-                .e_null => .@"null",
+                .e_null => .null,
                 .e_number => .number,
-                .e_string => .@"string",
-                .e_undefined => .@"undefined",
-                .e_template => if (data.e_template.tag == null) PrimitiveType.@"string" else PrimitiveType.unknown,
+                .e_string => .string,
+                .e_undefined => .undefined,
+                .e_template => if (data.e_template.tag == null) PrimitiveType.string else PrimitiveType.unknown,
                 .e_if => mergeKnownPrimitive(data.e_if.yes.data, data.e_if.no.data),
                 .e_binary => |binary| brk: {
                     switch (binary.op) {
@@ -3595,7 +5861,7 @@ pub const Expr = struct {
                         .bin_nullish_coalescing => {
                             const left = binary.left.data.knownPrimitive();
                             const right = binary.right.data.knownPrimitive();
-                            if (left == .@"null" or left == .@"undefined")
+                            if (left == .null or left == .undefined)
                                 break :brk right;
 
                             if (left != .unknown) {
@@ -3611,8 +5877,8 @@ pub const Expr = struct {
                             const left = binary.left.data.knownPrimitive();
                             const right = binary.right.data.knownPrimitive();
 
-                            if (left == .@"string" or right == .@"string")
-                                break :brk PrimitiveType.@"string";
+                            if (left == .string or right == .string)
+                                break :brk PrimitiveType.string;
 
                             if (left == .bigint or right == .bigint)
                                 break :brk PrimitiveType.bigint;
@@ -3664,8 +5930,8 @@ pub const Expr = struct {
                 },
 
                 .e_unary => switch (data.e_unary.op) {
-                    .un_void => PrimitiveType.@"undefined",
-                    .un_typeof => PrimitiveType.@"string",
+                    .un_void => PrimitiveType.undefined,
+                    .un_typeof => PrimitiveType.string,
                     .un_not, .un_delete => PrimitiveType.boolean,
                     .un_pos => PrimitiveType.number, // Cannot be bigint because that throws an exception
                     .un_neg, .un_cpl => switch (data.e_unary.value.data.knownPrimitive()) {
@@ -3677,6 +5943,9 @@ pub const Expr = struct {
 
                     else => PrimitiveType.unknown,
                 },
+
+                .e_inlined_enum => |inlined| inlined.value.data.knownPrimitive(),
+
                 else => PrimitiveType.unknown,
             };
         }
@@ -3695,139 +5964,363 @@ pub const Expr = struct {
         pub fn toNumber(data: Expr.Data) ?f64 {
             return switch (data) {
                 .e_null => 0,
-                .e_undefined => std.math.nan_f64,
+                .e_undefined => std.math.nan(f64),
+                .e_string => |str| {
+                    if (str.next != null) return null;
+                    if (!str.isUTF8()) return null;
+
+                    // +'1' => 1
+                    return stringToEquivalentNumberValue(str.slice8());
+                },
                 .e_boolean => @as(f64, if (data.e_boolean.value) 1.0 else 0.0),
                 .e_number => data.e_number.value,
+                .e_inlined_enum => |inlined| switch (inlined.value.data) {
+                    .e_number => |num| num.value,
+                    .e_string => |str| {
+                        if (str.next != null) return null;
+                        if (!str.isUTF8()) return null;
+
+                        // +'1' => 1
+                        return stringToEquivalentNumberValue(str.slice8());
+                    },
+                    else => null,
+                },
                 else => null,
             };
         }
 
-        pub const Equality = struct { equal: bool = false, ok: bool = false };
+        pub fn toFiniteNumber(data: Expr.Data) ?f64 {
+            return switch (data) {
+                .e_boolean => @as(f64, if (data.e_boolean.value) 1.0 else 0.0),
+                .e_number => if (std.math.isFinite(data.e_number.value))
+                    data.e_number.value
+                else
+                    null,
+                .e_inlined_enum => |inlined| switch (inlined.value.data) {
+                    .e_number => |num| if (std.math.isFinite(num.value))
+                        num.value
+                    else
+                        null,
+                    else => null,
+                },
+                else => null,
+            };
+        }
+
+        pub fn extractNumericValue(data: Expr.Data) ?f64 {
+            return switch (data) {
+                .e_number => data.e_number.value,
+                .e_inlined_enum => |inlined| switch (inlined.value.data) {
+                    .e_number => |num| num.value,
+                    else => null,
+                },
+                else => null,
+            };
+        }
+
+        pub const Equality = struct {
+            equal: bool = false,
+            ok: bool = false,
+
+            /// This extra flag is unfortunately required for the case of visiting the expression
+            /// `require.main === module` (and any combination of !==, ==, !=, either ordering)
+            ///
+            /// We want to replace this with the dedicated import_meta_main node, which:
+            /// - Stops this module from having p.require_ref, allowing conversion to ESM
+            /// - Allows us to inline `import.meta.main`'s value, if it is known (bun build --compile)
+            is_require_main_and_module: bool = false,
+
+            pub const @"true" = Equality{ .ok = true, .equal = true };
+            pub const @"false" = Equality{ .ok = true, .equal = false };
+            pub const unknown = Equality{ .ok = false };
+        };
 
         // Returns "equal, ok". If "ok" is false, then nothing is known about the two
         // values. If "ok" is true, the equality or inequality of the two values is
         // stored in "equal".
-        pub fn eql(left: Expr.Data, right: Expr.Data) Equality {
-            var equality = Equality{};
+        pub fn eql(
+            left: Expr.Data,
+            right: Expr.Data,
+            p: anytype,
+            comptime kind: enum { loose, strict },
+        ) Equality {
+            comptime bun.assert(@typeInfo(@TypeOf(p)).Pointer.size == .One); // pass *Parser
+
+            // https://dorey.github.io/JavaScript-Equality-Table/
             switch (left) {
-                .e_null => {
-                    equality.equal = @as(Expr.Tag, right) == Expr.Tag.e_null;
-                    equality.ok = equality.equal;
-                },
-                .e_undefined => {
-                    equality.ok = @as(Expr.Tag, right) == Expr.Tag.e_undefined;
-                    equality.equal = equality.ok;
+                .e_inlined_enum => |inlined| return inlined.value.data.eql(right, p, kind),
+
+                .e_null, .e_undefined => {
+                    const ok = switch (@as(Expr.Tag, right)) {
+                        .e_null, .e_undefined => true,
+                        else => @as(Expr.Tag, right).isPrimitiveLiteral(),
+                    };
+
+                    if (comptime kind == .loose) {
+                        return .{
+                            .equal = switch (@as(Expr.Tag, right)) {
+                                .e_null, .e_undefined => true,
+                                else => false,
+                            },
+                            .ok = ok,
+                        };
+                    }
+
+                    return .{
+                        .equal = @as(Tag, right) == @as(Tag, left),
+                        .ok = ok,
+                    };
                 },
                 .e_boolean => |l| {
-                    equality.ok = @as(Expr.Tag, right) == Expr.Tag.e_boolean;
-                    equality.equal = equality.ok and l.value == right.e_boolean.value;
-                },
-                .e_number => |l| {
-                    equality.ok = @as(Expr.Tag, right) == Expr.Tag.e_number;
-                    equality.equal = equality.ok and l.value == right.e_number.value;
-                },
-                .e_big_int => |l| {
-                    equality.ok = @as(Expr.Tag, right) == Expr.Tag.e_big_int;
-                    equality.equal = equality.ok and strings.eql(l.value, right.e_big_int.value);
-                },
-                .e_string => |l| {
-                    equality.ok = @as(Expr.Tag, right) == Expr.Tag.e_string;
-                    if (equality.ok) {
-                        const r = right.e_string;
-                        equality.equal = r.eql(E.String, l);
+                    switch (right) {
+                        .e_boolean => {
+                            return .{
+                                .ok = true,
+                                .equal = l.value == right.e_boolean.value,
+                            };
+                        },
+                        .e_number => |num| {
+                            if (comptime kind == .strict) {
+                                // "true === 1" is false
+                                // "false === 0" is false
+                                return Equality.false;
+                            }
+
+                            return .{
+                                .ok = true,
+                                .equal = if (l.value)
+                                    num.value == 1
+                                else
+                                    num.value == 0,
+                            };
+                        },
+                        .e_null, .e_undefined => {
+                            return Equality.false;
+                        },
+                        else => {},
                     }
                 },
-                else => {},
+                .e_number => |l| {
+                    switch (right) {
+                        .e_number => |r| {
+                            return .{
+                                .ok = true,
+                                .equal = l.value == r.value,
+                            };
+                        },
+                        .e_inlined_enum => |r| if (r.value.data == .e_number) {
+                            return .{
+                                .ok = true,
+                                .equal = l.value == r.value.data.e_number.value,
+                            };
+                        },
+                        .e_boolean => |r| {
+                            if (comptime kind == .loose) {
+                                return .{
+                                    .ok = true,
+                                    // "1 == true" is true
+                                    // "0 == false" is true
+                                    .equal = if (r.value)
+                                        l.value == 1
+                                    else
+                                        l.value == 0,
+                                };
+                            }
+
+                            // "1 === true" is false
+                            // "0 === false" is false
+                            return Equality.false;
+                        },
+                        .e_null, .e_undefined => {
+                            // "(not null or undefined) == undefined" is false
+                            return Equality.false;
+                        },
+                        else => {},
+                    }
+                },
+                .e_big_int => |l| {
+                    if (right == .e_big_int) {
+                        if (strings.eqlLong(l.value, right.e_big_int.value, true)) {
+                            return Equality.true;
+                        }
+
+                        // 0x0000n == 0n is true
+                        return .{ .ok = false };
+                    } else {
+                        return .{
+                            .ok = switch (right) {
+                                .e_null, .e_undefined => true,
+                                else => false,
+                            },
+                            .equal = false,
+                        };
+                    }
+                },
+                .e_string => |l| {
+                    switch (right) {
+                        .e_string => |r| {
+                            r.resolveRopeIfNeeded(p.allocator);
+                            l.resolveRopeIfNeeded(p.allocator);
+                            return .{
+                                .ok = true,
+                                .equal = r.eql(E.String, l),
+                            };
+                        },
+                        .e_inlined_enum => |inlined| {
+                            if (inlined.value.data == .e_string) {
+                                const r = inlined.value.data.e_string;
+
+                                r.resolveRopeIfNeeded(p.allocator);
+                                l.resolveRopeIfNeeded(p.allocator);
+
+                                return .{
+                                    .ok = true,
+                                    .equal = r.eql(E.String, l),
+                                };
+                            }
+                        },
+                        .e_null, .e_undefined => {
+                            return Equality.false;
+                        },
+                        .e_number => |r| {
+                            if (comptime kind == .loose) {
+                                if (r.value == 0 and (l.isBlank() or l.eqlComptime("0"))) {
+                                    return Equality.true;
+                                }
+
+                                if (r.value == 1 and l.eqlComptime("1")) {
+                                    return Equality.true;
+                                }
+
+                                // the string could still equal 0 or 1 but it could be hex, binary, octal, ...
+                                return Equality.unknown;
+                            } else {
+                                return Equality.false;
+                            }
+                        },
+
+                        else => {},
+                    }
+                },
+
+                else => {
+                    // Do not need to check left because e_require_main is
+                    // always re-ordered to the right side.
+                    if (right == .e_require_main) {
+                        if (left.as(.e_identifier)) |id| {
+                            if (id.ref.eql(p.module_ref)) return .{
+                                .ok = true,
+                                .equal = true,
+                                .is_require_main_and_module = true,
+                            };
+                        }
+                    }
+                },
             }
 
-            return equality;
+            return Equality.unknown;
         }
 
-        pub fn toJS(this: Data, ctx: JSC.C.JSContextRef, exception: JSC.C.ExceptionRef) JSC.C.JSValueRef {
+        pub fn toJS(this: Data, allocator: std.mem.Allocator, globalObject: *JSC.JSGlobalObject) ToJSError!JSC.JSValue {
             return switch (this) {
-                .e_array => |e| e.toJS(ctx, exception),
-                .e_null => |e| e.toJS(ctx, exception),
-                .e_undefined => |e| e.toJS(ctx, exception),
-                .e_object => |e| e.toJS(ctx, exception),
-                .e_boolean => |e| e.toJS(ctx, exception),
-                .e_number => |e| e.toJS(ctx, exception),
-                .e_big_int => |e| e.toJS(ctx, exception),
-                .e_string => |e| e.toJS(ctx, exception),
+                .e_array => |e| e.toJS(allocator, globalObject),
+                .e_object => |e| e.toJS(allocator, globalObject),
+                .e_string => |e| e.toJS(allocator, globalObject),
+                .e_null => JSC.JSValue.null,
+                .e_undefined => JSC.JSValue.undefined,
+                .e_boolean => |boolean| if (boolean.value)
+                    JSC.JSValue.true
+                else
+                    JSC.JSValue.false,
+                .e_number => |e| e.toJS(),
+                // .e_big_int => |e| e.toJS(ctx, exception),
+
+                .e_inlined_enum => |inlined| inlined.value.data.toJS(allocator, globalObject),
+
+                .e_identifier,
+                .e_import_identifier,
+                .e_private_identifier,
+                .e_commonjs_export_identifier,
+                => error.@"Cannot convert identifier to JS. Try a statically-known value",
+
+                // brk: {
+                //     // var node = try allocator.create(Macro.JSNode);
+                //     // node.* = Macro.JSNode.initExpr(Expr{ .data = this, .loc = logger.Loc.Empty });
+                //     // break :brk JSC.JSValue.c(Macro.JSNode.Class.make(globalObject, node));
+                // },
+
                 else => {
-                    return JSC.C.JSValueMakeUndefined(ctx);
+                    return error.@"Cannot convert argument type to JS";
                 },
             };
         }
 
         pub const Store = struct {
-            const often = 512;
-            const medium = 256;
-            const rare = 24;
+            const StoreType = NewStore(&.{
+                E.Array,
+                E.Arrow,
+                E.Await,
+                E.BigInt,
+                E.Binary,
+                E.Call,
+                E.Class,
+                E.Dot,
+                E.Function,
+                E.If,
+                E.Import,
+                E.Index,
+                E.InlinedEnum,
+                E.JSXElement,
+                E.New,
+                E.Number,
+                E.Object,
+                E.PrivateIdentifier,
+                E.RegExp,
+                E.Spread,
+                E.String,
+                E.Template,
+                E.TemplatePart,
+                E.Unary,
+                E.Yield,
+            }, 512);
 
-            pub const All = NewBaseStore(
-                &([_]type{
-                    E.Array,
-                    E.Unary,
-                    E.Binary,
-                    E.Class,
-                    E.New,
-                    E.Function,
-                    E.Call,
-                    E.Dot,
-                    E.Index,
-                    E.Arrow,
-                    E.RegExp,
-
-                    E.PrivateIdentifier,
-                    E.JSXElement,
-                    E.Number,
-                    E.BigInt,
-                    E.Object,
-                    E.Spread,
-                    E.String,
-                    E.TemplatePart,
-                    E.Template,
-                    E.Await,
-                    E.Yield,
-                    E.If,
-                    E.Import,
-                }),
-                512,
-            );
-
-            threadlocal var has_inited = false;
+            pub threadlocal var instance: ?*StoreType = null;
+            pub threadlocal var memory_allocator: ?*ASTMemoryAllocator = null;
             pub threadlocal var disable_reset = false;
-            pub fn create(allocator: std.mem.Allocator) void {
-                if (has_inited) {
+
+            pub fn create() void {
+                if (instance != null or memory_allocator != null) {
                     return;
                 }
 
-                has_inited = true;
-                _ = All.init(allocator);
+                instance = StoreType.init();
             }
 
             pub fn reset() void {
-                if (disable_reset) return;
-                All.reset();
+                if (disable_reset or memory_allocator != null) return;
+                instance.?.reset();
             }
 
             pub fn deinit() void {
-                if (!has_inited) return;
-                All.deinit();
-                has_inited = false;
+                if (instance == null or memory_allocator != null) return;
+                instance.?.deinit();
+                instance = null;
             }
 
-            pub fn append(comptime ValueType: type, value: anytype) *ValueType {
-                if (ValueType == E.Identifier) {
-                    return E.Identifier.append(ValueType, value);
-                } else {
-                    return All.append(ValueType, value);
+            pub inline fn assert() void {
+                if (comptime Environment.allow_assert) {
+                    if (instance == null and memory_allocator == null)
+                        bun.unreachablePanic("Store must be init'd", .{});
                 }
             }
 
-            pub fn toOwnedSlice() []*Store.All.Block {
-                if (!has_inited or Store.All._self.overflow.used == 0 or disable_reset) return &[_]*Store.All.Block{};
-                return Store.All.reclaim();
+            pub fn append(comptime T: type, value: T) *T {
+                if (memory_allocator) |allocator| {
+                    return allocator.append(T, value);
+                }
+
+                Disabler.assert();
+                return instance.?.append(T, value);
             }
         };
 
@@ -3835,21 +6328,33 @@ pub const Expr = struct {
             return @as(Expr.Tag, self) == .e_string;
         }
     };
-};
 
-test "Byte size of Expr" {
-    try std.io.getStdErr().writeAll(comptime std.fmt.comptimePrint("\n\nByte Size {d}\n\n", .{@sizeOf(Expr.Data)}));
-}
+    pub fn StoredData(tag: Tag) type {
+        const T = std.meta.FieldType(Data, tag);
+        return switch (@typeInfo(T)) {
+            .Pointer => |ptr| ptr.child,
+            else => T,
+        };
+    }
+};
 
 pub const EnumValue = struct {
     loc: logger.Loc,
     ref: Ref,
-    name: E.String,
+    name: []const u8,
     value: ?ExprNodeIndex,
+
+    pub fn nameAsEString(enum_value: EnumValue, allocator: std.mem.Allocator) E.String {
+        return E.String.initReEncodeUTF8(enum_value.name, allocator);
+    }
 };
 
 pub const S = struct {
-    pub const Block = struct { stmts: StmtNodeList };
+    pub const Block = struct {
+        stmts: StmtNodeList,
+        close_brace_loc: logger.Loc = logger.Loc.Empty,
+    };
+
     pub const SExpr = struct {
         value: ExprNodeIndex,
 
@@ -3862,7 +6367,7 @@ pub const S = struct {
     pub const Comment = struct { text: string };
 
     pub const Directive = struct {
-        value: []const u16,
+        value: []const u8,
     };
 
     pub const ExportClause = struct { items: []ClauseItem, is_single_line: bool = false };
@@ -3877,10 +6382,6 @@ pub const S = struct {
 
     // This is an "export = value;" statement in TypeScript
     pub const ExportEquals = struct { value: ExprNodeIndex };
-
-    // The decision of whether to export an expression using "module.exports" or
-    // "export default" is deferred until linking using this statement kind
-    pub const LazyExport = struct { value: ExprNodeIndex };
 
     pub const Label = struct { name: LocRef, stmt: StmtNodeIndex };
 
@@ -3899,6 +6400,17 @@ pub const S = struct {
     pub const ExportDefault = struct {
         default_name: LocRef, // value may be a SFunction or SClass
         value: StmtOrExpr,
+
+        pub fn canBeMoved(self: *const ExportDefault) bool {
+            return switch (self.value) {
+                .expr => |e| e.canBeMoved(),
+                .stmt => |s| switch (s.data) {
+                    .s_class => |class| class.class.canBeMoved(),
+                    .s_function => true,
+                    else => false,
+                },
+            };
+        }
     };
 
     pub const Enum = struct {
@@ -3960,7 +6472,7 @@ pub const S = struct {
     pub const With = struct {
         value: ExprNodeIndex,
         body: StmtNodeIndex,
-        body_loc: logger.Loc,
+        body_loc: logger.Loc = logger.Loc.Empty,
     };
 
     pub const Try = struct {
@@ -3996,7 +6508,7 @@ pub const S = struct {
         // when converting this module to a CommonJS module.
         namespace_ref: Ref,
         default_name: ?LocRef = null,
-        items: []ClauseItem = &([_]ClauseItem{}),
+        items: []ClauseItem = &.{},
         star_name_loc: ?logger.Loc = null,
         import_record_index: u32,
         is_single_line: bool = false,
@@ -4006,19 +6518,37 @@ pub const S = struct {
     pub const Throw = struct { value: ExprNodeIndex };
 
     pub const Local = struct {
-        kind: Kind = Kind.k_var,
-        decls: []G.Decl,
+        kind: Kind = .k_var,
+        decls: G.Decl.List = .{},
         is_export: bool = false,
         // The TypeScript compiler doesn't generate code for "import foo = bar"
         // statements where the import is never used.
         was_ts_import_equals: bool = false,
 
-        pub const Kind = enum(u2) {
+        was_commonjs_export: bool = false,
+
+        pub fn canMergeWith(this: *const Local, other: *const Local) bool {
+            return this.kind == other.kind and this.is_export == other.is_export and
+                this.was_commonjs_export == other.was_commonjs_export;
+        }
+
+        pub const Kind = enum {
             k_var,
             k_let,
             k_const,
-            pub fn jsonStringify(self: @This(), opts: anytype, o: anytype) !void {
-                return try std.json.stringify(@tagName(self), opts, o);
+            k_using,
+            k_await_using,
+
+            pub fn jsonStringify(self: @This(), writer: anytype) !void {
+                return try writer.write(@tagName(self));
+            }
+
+            pub fn isUsing(self: Kind) bool {
+                return self == .k_using or self == .k_await_using;
+            }
+
+            pub fn isReassignable(kind: Kind) bool {
+                return kind == .k_var or kind == .k_let;
             }
         };
     };
@@ -4036,6 +6566,7 @@ pub const Catch = struct {
     loc: logger.Loc,
     binding: ?BindingNodeIndex = null,
     body: StmtNodeList,
+    body_loc: logger.Loc,
 };
 
 pub const Finally = struct {
@@ -4049,10 +6580,10 @@ pub const Op = struct {
     // If you add a new token, remember to add it to "Table" too
     pub const Code = enum {
         // Prefix
-        un_pos,
-        un_neg,
-        un_cpl,
-        un_not,
+        un_pos, // +expr
+        un_neg, // -expr
+        un_cpl, // ~expr
+        un_not, // !expr
         un_void,
         un_typeof,
         un_delete,
@@ -4147,19 +6678,19 @@ pub const Op = struct {
         bin_bitwise_xor_assign,
         /// Right-associative
         bin_nullish_coalescing_assign,
-        /// Right-associative 
+        /// Right-associative
         bin_logical_or_assign,
         /// Right-associative
         bin_logical_and_assign,
 
-        pub fn jsonStringify(self: @This(), opts: anytype, o: anytype) !void {
-            return try std.json.stringify(@tagName(self), opts, o);
+        pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            return try writer.write(@tagName(self));
         }
 
         pub fn unaryAssignTarget(code: Op.Code) AssignTarget {
-            if (@enumToInt(code) >=
-                @enumToInt(Op.Code.un_pre_dec) and @enumToInt(code) <=
-                @enumToInt(Op.Code.un_post_inc))
+            if (@intFromEnum(code) >=
+                @intFromEnum(Op.Code.un_pre_dec) and @intFromEnum(code) <=
+                @intFromEnum(Op.Code.un_post_inc))
             {
                 return AssignTarget.update;
             }
@@ -4167,19 +6698,19 @@ pub const Op = struct {
             return AssignTarget.none;
         }
         pub fn isLeftAssociative(code: Op.Code) bool {
-            return @enumToInt(code) >=
-                @enumToInt(Op.Code.bin_add) and
-                @enumToInt(code) < @enumToInt(Op.Code.bin_comma) and code != .bin_pow;
+            return @intFromEnum(code) >=
+                @intFromEnum(Op.Code.bin_add) and
+                @intFromEnum(code) < @intFromEnum(Op.Code.bin_comma) and code != .bin_pow;
         }
         pub fn isRightAssociative(code: Op.Code) bool {
-            return @enumToInt(code) >= @enumToInt(Op.Code.bin_assign) or code == .bin_pow;
+            return @intFromEnum(code) >= @intFromEnum(Op.Code.bin_assign) or code == .bin_pow;
         }
         pub fn binaryAssignTarget(code: Op.Code) AssignTarget {
             if (code == .bin_assign) {
                 return AssignTarget.replace;
             }
 
-            if (@enumToInt(code) > @enumToInt(Op.Code.bin_assign)) {
+            if (@intFromEnum(code) > @intFromEnum(Op.Code.bin_assign)) {
                 return AssignTarget.update;
             }
 
@@ -4187,7 +6718,7 @@ pub const Op = struct {
         }
 
         pub fn isPrefix(code: Op.Code) bool {
-            return @enumToInt(code) < @enumToInt(Op.Code.un_post_dec);
+            return @intFromEnum(code) < @intFromEnum(Op.Code.un_post_dec);
         }
     };
 
@@ -4217,27 +6748,27 @@ pub const Op = struct {
         member,
 
         pub inline fn lt(self: Level, b: Level) bool {
-            return @enumToInt(self) < @enumToInt(b);
+            return @intFromEnum(self) < @intFromEnum(b);
         }
         pub inline fn gt(self: Level, b: Level) bool {
-            return @enumToInt(self) > @enumToInt(b);
+            return @intFromEnum(self) > @intFromEnum(b);
         }
         pub inline fn gte(self: Level, b: Level) bool {
-            return @enumToInt(self) >= @enumToInt(b);
+            return @intFromEnum(self) >= @intFromEnum(b);
         }
         pub inline fn lte(self: Level, b: Level) bool {
-            return @enumToInt(self) <= @enumToInt(b);
+            return @intFromEnum(self) <= @intFromEnum(b);
         }
         pub inline fn eql(self: Level, b: Level) bool {
-            return @enumToInt(self) == @enumToInt(b);
+            return @intFromEnum(self) == @intFromEnum(b);
         }
 
         pub inline fn sub(self: Level, i: anytype) Level {
-            return @intToEnum(Level, @enumToInt(self) - i);
+            return @as(Level, @enumFromInt(@intFromEnum(self) - i));
         }
 
-        pub inline fn add(self: Level, i: anytype) Level {
-            return @intToEnum(Level, @enumToInt(self) + i);
+        pub inline fn addF(self: Level, i: anytype) Level {
+            return @as(Level, @enumFromInt(@intFromEnum(self) + i));
         }
     };
 
@@ -4253,8 +6784,8 @@ pub const Op = struct {
         };
     }
 
-    pub fn jsonStringify(self: *const @This(), opts: anytype, o: anytype) !void {
-        return try std.json.stringify(self.text, opts, o);
+    pub fn jsonStringify(self: *const @This(), writer: anytype) !void {
+        return try writer.write(self.text);
     }
 
     pub const TableType: std.EnumArray(Op.Code, Op) = undefined;
@@ -4336,13 +6867,16 @@ pub const ArrayBinding = struct {
 };
 
 pub const Ast = struct {
+    pub const TopLevelSymbolToParts = std.ArrayHashMapUnmanaged(Ref, BabyList(u32), Ref.ArrayHashCtx, false);
+
     approximate_newline_count: usize = 0,
     has_lazy_export: bool = false,
-    runtime_imports: Runtime.Imports,
+    runtime_imports: Runtime.Imports = .{},
+
+    nested_scope_slot_counts: SlotCounts = SlotCounts{},
 
     runtime_import_record_id: ?u32 = null,
     needs_runtime: bool = false,
-    externals: []u32 = &[_]u32{},
     // This is a list of CommonJS features. When a file uses CommonJS features,
     // it's not a candidate for "flat bundling" and must be wrapped in its own
     // closure.
@@ -4350,53 +6884,84 @@ pub const Ast = struct {
     uses_exports_ref: bool = false,
     uses_module_ref: bool = false,
     uses_require_ref: bool = false,
-    exports_kind: ExportsKind = ExportsKind.none,
+    commonjs_module_exports_assigned_deoptimized: bool = false,
 
-    bundle_export_ref: ?Ref = null,
+    force_cjs_to_esm: bool = false,
+    exports_kind: ExportsKind = ExportsKind.none,
 
     // This is a list of ES6 features. They are ranges instead of booleans so
     // that they can be used in log messages. Check to see if "Len > 0".
-    import_keyword: ?logger.Range = null, // Does not include TypeScript-specific syntax or "import()"
-    export_keyword: ?logger.Range = null, // Does not include TypeScript-specific syntax
-    top_level_await_keyword: ?logger.Range = null,
+    import_keyword: logger.Range = logger.Range.None, // Does not include TypeScript-specific syntax or "import()"
+    export_keyword: logger.Range = logger.Range.None, // Does not include TypeScript-specific syntax
+    top_level_await_keyword: logger.Range = logger.Range.None,
 
-    // These are stored at the AST level instead of on individual AST nodes so
-    // they can be manipulated efficiently without a full AST traversal
-    import_records: []ImportRecord = &([_]ImportRecord{}),
+    /// These are stored at the AST level instead of on individual AST nodes so
+    /// they can be manipulated efficiently without a full AST traversal
+    import_records: ImportRecord.List = .{},
 
-    hashbang: ?string = null,
+    hashbang: string = "",
     directive: ?string = null,
-    url_for_css: ?string = null,
-    parts: []Part,
-    symbols: []Symbol = &([_]Symbol{}),
-    module_scope: ?Scope = null,
-    // char_freq:    *CharFreq,
-    exports_ref: ?Ref = null,
-    module_ref: ?Ref = null,
-    wrapper_ref: ?Ref = null,
+    parts: Part.List = Part.List{},
+    // This list may be mutated later, so we should store the capacity
+    symbols: Symbol.List = Symbol.List{},
+    module_scope: Scope = Scope{},
+    char_freq: ?CharFreq = null,
+    exports_ref: Ref = Ref.None,
+    module_ref: Ref = Ref.None,
+    wrapper_ref: Ref = Ref.None,
     require_ref: Ref = Ref.None,
-
-    bundle_namespace_ref: ?Ref = null,
-    prepend_part: ?Part = null,
 
     // These are used when bundling. They are filled in during the parser pass
     // since we already have to traverse the AST then anyway and the parser pass
     // is conveniently fully parallelized.
-    named_imports: NamedImports = undefined,
-    named_exports: NamedExports = undefined,
+    named_imports: NamedImports = .{},
+    named_exports: NamedExports = .{},
     export_star_import_records: []u32 = &([_]u32{}),
 
-    pub const NamedImports = std.ArrayHashMap(Ref, NamedImport, RefHashCtx, true);
-    pub const NamedExports = std.StringArrayHashMap(NamedExport);
+    // allocator: std.mem.Allocator,
+    top_level_symbols_to_parts: TopLevelSymbolToParts = .{},
 
-    pub fn initTest(parts: []Part) Ast {
+    commonjs_named_exports: CommonJSNamedExports = .{},
+
+    redirect_import_record_index: ?u32 = null,
+
+    /// Only populated when bundling
+    target: bun.options.Target = .browser,
+    // const_values: ConstValuesMap = .{},
+    ts_enums: TsEnumsMap = .{},
+
+    /// Not to be confused with `commonjs_named_exports`
+    /// This is a list of named exports that may exist in a CommonJS module
+    /// We use this with `commonjs_at_runtime` to re-export CommonJS
+    has_commonjs_export_names: bool = false,
+    import_meta_ref: Ref = Ref.None,
+
+    pub const CommonJSNamedExport = struct {
+        loc_ref: LocRef,
+        needs_decl: bool = true,
+    };
+    pub const CommonJSNamedExports = bun.StringArrayHashMapUnmanaged(CommonJSNamedExport);
+
+    pub const NamedImports = std.ArrayHashMapUnmanaged(Ref, NamedImport, RefHashCtx, true);
+    pub const NamedExports = bun.StringArrayHashMapUnmanaged(NamedExport);
+    pub const ConstValuesMap = std.ArrayHashMapUnmanaged(Ref, Expr, RefHashCtx, false);
+    pub const TsEnumsMap = std.ArrayHashMapUnmanaged(Ref, bun.StringHashMapUnmanaged(InlinedEnumValue), RefHashCtx, false);
+
+    pub fn fromParts(parts: []Part) Ast {
         return Ast{
-            .parts = parts,
+            .parts = Part.List.init(parts),
             .runtime_imports = .{},
         };
     }
 
-    pub const empty = Ast{ .parts = &[_]Part{}, .runtime_imports = undefined };
+    pub fn initTest(parts: []Part) Ast {
+        return Ast{
+            .parts = Part.List.init(parts),
+            .runtime_imports = .{},
+        };
+    }
+
+    pub const empty = Ast{ .parts = Part.List{}, .runtime_imports = .{} };
 
     pub fn toJSON(self: *const Ast, _: std.mem.Allocator, stream: anytype) !void {
         const opts = std.json.StringifyOptions{ .whitespace = std.json.StringifyOptions.Whitespace{
@@ -4404,11 +6969,409 @@ pub const Ast = struct {
         } };
         try std.json.stringify(self.parts, opts, stream);
     }
+
+    /// Do not call this if it wasn't globally allocated!
+    pub fn deinit(this: *Ast) void {
+        // TODO: assert mimalloc-owned memory
+        if (this.parts.len > 0) this.parts.deinitWithAllocator(bun.default_allocator);
+        if (this.symbols.len > 0) this.symbols.deinitWithAllocator(bun.default_allocator);
+        if (this.import_records.len > 0) this.import_records.deinitWithAllocator(bun.default_allocator);
+    }
+};
+
+/// TLA => Top Level Await
+pub const TlaCheck = struct {
+    depth: u32 = 0,
+    parent: Index.Int = Index.invalid.get(),
+    import_record_index: Index.Int = Index.invalid.get(),
+};
+
+/// Like Ast but slimmer and for bundling only.
+///
+/// On Linux, the hottest function in the bundler is:
+/// src.multi_array_list.MultiArrayList(src.js_ast.Ast).ensureTotalCapacity
+/// https://share.firefox.dev/3NNlRKt
+///
+/// So we make a slimmer version of Ast for bundling that doesn't allocate as much memory
+pub const BundledAst = struct {
+    approximate_newline_count: u32 = 0,
+    nested_scope_slot_counts: SlotCounts = .{},
+
+    exports_kind: ExportsKind = .none,
+
+    /// These are stored at the AST level instead of on individual AST nodes so
+    /// they can be manipulated efficiently without a full AST traversal
+    import_records: ImportRecord.List = .{},
+
+    hashbang: string = "",
+    parts: Part.List = .{},
+    css: ?*bun.css.BundlerStyleSheet = null,
+    url_for_css: []const u8 = "",
+    symbols: Symbol.List = .{},
+    module_scope: Scope = .{},
+    char_freq: CharFreq = undefined,
+    exports_ref: Ref = Ref.None,
+    module_ref: Ref = Ref.None,
+    wrapper_ref: Ref = Ref.None,
+    require_ref: Ref = Ref.None,
+    top_level_await_keyword: logger.Range,
+    tla_check: TlaCheck = .{},
+
+    // These are used when bundling. They are filled in during the parser pass
+    // since we already have to traverse the AST then anyway and the parser pass
+    // is conveniently fully parallelized.
+    named_imports: NamedImports = .{},
+    named_exports: NamedExports = .{},
+    export_star_import_records: []u32 = &.{},
+
+    top_level_symbols_to_parts: TopLevelSymbolToParts = .{},
+
+    commonjs_named_exports: CommonJSNamedExports = .{},
+
+    redirect_import_record_index: u32 = std.math.maxInt(u32),
+
+    /// Only populated when bundling. When --server-components is passed, this
+    /// will be .browser when it is a client component, and the server's target
+    /// on the server.
+    target: bun.options.Target = .browser,
+
+    // const_values: ConstValuesMap = .{},
+    ts_enums: Ast.TsEnumsMap = .{},
+
+    flags: BundledAst.Flags = .{},
+
+    pub const NamedImports = Ast.NamedImports;
+    pub const NamedExports = Ast.NamedExports;
+    pub const TopLevelSymbolToParts = Ast.TopLevelSymbolToParts;
+    pub const CommonJSNamedExports = Ast.CommonJSNamedExports;
+    pub const ConstValuesMap = Ast.ConstValuesMap;
+
+    pub const Flags = packed struct(u8) {
+        // This is a list of CommonJS features. When a file uses CommonJS features,
+        // it's not a candidate for "flat bundling" and must be wrapped in its own
+        // closure.
+        uses_exports_ref: bool = false,
+        uses_module_ref: bool = false,
+        // uses_require_ref: bool = false,
+        uses_export_keyword: bool = false,
+        has_char_freq: bool = false,
+        force_cjs_to_esm: bool = false,
+        has_lazy_export: bool = false,
+        commonjs_module_exports_assigned_deoptimized: bool = false,
+        has_explicit_use_strict_directive: bool = false,
+    };
+
+    pub const empty = BundledAst.init(Ast.empty);
+
+    pub fn toAST(this: *const BundledAst) Ast {
+        return .{
+            .approximate_newline_count = this.approximate_newline_count,
+            .nested_scope_slot_counts = this.nested_scope_slot_counts,
+
+            .exports_kind = this.exports_kind,
+
+            .import_records = this.import_records,
+
+            .hashbang = this.hashbang,
+            .parts = this.parts,
+            // This list may be mutated later, so we should store the capacity
+            .symbols = this.symbols,
+            .module_scope = this.module_scope,
+            .char_freq = if (this.flags.has_char_freq) this.char_freq else null,
+            .exports_ref = this.exports_ref,
+            .module_ref = this.module_ref,
+            .wrapper_ref = this.wrapper_ref,
+            .require_ref = this.require_ref,
+            .top_level_await_keyword = this.top_level_await_keyword,
+
+            // These are used when bundling. They are filled in during the parser pass
+            // since we already have to traverse the AST then anyway and the parser pass
+            // is conveniently fully parallelized.
+            .named_imports = this.named_imports,
+            .named_exports = this.named_exports,
+            .export_star_import_records = this.export_star_import_records,
+
+            .top_level_symbols_to_parts = this.top_level_symbols_to_parts,
+
+            .commonjs_named_exports = this.commonjs_named_exports,
+
+            .redirect_import_record_index = this.redirect_import_record_index,
+
+            .target = this.target,
+
+            // .const_values = this.const_values,
+            .ts_enums = this.ts_enums,
+
+            .uses_exports_ref = this.flags.uses_exports_ref,
+            .uses_module_ref = this.flags.uses_module_ref,
+            // .uses_require_ref = ast.uses_require_ref,
+            .export_keyword = .{ .len = if (this.flags.uses_export_keyword) 1 else 0, .loc = .{} },
+            .force_cjs_to_esm = this.flags.force_cjs_to_esm,
+            .has_lazy_export = this.flags.has_lazy_export,
+            .commonjs_module_exports_assigned_deoptimized = this.flags.commonjs_module_exports_assigned_deoptimized,
+            .directive = if (this.flags.has_explicit_use_strict_directive) "use strict" else null,
+        };
+    }
+
+    pub fn init(ast: Ast) BundledAst {
+        return .{
+            .approximate_newline_count = @as(u32, @truncate(ast.approximate_newline_count)),
+            .nested_scope_slot_counts = ast.nested_scope_slot_counts,
+
+            .exports_kind = ast.exports_kind,
+
+            .import_records = ast.import_records,
+
+            .hashbang = ast.hashbang,
+            .parts = ast.parts,
+            // This list may be mutated later, so we should store the capacity
+            .symbols = ast.symbols,
+            .module_scope = ast.module_scope,
+            .char_freq = ast.char_freq orelse undefined,
+            .exports_ref = ast.exports_ref,
+            .module_ref = ast.module_ref,
+            .wrapper_ref = ast.wrapper_ref,
+            .require_ref = ast.require_ref,
+            .top_level_await_keyword = ast.top_level_await_keyword,
+            // These are used when bundling. They are filled in during the parser pass
+            // since we already have to traverse the AST then anyway and the parser pass
+            // is conveniently fully parallelized.
+            .named_imports = ast.named_imports,
+            .named_exports = ast.named_exports,
+            .export_star_import_records = ast.export_star_import_records,
+
+            // .allocator = ast.allocator,
+            .top_level_symbols_to_parts = ast.top_level_symbols_to_parts,
+
+            .commonjs_named_exports = ast.commonjs_named_exports,
+
+            .redirect_import_record_index = ast.redirect_import_record_index orelse std.math.maxInt(u32),
+
+            .target = ast.target,
+
+            // .const_values = ast.const_values,
+            .ts_enums = ast.ts_enums,
+
+            .flags = .{
+                .uses_exports_ref = ast.uses_exports_ref,
+                .uses_module_ref = ast.uses_module_ref,
+                // .uses_require_ref = ast.uses_require_ref,
+                .uses_export_keyword = ast.export_keyword.len > 0,
+                .has_char_freq = ast.char_freq != null,
+                .force_cjs_to_esm = ast.force_cjs_to_esm,
+                .has_lazy_export = ast.has_lazy_export,
+                .commonjs_module_exports_assigned_deoptimized = ast.commonjs_module_exports_assigned_deoptimized,
+                .has_explicit_use_strict_directive = strings.eqlComptime(ast.directive orelse "", "use strict"),
+            },
+        };
+    }
+
+    /// TODO: I don't like having to do this extra allocation. Is there a way to only do this if we know it is imported by a CSS file?
+    pub fn addUrlForCss(
+        this: *BundledAst,
+        allocator: std.mem.Allocator,
+        experimental: Loader.Experimental,
+        source: *const logger.Source,
+        mime_type_: ?[]const u8,
+        unique_key: ?[]const u8,
+    ) void {
+        if (experimental.css) {
+            const mime_type = if (mime_type_) |m| m else MimeType.byExtension(bun.strings.trimLeadingChar(std.fs.path.extension(source.path.text), '.')).value;
+            const contents = source.contents;
+            // TODO: make this configurable
+            const COPY_THRESHOLD = 128 * 1024; // 128kb
+            const should_copy = contents.len >= COPY_THRESHOLD and unique_key != null;
+            if (should_copy) return;
+            this.url_for_css = url_for_css: {
+
+                // Encode as base64
+                const encode_len = bun.base64.encodeLen(contents);
+                const data_url_prefix_len = "data:".len + mime_type.len + ";base64,".len;
+                const total_buffer_len = data_url_prefix_len + encode_len;
+                var encoded = allocator.alloc(u8, total_buffer_len) catch bun.outOfMemory();
+                _ = std.fmt.bufPrint(encoded[0..data_url_prefix_len], "data:{s};base64,", .{mime_type}) catch unreachable;
+                const len = bun.base64.encode(encoded[data_url_prefix_len..], contents);
+                break :url_for_css encoded[0 .. data_url_prefix_len + len];
+            };
+        }
+    }
 };
 
 pub const Span = struct {
-    text: string,
-    range: logger.Range,
+    text: string = "",
+    range: logger.Range = .{},
+};
+
+/// This is for TypeScript "enum" and "namespace" blocks. Each block can
+/// potentially be instantiated multiple times. The exported members of each
+/// block are merged into a single namespace while the non-exported code is
+/// still scoped to just within that block:
+///
+///    let x = 1;
+///    namespace Foo {
+///      let x = 2;
+///      export let y = 3;
+///    }
+///    namespace Foo {
+///      console.log(x); // 1
+///      console.log(y); // 3
+///    }
+///
+/// Doing this also works inside an enum:
+///
+///    enum Foo {
+///      A = 3,
+///      B = A + 1,
+///    }
+///    enum Foo {
+///      C = A + 2,
+///    }
+///    console.log(Foo.B) // 4
+///    console.log(Foo.C) // 5
+///
+/// This is a form of identifier lookup that works differently than the
+/// hierarchical scope-based identifier lookup in JavaScript. Lookup now needs
+/// to search sibling scopes in addition to parent scopes. This is accomplished
+/// by sharing the map of exported members between all matching sibling scopes.
+pub const TSNamespaceScope = struct {
+    /// This is specific to this namespace block. It's the argument of the
+    /// immediately-invoked function expression that the namespace block is
+    /// compiled into:
+    ///
+    ///   var ns;
+    ///   (function (ns2) {
+    ///     ns2.x = 123;
+    ///   })(ns || (ns = {}));
+    ///
+    /// This variable is "ns2" in the above example. It's the symbol to use when
+    /// generating property accesses off of this namespace when it's in scope.
+    arg_ref: Ref,
+
+    /// This is shared between all sibling namespace blocks
+    exported_members: *TSNamespaceMemberMap,
+
+    /// This is a lazily-generated map of identifiers that actually represent
+    /// property accesses to this namespace's properties. For example:
+    ///
+    ///   namespace x {
+    ///     export let y = 123
+    ///   }
+    ///   namespace x {
+    ///     export let z = y
+    ///   }
+    ///
+    /// This should be compiled into the following code:
+    ///
+    ///   var x;
+    ///   (function(x2) {
+    ///     x2.y = 123;
+    ///   })(x || (x = {}));
+    ///   (function(x3) {
+    ///     x3.z = x3.y;
+    ///   })(x || (x = {}));
+    ///
+    /// When we try to find the symbol "y", we instead return one of these lazily
+    /// generated proxy symbols that represent the property access "x3.y". This
+    /// map is unique per namespace block because "x3" is the argument symbol that
+    /// is specific to that particular namespace block.
+    property_accesses: bun.StringArrayHashMapUnmanaged(Ref) = .{},
+
+    /// Even though enums are like namespaces and both enums and namespaces allow
+    /// implicit references to properties of sibling scopes, they behave like
+    /// separate, er, namespaces. Implicit references only work namespace-to-
+    /// namespace and enum-to-enum. They do not work enum-to-namespace. And I'm
+    /// not sure what's supposed to happen for the namespace-to-enum case because
+    /// the compiler crashes: https://github.com/microsoft/TypeScript/issues/46891.
+    /// So basically these both work:
+    ///
+    ///   enum a { b = 1 }
+    ///   enum a { c = b }
+    ///
+    ///   namespace x { export let y = 1 }
+    ///   namespace x { export let z = y }
+    ///
+    /// This doesn't work:
+    ///
+    ///   enum a { b = 1 }
+    ///   namespace a { export let c = b }
+    ///
+    /// And this crashes the TypeScript compiler:
+    ///
+    ///   namespace a { export let b = 1 }
+    ///   enum a { c = b }
+    ///
+    /// Therefore we only allow enum/enum and namespace/namespace interactions.
+    is_enum_scope: bool,
+};
+
+pub const TSNamespaceMemberMap = bun.StringArrayHashMapUnmanaged(TSNamespaceMember);
+
+pub const TSNamespaceMember = struct {
+    loc: logger.Loc,
+    data: Data,
+
+    pub const Data = union(enum) {
+        /// "namespace ns { export let it }"
+        property,
+        /// "namespace ns { export namespace it {} }"
+        namespace: *TSNamespaceMemberMap,
+        /// "enum ns { it }"
+        enum_number: f64,
+        /// "enum ns { it = 'it' }"
+        enum_string: *E.String,
+        /// "enum ns { it = something() }"
+        enum_property: void,
+
+        pub fn isEnum(data: Data) bool {
+            return switch (data) {
+                inline else => |_, tag| comptime std.mem.startsWith(u8, @tagName(tag), "enum_"),
+            };
+        }
+    };
+};
+
+/// Inlined enum values can only be numbers and strings
+/// This type special cases an encoding similar to JSValue, where nan-boxing is used
+/// to encode both a 64-bit pointer or a 64-bit float using 64 bits.
+pub const InlinedEnumValue = packed struct {
+    raw_data: u64,
+
+    pub const Decoded = union(enum) {
+        string: *E.String,
+        number: f64,
+    };
+
+    /// See JSCJSValue.h in WebKit for more details
+    const double_encode_offset = 1 << 49;
+    /// See PureNaN.h in WebKit for more details
+    const pure_nan: f64 = @bitCast(@as(u64, 0x7ff8000000000000));
+
+    fn purifyNaN(value: f64) f64 {
+        return if (std.math.isNan(value)) pure_nan else value;
+    }
+
+    pub fn encode(decoded: Decoded) InlinedEnumValue {
+        const encoded: InlinedEnumValue = .{ .raw_data = switch (decoded) {
+            .string => |ptr| @as(u48, @truncate(@intFromPtr(ptr))),
+            .number => |num| @as(u64, @bitCast(purifyNaN(num))) + double_encode_offset,
+        } };
+        if (Environment.allow_assert) {
+            bun.assert(switch (encoded.decode()) {
+                .string => |str| str == decoded.string,
+                .number => |num| @as(u64, @bitCast(num)) ==
+                    @as(u64, @bitCast(purifyNaN(decoded.number))),
+            });
+        }
+        return encoded;
+    }
+
+    pub fn decode(encoded: InlinedEnumValue) Decoded {
+        if (encoded.raw_data > 0x0000FFFFFFFFFFFF) {
+            return .{ .number = @bitCast(encoded.raw_data - double_encode_offset) };
+        } else {
+            return .{ .string = @ptrFromInt(encoded.raw_data) };
+        }
+    }
 };
 
 pub const ExportsKind = enum {
@@ -4436,21 +7399,136 @@ pub const ExportsKind = enum {
     // "exports") with getters for the export names. All named imports to this
     // module are allowed. Direct named imports reference the corresponding export
     // directly. Other imports go through property accesses on "exports".
-    esm_with_dyn,
+    esm_with_dynamic_fallback,
 
-    pub fn jsonStringify(self: @This(), opts: anytype, o: anytype) !void {
-        return try std.json.stringify(@tagName(self), opts, o);
+    // Like "esm_with_dynamic_fallback", but the module was originally a CommonJS
+    // module.
+    esm_with_dynamic_fallback_from_cjs,
+
+    const dynamic = std.EnumSet(ExportsKind).init(.{
+        .esm_with_dynamic_fallback = true,
+        .esm_with_dynamic_fallback_from_cjs = true,
+        .cjs = true,
+    });
+
+    const with_dynamic_fallback = std.EnumSet(ExportsKind).init(.{
+        .esm_with_dynamic_fallback = true,
+        .esm_with_dynamic_fallback_from_cjs = true,
+    });
+
+    pub fn isDynamic(self: ExportsKind) bool {
+        return dynamic.contains(self);
+    }
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        return try writer.write(@tagName(self));
+    }
+
+    pub fn isESMWithDynamicFallback(self: ExportsKind) bool {
+        return with_dynamic_fallback.contains(self);
     }
 };
 
 pub const DeclaredSymbol = struct {
     ref: Ref,
     is_top_level: bool = false,
+
+    pub const List = struct {
+        entries: bun.MultiArrayList(DeclaredSymbol) = .{},
+
+        pub fn refs(this: *const List) []Ref {
+            return this.entries.items(.ref);
+        }
+
+        pub fn toOwnedSlice(this: *List) List {
+            const new = this.*;
+
+            this.* = .{};
+            return new;
+        }
+
+        pub fn clone(this: *const List, allocator: std.mem.Allocator) !List {
+            return List{ .entries = try this.entries.clone(allocator) };
+        }
+
+        pub inline fn len(this: List) usize {
+            return this.entries.len;
+        }
+
+        pub fn append(this: *List, allocator: std.mem.Allocator, entry: DeclaredSymbol) !void {
+            try this.ensureUnusedCapacity(allocator, 1);
+            this.appendAssumeCapacity(entry);
+        }
+
+        pub fn appendList(this: *List, allocator: std.mem.Allocator, other: List) !void {
+            try this.ensureUnusedCapacity(allocator, other.len());
+            this.appendListAssumeCapacity(other);
+        }
+
+        pub fn appendListAssumeCapacity(this: *List, other: List) void {
+            this.entries.appendListAssumeCapacity(other.entries);
+        }
+
+        pub fn appendAssumeCapacity(this: *List, entry: DeclaredSymbol) void {
+            this.entries.appendAssumeCapacity(entry);
+        }
+
+        pub fn ensureTotalCapacity(this: *List, allocator: std.mem.Allocator, count: usize) !void {
+            try this.entries.ensureTotalCapacity(allocator, count);
+        }
+
+        pub fn ensureUnusedCapacity(this: *List, allocator: std.mem.Allocator, count: usize) !void {
+            try this.entries.ensureUnusedCapacity(allocator, count);
+        }
+
+        pub fn clearRetainingCapacity(this: *List) void {
+            this.entries.clearRetainingCapacity();
+        }
+
+        pub fn deinit(this: *List, allocator: std.mem.Allocator) void {
+            this.entries.deinit(allocator);
+        }
+
+        pub fn initCapacity(allocator: std.mem.Allocator, capacity: usize) !List {
+            var entries = bun.MultiArrayList(DeclaredSymbol){};
+            try entries.ensureUnusedCapacity(allocator, capacity);
+            return List{ .entries = entries };
+        }
+
+        pub fn fromSlice(allocator: std.mem.Allocator, entries: []const DeclaredSymbol) !List {
+            var this = try List.initCapacity(allocator, entries.len);
+            errdefer this.deinit(allocator);
+            for (entries) |entry| {
+                this.appendAssumeCapacity(entry);
+            }
+
+            return this;
+        }
+    };
+
+    fn forEachTopLevelSymbolWithType(decls: *List, comptime Ctx: type, ctx: Ctx, comptime Fn: fn (Ctx, Ref) void) void {
+        var entries = decls.entries.slice();
+        const is_top_level = entries.items(.is_top_level);
+        const refs = entries.items(.ref);
+
+        // TODO: SIMD
+        for (is_top_level, refs) |top, ref| {
+            if (top) {
+                @call(bun.callmod_inline, Fn, .{ ctx, ref });
+            }
+        }
+    }
+
+    pub fn forEachTopLevelSymbol(decls: *List, ctx: anytype, comptime Fn: anytype) void {
+        forEachTopLevelSymbolWithType(decls, @TypeOf(ctx), ctx, Fn);
+    }
 };
 
-pub const Dependency = packed struct {
-    source_index: u32 = 0,
-    part_index: u32 = 0,
+pub const Dependency = struct {
+    source_index: Index = Index.invalid,
+    part_index: Index.Int = 0,
+
+    pub const List = BabyList(Dependency);
 };
 
 pub const ExprList = std.ArrayList(Expr);
@@ -4463,37 +7541,47 @@ pub const BindingList = std.ArrayList(Binding);
 // shaking and can be assigned to separate chunks (i.e. output files) by code
 // splitting.
 pub const Part = struct {
-    stmts: []Stmt,
+    pub const ImportRecordIndices = BabyList(u32);
+    pub const List = BabyList(Part);
+
+    stmts: []Stmt = &([_]Stmt{}),
     scopes: []*Scope = &([_]*Scope{}),
 
-    // Each is an index into the file-level import record list
-    import_record_indices: []u32 = &([_]u32{}),
+    /// Each is an index into the file-level import record list
+    import_record_indices: ImportRecordIndices = .{},
 
-    // All symbols that are declared in this part. Note that a given symbol may
-    // have multiple declarations, and so may end up being declared in multiple
-    // parts (e.g. multiple "var" declarations with the same name). Also note
-    // that this list isn't deduplicated and may contain duplicates.
-    declared_symbols: []DeclaredSymbol = &([_]DeclaredSymbol{}),
+    /// All symbols that are declared in this part. Note that a given symbol may
+    /// have multiple declarations, and so may end up being declared in multiple
+    /// parts (e.g. multiple "var" declarations with the same name). Also note
+    /// that this list isn't deduplicated and may contain duplicates.
+    declared_symbols: DeclaredSymbol.List = .{},
 
-    // An estimate of the number of uses of all symbols used within this part.
-    symbol_uses: SymbolUseMap = SymbolUseMap{},
+    /// An estimate of the number of uses of all symbols used within this part.
+    symbol_uses: SymbolUseMap = .{},
 
-    // The indices of the other parts in this file that are needed if this part
-    // is needed.
-    dependencies: []Dependency = &([_]Dependency{}),
+    /// This tracks property accesses off of imported symbols. We don't know
+    /// during parsing if an imported symbol is going to be an inlined enum
+    /// value or not. This is only known during linking. So we defer adding
+    /// a dependency on these imported symbols until we know whether the
+    /// property access is an inlined enum value or not.
+    import_symbol_property_uses: SymbolPropertyUseMap = .{},
 
-    // If true, this part can be removed if none of the declared symbols are
-    // used. If the file containing this part is imported, then all parts that
-    // don't have this flag enabled must be included.
+    /// The indices of the other parts in this file that are needed if this part
+    /// is needed.
+    dependencies: Dependency.List = .{},
+
+    /// If true, this part can be removed if none of the declared symbols are
+    /// used. If the file containing this part is imported, then all parts that
+    /// don't have this flag enabled must be included.
     can_be_removed_if_unused: bool = false,
 
-    // This is used for generated parts that we don't want to be present if they
-    // aren't needed. This enables tree shaking for these parts even if global
-    // tree shaking isn't enabled.
+    /// This is used for generated parts that we don't want to be present if they
+    /// aren't needed. This enables tree shaking for these parts even if global
+    /// tree shaking isn't enabled.
     force_tree_shaking: bool = false,
 
-    // This is true if this file has been marked as live by the tree shaking
-    // algorithm.
+    /// This is true if this file has been marked as live by the tree shaking
+    /// algorithm.
     is_live: bool = false,
 
     tag: Tag = Tag.none,
@@ -4505,30 +7593,55 @@ pub const Part = struct {
         cjs_imports,
         react_fast_refresh,
         dirname_filename,
+        bun_test,
+        dead_due_to_inlining,
+        commonjs_named_export,
+        import_to_convert_from_require,
     };
 
     pub const SymbolUseMap = std.ArrayHashMapUnmanaged(Ref, Symbol.Use, RefHashCtx, false);
-    pub fn jsonStringify(self: *const Part, options: std.json.StringifyOptions, writer: anytype) !void {
-        return std.json.stringify(self.stmts, options, writer);
+    pub const SymbolPropertyUseMap = std.ArrayHashMapUnmanaged(Ref, bun.StringHashMapUnmanaged(Symbol.Use), RefHashCtx, false);
+
+    pub fn jsonStringify(self: *const Part, writer: anytype) !void {
+        return writer.write(self.stmts);
     }
 };
 
-pub const Result = struct {
+pub const Result = union(enum) {
+    already_bundled: AlreadyBundled,
+    cached: void,
     ast: Ast,
-    ok: bool = false,
+
+    pub const AlreadyBundled = enum {
+        bun,
+        bun_cjs,
+        bytecode,
+        bytecode_cjs,
+    };
 };
 
 pub const StmtOrExpr = union(enum) {
-    stmt: StmtNodeIndex,
-    expr: ExprNodeIndex,
+    stmt: Stmt,
+    expr: Expr,
+
+    pub fn toExpr(stmt_or_expr: StmtOrExpr) Expr {
+        return switch (stmt_or_expr) {
+            .expr => |expr| expr,
+            .stmt => |stmt| switch (stmt.data) {
+                .s_function => |s| Expr.init(E.Function, .{ .func = s.func }, stmt.loc),
+                .s_class => |s| Expr.init(E.Class, s.class, stmt.loc),
+                else => Output.panic("Unexpected statement type in default export: .{s}", .{@tagName(stmt.data)}),
+            },
+        };
+    }
 };
 
 pub const NamedImport = struct {
     // Parts within this file that use this import
-    local_parts_with_uses: []u32 = &([_]u32{}),
+    local_parts_with_uses: BabyList(u32) = BabyList(u32){},
 
     alias: ?string,
-    alias_loc: ?logger.Loc,
+    alias_loc: ?logger.Loc = null,
     namespace_ref: ?Ref,
     import_record_index: u32,
 
@@ -4548,26 +7661,27 @@ pub const NamedExport = struct {
     alias_loc: logger.Loc,
 };
 
-pub const StrictModeKind = enum(u7) {
+pub const StrictModeKind = enum(u4) {
     sloppy_mode,
     explicit_strict_mode,
     implicit_strict_mode_import,
     implicit_strict_mode_export,
     implicit_strict_mode_top_level_await,
     implicit_strict_mode_class,
-    pub fn jsonStringify(self: @This(), opts: anytype, o: anytype) !void {
-        return try std.json.stringify(@tagName(self), opts, o);
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        return try writer.write(@tagName(self));
     }
 };
 
 pub const Scope = struct {
+    pub const MemberHashMap = bun.StringHashMapUnmanaged(Member);
+
     id: usize = 0,
     kind: Kind = Kind.block,
-    parent: ?*Scope,
-    children: std.ArrayListUnmanaged(*Scope) = .{},
-    // This is a special hash table that allows us to pass in the hash directly
-    members: StringHashMapUnmanaged(Member) = .{},
-    generated: std.ArrayListUnmanaged(Ref) = .{},
+    parent: ?*Scope = null,
+    children: BabyList(*Scope) = .{},
+    members: MemberHashMap = .{},
+    generated: BabyList(Ref) = .{},
 
     // This is used to store the ref of the label symbol for ScopeLabel scopes.
     label_ref: ?Ref = null,
@@ -4582,6 +7696,38 @@ pub const Scope = struct {
     forbid_arguments: bool = false,
 
     strict_mode: StrictModeKind = StrictModeKind.sloppy_mode,
+
+    is_after_const_local_prefix: bool = false,
+
+    // This will be non-null if this is a TypeScript "namespace" or "enum"
+    ts_namespace: ?*TSNamespaceScope = null,
+
+    pub const NestedScopeMap = std.AutoArrayHashMap(u32, bun.BabyList(*Scope));
+
+    pub fn getMemberHash(name: []const u8) u64 {
+        return bun.StringHashMapContext.hash(.{}, name);
+    }
+
+    pub fn getMemberWithHash(this: *const Scope, name: []const u8, hash_value: u64) ?Member {
+        const hashed = bun.StringHashMapContext.Prehashed{
+            .value = hash_value,
+            .input = name,
+        };
+        return this.members.getAdapted(name, hashed);
+    }
+
+    pub fn getOrPutMemberWithHash(
+        this: *Scope,
+        allocator: std.mem.Allocator,
+        name: []const u8,
+        hash_value: u64,
+    ) !MemberHashMap.GetOrPutResult {
+        const hashed = bun.StringHashMapContext.Prehashed{
+            .value = hash_value,
+            .input = name,
+        };
+        return this.members.getOrPutContextAdapted(allocator, name, hashed, .{});
+    }
 
     pub fn reset(this: *Scope) void {
         this.children.clearRetainingCapacity();
@@ -4604,7 +7750,7 @@ pub const Scope = struct {
         loc: logger.Loc,
 
         pub fn eql(a: Member, b: Member) bool {
-            return @call(.{ .modifier = .always_inline }, Ref.eql, .{ a.ref, b.ref }) and a.loc.start == b.loc.start;
+            return @call(bun.callmod_inline, Ref.eql, .{ a.ref, b.ref }) and a.loc.start == b.loc.start;
         }
     };
 
@@ -4616,6 +7762,7 @@ pub const Scope = struct {
         become_private_get_set_pair,
         become_private_static_get_set_pair,
     };
+
     pub fn canMergeSymbols(
         scope: *Scope,
         existing: Symbol.Kind,
@@ -4648,9 +7795,12 @@ pub const Scope = struct {
             // "enum Foo {} namespace Foo { ... }"
             if (new == .ts_namespace) {
                 switch (existing) {
-                    .ts_namespace, .hoisted_function, .generator_or_async_function, .ts_enum, .class => {
-                        return .keep_existing;
-                    },
+                    .ts_namespace,
+                    .ts_enum,
+                    .hoisted_function,
+                    .generator_or_async_function,
+                    .class,
+                    => return .keep_existing,
                     else => {},
                 }
             }
@@ -4660,10 +7810,12 @@ pub const Scope = struct {
         // "var foo; function foo() {}"
         // "function foo() {} var foo;"
         // "function *foo() {} function *foo() {}" but not "{ function *foo() {} function *foo() {} }"
-        if (Symbol.isKindHoistedOrFunction(new) and Symbol.isKindHoistedOrFunction(existing) and (scope.kind == .entry or scope.kind == .function_body or
-            (Symbol.isKindHoisted(new) and Symbol.isKindHoisted(existing))))
+        if (Symbol.isKindHoistedOrFunction(new) and
+            Symbol.isKindHoistedOrFunction(existing) and
+            (scope.kind == .entry or scope.kind == .function_body or scope.kind == .function_args or
+            (new == existing and Symbol.isKindHoisted(existing))))
         {
-            return .keep_existing;
+            return .replace_with_new;
         }
 
         // "get #foo() {} set #foo() {}"
@@ -4703,6 +7855,7 @@ pub const Scope = struct {
         label,
         class_name,
         class_body,
+        catch_binding,
 
         // The scopes below stop hoisted variables from extending into parent scopes
         entry, // This is a module, TypeScript enum, or TypeScript namespace
@@ -4710,22 +7863,22 @@ pub const Scope = struct {
         function_body,
         class_static_init,
 
-        pub fn jsonStringify(self: @This(), opts: anytype, o: anytype) !void {
-            return try std.json.stringify(@tagName(self), opts, o);
+        pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            return try writer.write(@tagName(self));
         }
     };
 
     pub fn recursiveSetStrictMode(s: *Scope, kind: StrictModeKind) void {
         if (s.strict_mode == .sloppy_mode) {
             s.strict_mode = kind;
-            for (s.children.items) |child| {
+            for (s.children.slice()) |child| {
                 child.recursiveSetStrictMode(kind);
             }
         }
     }
 
-    pub fn kindStopsHoisting(s: *Scope) bool {
-        return @enumToInt(s.kind) >= @enumToInt(Kind.entry);
+    pub inline fn kindStopsHoisting(s: *const Scope) bool {
+        return @intFromEnum(s.kind) >= @intFromEnum(Kind.entry);
     }
 };
 
@@ -4736,7 +7889,7 @@ pub fn printmem(comptime format: string, args: anytype) void {
 }
 
 pub const Macro = struct {
-    const JavaScript = @import("javascript_core");
+    const JavaScript = bun.JSC;
     const JSCBase = @import("./bun.js/base.zig");
     const Resolver = @import("./resolver/resolver.zig").Resolver;
     const isPackagePath = @import("./resolver/resolver.zig").isPackagePath;
@@ -4744,8 +7897,8 @@ pub const Macro = struct {
     const DotEnv = @import("./env_loader.zig");
     const js = @import("./bun.js/javascript_core_c_api.zig");
     const Zig = @import("./bun.js/bindings/exports.zig");
-    const Bundler = @import("./bundler.zig").Bundler;
-    const MacroEntryPoint = @import("./bundler.zig").MacroEntryPoint;
+    const Transpiler = bun.Transpiler;
+    const MacroEntryPoint = bun.transpiler.MacroEntryPoint;
     const MacroRemap = @import("./resolver/package_json.zig").MacroMap;
     pub const MacroRemapEntry = @import("./resolver/package_json.zig").MacroImportReplacementMap;
 
@@ -4753,7 +7906,7 @@ pub const Macro = struct {
     pub const namespaceWithColon: string = namespace ++ ":";
 
     pub fn isMacroPath(str: string) bool {
-        return (str.len > namespaceWithColon.len and strings.eqlComptimeIgnoreLen(str[0..namespaceWithColon.len], namespaceWithColon));
+        return strings.hasPrefixComptime(str, namespaceWithColon);
     }
 
     pub const MacroContext = struct {
@@ -4770,12 +7923,12 @@ pub const Macro = struct {
             return this.remap.get(path);
         }
 
-        pub fn init(bundler: *Bundler) MacroContext {
+        pub fn init(transpiler: *Transpiler) MacroContext {
             return MacroContext{
                 .macros = MacroMap.init(default_allocator),
-                .resolver = &bundler.resolver,
-                .env = bundler.env,
-                .remap = bundler.options.macro_remap,
+                .resolver = &transpiler.resolver,
+                .env = transpiler.env,
+                .remap = transpiler.options.macro_remap,
             };
         }
 
@@ -4787,10 +7940,7 @@ pub const Macro = struct {
             source: *const logger.Source,
             import_range: logger.Range,
             caller: Expr,
-            args: []Expr,
             function_name: string,
-            comptime Visitor: type,
-            visitor: Visitor,
         ) anyerror!Expr {
             Expr.Data.Store.disable_reset = true;
             Stmt.Data.Store.disable_reset = true;
@@ -4802,49 +7952,57 @@ pub const Macro = struct {
             else
                 import_record_path;
 
-            std.debug.assert(!isMacroPath(import_record_path_without_macro_prefix));
+            bun.assert(!isMacroPath(import_record_path_without_macro_prefix));
 
-            const resolve_result = this.resolver.resolve(source_dir, import_record_path_without_macro_prefix, .stmt) catch |err| {
-                switch (err) {
-                    error.ModuleNotFound => {
-                        log.addResolveError(
-                            source,
-                            import_range,
-                            log.msgs.allocator,
-                            "Macro \"{s}\" not found",
-                            .{import_record_path},
-                            .stmt,
-                        ) catch unreachable;
-                        return error.MacroNotFound;
-                    },
-                    else => {
-                        log.addRangeErrorFmt(
-                            source,
-                            import_range,
-                            log.msgs.allocator,
-                            "{s} resolving macro \"{s}\"",
-                            .{ @errorName(err), import_record_path },
-                        ) catch unreachable;
-                        return err;
-                    },
+            const input_specifier = brk: {
+                if (JSC.HardcodedModule.Aliases.get(import_record_path, .bun)) |replacement| {
+                    break :brk replacement.path;
                 }
+
+                const resolve_result = this.resolver.resolve(source_dir, import_record_path_without_macro_prefix, .stmt) catch |err| {
+                    switch (err) {
+                        error.ModuleNotFound => {
+                            log.addResolveError(
+                                source,
+                                import_range,
+                                log.msgs.allocator,
+                                "Macro \"{s}\" not found",
+                                .{import_record_path},
+                                .stmt,
+                                err,
+                            ) catch unreachable;
+                            return error.MacroNotFound;
+                        },
+                        else => {
+                            log.addRangeErrorFmt(
+                                source,
+                                import_range,
+                                log.msgs.allocator,
+                                "{s} resolving macro \"{s}\"",
+                                .{ @errorName(err), import_record_path },
+                            ) catch unreachable;
+                            return err;
+                        },
+                    }
+                };
+                break :brk resolve_result.path_pair.primary.text;
             };
 
             var specifier_buf: [64]u8 = undefined;
             var specifier_buf_len: u32 = 0;
             const hash = MacroEntryPoint.generateID(
-                resolve_result.path_pair.primary.text,
+                input_specifier,
                 function_name,
                 &specifier_buf,
                 &specifier_buf_len,
             );
 
-            var macro_entry = this.macros.getOrPut(hash) catch unreachable;
+            const macro_entry = this.macros.getOrPut(hash) catch unreachable;
             if (!macro_entry.found_existing) {
                 macro_entry.value_ptr.* = Macro.init(
                     default_allocator,
                     this.resolver,
-                    resolve_result,
+                    input_specifier,
                     log,
                     this.env,
                     function_name,
@@ -4864,19 +8022,31 @@ pub const Macro = struct {
             }
             macro.vm.enableMacroMode();
             defer macro.vm.disableMacroMode();
-            return try Macro.Runner.run(
-                macro,
-                log,
-                default_allocator,
-                function_name,
-                caller,
-                args,
-                source,
-                hash,
-                comptime Visitor,
-                visitor,
-                this.javascript_object,
-            );
+
+            const Wrapper = struct {
+                args: std.meta.ArgsTuple(@TypeOf(Macro.Runner.run)),
+                ret: Runner.MacroError!Expr,
+
+                pub fn call(self: *@This()) void {
+                    self.ret = @call(.auto, Macro.Runner.run, self.args);
+                }
+            };
+            var wrapper = Wrapper{
+                .args = .{
+                    macro,
+                    log,
+                    default_allocator,
+                    function_name,
+                    caller,
+                    source,
+                    hash,
+                    this.javascript_object,
+                },
+                .ret = undefined,
+            };
+
+            macro.vm.runWithAPILock(Wrapper, &wrapper, Wrapper.call);
+            return try wrapper.ret;
             // this.macros.getOrPut(key: K)
         }
     };
@@ -4884,2766 +8054,6 @@ pub const Macro = struct {
     pub const MacroResult = struct {
         import_statements: []S.Import = &[_]S.Import{},
         replacement: Expr,
-    };
-
-    pub const JSNode = struct {
-        loc: logger.Loc,
-        data: Data,
-        visited: bool = false,
-
-        pub const Class = JSCBase.NewClass(
-            JSNode,
-            .{
-                .name = "JSNode",
-                .read_only = true,
-            },
-            .{
-                .toString = .{
-                    .rfn = JSBindings.toString,
-                },
-
-                // .getAt = .{
-                //     .rfn = JSBindings.getAt,
-                // },
-                // .valueAt = .{
-                //     .rfn = JSBindings.valueAt,
-                // },
-                // .toNumber = .{
-                //     .rfn = toNumber,
-                // },
-                .get = .{
-                    .rfn = JSBindings.get,
-                    .ro = true,
-                },
-            },
-            .{
-                .tag = .{
-                    .get = JSBindings.getTag,
-                    .ro = true,
-                },
-
-                .tagName = .{
-                    .get = JSBindings.getTagName,
-                    .ro = true,
-                },
-                .position = .{
-                    .get = JSBindings.getPosition,
-                    .ro = true,
-                },
-                .value = .{
-                    .get = JSBindings.getValue,
-                    .ro = true,
-                },
-                .arguments = .{
-                    .get = JSBindings.getCallArgs,
-                    .ro = true,
-                },
-                .properties = .{
-                    .get = JSBindings.getProperties,
-                    .ro = true,
-                },
-                .propertyNodes = .{
-                    .get = JSBindings.getPropertyNodes,
-                    .ro = true,
-                },
-
-                .namespace = .{
-                    .get = JSBindings.getModuleNamespace,
-                    .ro = true,
-                },
-            },
-        );
-
-        pub fn makeFromExpr(ctx: js.JSContextRef, allocator: std.mem.Allocator, expr: Expr) js.JSObjectRef {
-            var ptr = allocator.create(JSNode) catch unreachable;
-            ptr.* = JSNode.initExpr(expr);
-            // If we look at JSObjectMake, we can see that all it does with the ctx value is lookup what the global object is
-            // so it's safe to just avoid that and do it here like this:
-            return JSNode.Class.make(ctx, ptr);
-        }
-
-        pub fn updateSymbolsMap(this: *const JSNode, comptime Visitor: type, visitor: Visitor) void {
-            switch (this.data) {
-                Tag.fragment => |frag| {
-                    for (frag) |child| {
-                        if (child.data == .inline_inject) {
-                            child.updateSymbolsMap(Visitor, visitor);
-                        }
-                    }
-                },
-                Tag.inline_inject => |inject| {
-                    for (inject) |child| {
-                        child.updateSymbolsMap(Visitor, visitor);
-                    }
-                },
-
-                Tag.s_import => |import| {
-                    visitor.visitImport(import.*);
-                },
-
-                else => {},
-            }
-        }
-
-        pub const JSBindings = struct {
-            const getAllocator = JSCBase.getAllocator;
-
-            threadlocal var temporary_call_args_array: [256]js.JSValueRef = undefined;
-            pub fn getCallArgs(
-                this: *JSNode,
-                ctx: js.JSContextRef,
-                _: js.JSValueRef,
-                _: js.JSStringRef,
-                exception: js.ExceptionRef,
-            ) js.JSObjectRef {
-                const args = this.data.callArgs();
-
-                switch (args.len) {
-                    0 => return js.JSObjectMakeArray(ctx, 0, null, exception),
-                    1...255 => {
-                        var slice = temporary_call_args_array[0..args.len];
-                        for (slice) |_, i| {
-                            var node = JSCBase.getAllocator(ctx).create(JSNode) catch unreachable;
-                            node.* = JSNode.initExpr(args.ptr[i]);
-                            slice[i] = JSNode.Class.make(ctx, node);
-                        }
-                        return js.JSObjectMakeArray(ctx, args.len, slice.ptr, exception);
-                    },
-                    else => {
-                        Output.prettyErrorln("are you for real? {d} args to your call expression? that has to be a bug.\n", .{args.len});
-                        Output.flush();
-                        return js.JSObjectMakeArray(ctx, 0, null, exception);
-                    },
-                }
-            }
-
-            pub fn getProperties(
-                this: *JSNode,
-                ctx: js.JSContextRef,
-                _: js.JSValueRef,
-                _: js.JSStringRef,
-                _: js.ExceptionRef,
-            ) js.JSObjectRef {
-                if (this.data != .e_object) {
-                    return js.JSObjectMake(ctx, null, null);
-                }
-
-                var lazy = getAllocator(ctx).create(LazyPropertiesObject) catch unreachable;
-                lazy.* = LazyPropertiesObject{ .node = this.* };
-                return LazyPropertiesObject.Class.make(ctx, lazy);
-            }
-
-            pub fn getPropertyNodes(
-                this: *JSNode,
-                ctx: js.JSContextRef,
-                _: js.JSValueRef,
-                _: js.JSStringRef,
-                exception: js.ExceptionRef,
-            ) js.JSObjectRef {
-                const args = if (this.data == .e_object) this.data.e_object.properties.slice() else &[_]G.Property{};
-
-                switch (args.len) {
-                    0 => return js.JSObjectMakeArray(ctx, 0, null, exception),
-                    1...255 => {
-                        var slice = temporary_call_args_array[0..args.len];
-                        for (slice) |_, i| {
-                            var node = JSCBase.getAllocator(ctx).create(JSNode) catch unreachable;
-                            node.* = JSNode{ .data = .{ .g_property = &args[i] }, .loc = this.loc };
-                            slice[i] = JSNode.Class.make(ctx, node);
-                        }
-                        return js.JSObjectMakeArray(ctx, args.len, slice.ptr, exception);
-                    },
-                    else => {
-                        return js.JSObjectMakeArray(ctx, 0, null, exception);
-                    },
-                }
-            }
-
-            pub fn getModuleNamespace(
-                this: *JSNode,
-                ctx: js.JSContextRef,
-                _: js.JSValueRef,
-                _: js.JSStringRef,
-                _: js.ExceptionRef,
-            ) js.JSObjectRef {
-                if (this.data != .s_import) return js.JSValueMakeUndefined(ctx);
-
-                var module_namespace = getAllocator(ctx).create(ModuleNamespace) catch unreachable;
-                module_namespace.* = ModuleNamespace{ .import_data = this.data.s_import.* };
-                return ModuleNamespace.Class.make(ctx, module_namespace);
-            }
-
-            fn toNumberValue(_: *JSNode, number: E.Number) js.JSValueRef {
-                return JSC.JSValue.jsNumberFromDouble(number.value).asRef();
-            }
-
-            fn toStringValue(_: *JSNode, ctx: js.JSContextRef, str: E.String) js.JSObjectRef {
-                if (str.isBlank()) {
-                    return JSC.ZigString.init("").toValue(ctx.ptr()).asRef();
-                }
-
-                if (str.isUTF8()) {
-                    return JSC.ZigString.init(str.data).toValue(ctx.ptr()).asRef();
-                } else {
-                    return js.JSValueMakeString(ctx, js.JSStringCreateWithCharactersNoCopy(str.slice16().ptr, str.slice16().len));
-                }
-            }
-
-            threadlocal var regex_value_array: [2]js.JSValueRef = undefined;
-
-            fn toRegexValue(_: *JSNode, ctx: js.JSContextRef, regex: *E.RegExp, exception: js.ExceptionRef) js.JSObjectRef {
-                if (regex.value.len == 0) {
-                    return js.JSObjectMakeRegExp(ctx, 0, null, exception);
-                }
-
-                regex_value_array[0] = JSC.ZigString.init(regex.pattern()).toValue(ctx.ptr()).asRef();
-                regex_value_array[1] = JSC.ZigString.init(regex.flags()).toValue(ctx.ptr()).asRef();
-
-                return js.JSObjectMakeRegExp(ctx, 2, &regex_value_array, exception);
-            }
-
-            fn toArrayValue(_: *JSNode, ctx: js.JSContextRef, array: E.Array, exception: js.ExceptionRef) js.JSObjectRef {
-                const items = array.slice();
-
-                if (items.len == 0) {
-                    return js.JSObjectMakeArray(ctx, 0, null, exception);
-                }
-
-                for (items) |expr, i| {
-                    var node = JSCBase.getAllocator(ctx).create(JSNode) catch unreachable;
-                    node.* = JSNode.initExpr(expr);
-                    temporary_call_args_array[i] = JSNode.Class.make(ctx, node);
-                }
-
-                return js.JSObjectMakeArray(ctx, items.len, &temporary_call_args_array, exception);
-            }
-
-            fn toArrayPrimitive(_: *JSNode, ctx: js.JSContextRef, array: E.Array, exception: js.ExceptionRef) js.JSObjectRef {
-                const items = array.slice();
-                if (items.len == 0) {
-                    return js.JSObjectMakeArray(ctx, 0, null, exception);
-                }
-
-                var node: JSNode = undefined;
-                for (items) |expr, i| {
-                    node = JSNode.initExpr(expr);
-                    temporary_call_args_array[i] = toPrimitive(&node, ctx, exception);
-                }
-
-                return js.JSObjectMakeArray(ctx, items.len, temporary_call_args_array[0..items.len].ptr, exception);
-            }
-
-            fn toObjectValue(this: *JSNode, ctx: js.JSContextRef, obj: E.Object, exception: js.ExceptionRef) js.JSObjectRef {
-                if (obj.properties.len == 0) {
-                    return js.JSObjectMakeArray(ctx, 0, null, exception);
-                }
-
-                var object_properties_array: [64]js.JSObjectRef = undefined;
-
-                var did_allocate = false;
-                var properties_list = if (obj.properties.len < object_properties_array.len)
-                    object_properties_array[0..obj.properties.len]
-                else brk: {
-                    did_allocate = true;
-                    break :brk getAllocator(ctx).alloc(js.JSObjectRef, obj.properties.len) catch unreachable;
-                };
-
-                defer if (did_allocate) getAllocator(ctx).free(properties_list);
-
-                for (obj.properties.slice()) |_, i| {
-                    var node = JSCBase.getAllocator(ctx).create(JSNode) catch unreachable;
-                    node.* = JSNode{
-                        .data = .{
-                            .g_property = &obj.properties.ptr[i],
-                        },
-                        .loc = this.loc,
-                    };
-                    properties_list[i] = JSNode.Class.make(ctx, node);
-                }
-
-                return js.JSObjectMakeArray(ctx, properties_list.len, properties_list.ptr, exception);
-            }
-
-            fn toObjectPrimitive(this: *JSNode, ctx: js.JSContextRef, _: E.Object, _: js.ExceptionRef) js.JSObjectRef {
-                var lazy = getAllocator(ctx).create(LazyPropertiesObject) catch unreachable;
-                lazy.* = LazyPropertiesObject{ .node = this.* };
-                return LazyPropertiesObject.Class.make(ctx, lazy);
-            }
-
-            fn toPropertyPrimitive(_: *JSNode, ctx: js.JSContextRef, prop: G.Property, exception: js.ExceptionRef) js.JSObjectRef {
-                var entries: [3]js.JSValueRef = undefined;
-
-                entries[0] = js.JSValueMakeUndefined(ctx);
-                entries[1] = entries[0];
-                entries[2] = entries[0];
-
-                var other: JSNode = undefined;
-
-                if (prop.key) |key| {
-                    other = JSNode.initExpr(key);
-                    entries[0] = toPrimitive(
-                        &other,
-                        ctx,
-                        exception,
-                    ) orelse js.JSValueMakeUndefined(ctx);
-                }
-
-                if (prop.value) |value| {
-                    other = JSNode.initExpr(value);
-                    entries[1] = toPrimitive(
-                        &other,
-                        ctx,
-                        exception,
-                    ) orelse js.JSValueMakeUndefined(ctx);
-                }
-
-                if (prop.initializer) |value| {
-                    other = JSNode.initExpr(value);
-                    entries[2] = toPrimitive(
-                        &other,
-                        ctx,
-                        exception,
-                    ) orelse js.JSValueMakeUndefined(ctx);
-                }
-
-                const out = js.JSObjectMakeArray(ctx, 3, &entries, exception);
-                return out;
-            }
-
-            pub fn toString(
-                this: *JSNode,
-                ctx: js.JSContextRef,
-                _: js.JSObjectRef,
-                _: js.JSObjectRef,
-                _: []const js.JSValueRef,
-                _: js.ExceptionRef,
-            ) js.JSObjectRef {
-                switch (this.data) {
-                    .e_string => |str| {
-                        return toStringValue(this, ctx, str.*);
-                    },
-                    .e_template => |template| {
-                        const str = template.head;
-
-                        if (str.isBlank()) {
-                            return JSC.ZigString.init("").toValue(ctx.ptr()).asRef();
-                        }
-
-                        if (str.isUTF8()) {
-                            return JSC.ZigString.init(str.data).toValue(ctx.ptr()).asRef();
-                        } else {
-                            return js.JSValueMakeString(ctx, js.JSStringCreateWithCharactersNoCopy(str.slice16().ptr, str.slice16().len));
-                        }
-                    },
-                    // .e_number => |number| {
-
-                    // },
-                    else => {
-                        return JSC.ZigString.init("").toValue(ctx.ptr()).asRef();
-                    },
-                }
-            }
-
-            fn toPrimitive(
-                this: *JSNode,
-                ctx: js.JSContextRef,
-                exception: js.ExceptionRef,
-            ) js.JSValueRef {
-                return @call(.{ .modifier = .always_inline }, toPrimitiveAllowRecursion, .{ this, ctx, exception, false });
-            }
-
-            fn toPrimitiveWithRecursion(
-                this: *JSNode,
-                ctx: js.JSContextRef,
-                exception: js.ExceptionRef,
-            ) js.JSValueRef {
-                return @call(.{ .modifier = .always_inline }, toPrimitiveAllowRecursion, .{ this, ctx, exception, true });
-            }
-
-            fn toPrimitiveAllowRecursion(this: *JSNode, ctx: js.JSContextRef, exception: js.ExceptionRef, comptime _: bool) js.JSValueRef {
-                switch (this.data) {
-                    .e_string => |str| {
-                        return JSBindings.toStringValue(this, ctx, str.*);
-                    },
-                    .e_template => |template| {
-                        return JSBindings.toStringValue(this, ctx, template.head);
-                        // return JSBindings.toTemplatePrimitive(this, ctx, template.*);
-                    },
-                    .e_number => |number| {
-                        return JSBindings.toNumberValue(this, number);
-                    },
-                    .e_reg_exp => |regex| {
-                        return JSBindings.toRegexValue(this, ctx, regex, exception);
-                    },
-                    .e_object => |object| {
-                        return JSBindings.toObjectPrimitive(this, ctx, object.*, exception);
-                    },
-                    .e_array => |array| {
-                        return JSBindings.toArrayPrimitive(this, ctx, array.*, exception);
-                    },
-
-                    // Returns an Entry
-                    // [string, number | regex | object | string | null | undefined]
-                    .g_property => |property| {
-                        return JSBindings.toPropertyPrimitive(this, ctx, property.*, exception);
-                    },
-                    .e_null => {
-                        return js.JSValueMakeNull(ctx);
-                    },
-                    else => {
-                        return js.JSValueMakeUndefined(ctx);
-                    },
-                }
-            }
-
-            fn toValue(this: *JSNode, ctx: js.JSContextRef, exception: js.ExceptionRef) js.JSObjectRef {
-                switch (this.data) {
-                    .e_await => |aw| {
-                        return JSNode.makeFromExpr(ctx, getAllocator(ctx), aw.value);
-                    },
-                    .e_yield => |yi| {
-                        return JSNode.makeFromExpr(ctx, getAllocator(ctx), yi.value orelse return null);
-                    },
-                    .e_spread => |spread| {
-                        return JSNode.makeFromExpr(ctx, getAllocator(ctx), spread.value);
-                    },
-                    .e_reg_exp => |reg| {
-                        return JSC.ZigString.toRef(reg.value, ctx.ptr());
-                    },
-
-                    .e_array => |array| {
-                        return toArrayValue(this, ctx, array.*, exception);
-                    },
-                    .e_object => |obj| {
-                        return toObjectValue(this, ctx, obj.*, exception);
-                    },
-                    else => {
-                        return null;
-                    },
-                }
-            }
-
-            pub fn getValue(
-                this: *JSNode,
-                ctx: js.JSContextRef,
-                thisObject: js.JSValueRef,
-                _: js.JSStringRef,
-                exception: js.ExceptionRef,
-            ) js.JSObjectRef {
-                return toValue(this, ctx, exception) orelse return thisObject;
-            }
-
-            pub fn get(
-                this: *JSNode,
-                ctx: js.JSContextRef,
-                _: js.JSObjectRef,
-                _: js.JSObjectRef,
-                _: []const js.JSValueRef,
-                exception: js.ExceptionRef,
-            ) js.JSObjectRef {
-                return toPrimitiveWithRecursion(this, ctx, exception) orelse return js.JSValueMakeUndefined(ctx);
-            }
-
-            pub fn getTag(
-                this: *JSNode,
-                _: js.JSContextRef,
-                _: js.JSValueRef,
-                _: js.JSStringRef,
-                _: js.ExceptionRef,
-            ) js.JSObjectRef {
-                return JSC.JSValue.jsNumberFromU16(@intCast(u16, @enumToInt(std.meta.activeTag(this.data)))).asRef();
-            }
-            pub fn getTagName(
-                this: *JSNode,
-                ctx: js.JSContextRef,
-                _: js.JSValueRef,
-                _: js.JSStringRef,
-                _: js.ExceptionRef,
-            ) js.JSObjectRef {
-                return JSC.ZigString.init(@tagName(this.data)).toValue(ctx.ptr()).asRef();
-            }
-            pub fn getPosition(
-                this: *JSNode,
-                _: js.JSContextRef,
-                _: js.JSValueRef,
-                _: js.JSStringRef,
-                _: js.ExceptionRef,
-            ) js.JSObjectRef {
-                return JSC.JSValue.jsNumberFromInt32(this.loc.start).asRef();
-            }
-        };
-
-        pub fn initExpr(this: Expr) JSNode {
-            switch (this.data) {
-                .e_array => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_array = value } };
-                },
-                .e_unary => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_unary = value } };
-                },
-                .e_binary => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_binary = value } };
-                },
-                .e_function => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_function = value } };
-                },
-                .e_new_target => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_new_target = value } };
-                },
-                .e_import_meta => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_import_meta = value } };
-                },
-                .e_call => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_call = value } };
-                },
-                .e_dot => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_dot = value } };
-                },
-                .e_index => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_index = value } };
-                },
-                .e_arrow => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_arrow = value } };
-                },
-                .e_identifier => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_identifier = value } };
-                },
-                .e_import_identifier => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_import_identifier = value } };
-                },
-                .e_private_identifier => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_private_identifier = value } };
-                },
-                .e_jsx_element => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_jsx_element = value } };
-                },
-                .e_big_int => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_big_int = value } };
-                },
-                .e_object => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_object = value } };
-                },
-                .e_spread => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_spread = value } };
-                },
-                .e_string => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_string = value } };
-                },
-                .e_template_part => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_template_part = value } };
-                },
-                .e_template => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_template = value } };
-                },
-                .e_reg_exp => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_reg_exp = value } };
-                },
-                .e_await => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_await = value } };
-                },
-                .e_yield => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_yield = value } };
-                },
-                .e_if => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_if = value } };
-                },
-                .e_require_or_require_resolve => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_require_or_require_resolve = value } };
-                },
-                .e_import => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_import = value } };
-                },
-                .e_this => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_this = value } };
-                },
-                .e_class => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_class = value } };
-                },
-                .e_require => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_require = value } };
-                },
-                .e_missing => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_missing = value } };
-                },
-                .e_boolean => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_boolean = value } };
-                },
-                .e_super => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_super = value } };
-                },
-                .e_null => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_null = value } };
-                },
-                .e_number => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_number = value } };
-                },
-                .e_undefined => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .e_undefined = value } };
-                },
-                .inline_identifier => |value| {
-                    return JSNode{ .loc = this.loc, .data = .{ .inline_identifier = value } };
-                },
-                else => {
-                    if (comptime Environment.isDebug) {
-                        Output.prettyWarnln("initExpr fail: {s}", .{@tagName(this.data)});
-                    }
-                    return JSNode{ .loc = this.loc, .data = .{ .e_missing = .{} } };
-                },
-            }
-        }
-
-        pub fn toExpr(this: JSNode) Expr {
-            switch (this.data) {
-                .e_array => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_array = value } };
-                },
-                .e_unary => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_unary = value } };
-                },
-                .e_binary => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_binary = value } };
-                },
-                .e_function => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_function = value } };
-                },
-                .e_new_target => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_new_target = value } };
-                },
-                .e_import_meta => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_import_meta = value } };
-                },
-                .e_call => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_call = value } };
-                },
-                .e_dot => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_dot = value } };
-                },
-                .e_index => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_index = value } };
-                },
-                .e_arrow => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_arrow = value } };
-                },
-                .e_identifier => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_identifier = value } };
-                },
-                .e_import_identifier => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_import_identifier = value } };
-                },
-                .e_private_identifier => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_private_identifier = value } };
-                },
-                .e_jsx_element => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_jsx_element = value } };
-                },
-                .e_big_int => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_big_int = value } };
-                },
-                .e_object => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_object = value } };
-                },
-                .e_spread => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_spread = value } };
-                },
-                .e_string => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_string = value } };
-                },
-                .e_template_part => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_template_part = value } };
-                },
-                .e_template => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_template = value } };
-                },
-                .e_reg_exp => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_reg_exp = value } };
-                },
-                .e_await => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_await = value } };
-                },
-                .e_yield => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_yield = value } };
-                },
-                .e_if => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_if = value } };
-                },
-                .e_require_or_require_resolve => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_require_or_require_resolve = value } };
-                },
-                .e_import => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_import = value } };
-                },
-                .e_this => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_this = value } };
-                },
-                .e_class => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_class = value } };
-                },
-                .e_require => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_require = value } };
-                },
-                .e_missing => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_missing = value } };
-                },
-                .e_boolean => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_boolean = value } };
-                },
-                .e_super => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_super = value } };
-                },
-                .e_null => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_null = value } };
-                },
-                .e_number => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_number = value } };
-                },
-                .e_undefined => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .e_undefined = value } };
-                },
-                .inline_identifier => |value| {
-                    return Expr{ .loc = this.loc, .data = .{ .inline_identifier = value } };
-                },
-                .fragment => |fragment| {
-                    if (fragment.len == 0) return Expr{ .loc = this.loc, .data = .{ .e_missing = E.Missing{} } };
-
-                    var left = toExpr(fragment[0]);
-
-                    if (fragment.len == 1) return left;
-
-                    for (fragment[1..]) |item| {
-                        const right = toExpr(item);
-                        left = Expr.joinWithComma(left, right, default_allocator);
-                    }
-
-                    return left;
-                },
-                else => {
-                    return Expr{ .loc = this.loc, .data = .{ .e_missing = .{} } };
-                },
-            }
-        }
-
-        // S.Import but with the path
-        pub const ImportData = struct {
-            import: S.Import,
-            path: string,
-        };
-
-        pub const Data = union(Tag) {
-            inline_false: void,
-            inline_true: void,
-            e_boolean: E.Boolean,
-            fragment: []JSNode,
-
-            e_super: E.Super,
-            e_null: E.Null,
-            e_number: E.Number,
-            e_undefined: E.Undefined,
-            e_new_target: E.NewTarget,
-            e_import_meta: E.ImportMeta,
-            e_missing: E.Missing,
-            e_this: E.This,
-
-            e_array: *E.Array,
-            e_unary: *E.Unary,
-            e_binary: *E.Binary,
-            e_function: *E.Function,
-
-            e_call: *E.Call,
-            e_dot: *E.Dot,
-            e_index: *E.Index,
-            e_arrow: *E.Arrow,
-
-            e_identifier: E.Identifier,
-            e_import_identifier: E.ImportIdentifier,
-            e_private_identifier: E.PrivateIdentifier,
-
-            e_jsx_element: *E.JSXElement,
-
-            e_big_int: *E.BigInt,
-            e_object: *E.Object,
-            e_spread: *E.Spread,
-            e_string: *E.String,
-            e_template_part: *E.TemplatePart,
-            e_template: *E.Template,
-
-            e_await: *E.Await,
-            e_yield: *E.Yield,
-            e_if: *E.If,
-
-            e_import: *E.Import,
-
-            e_class: *E.Class,
-
-            s_import: *ImportData,
-            s_block: *S.Block,
-
-            e_reg_exp: *E.RegExp,
-            e_require_or_require_resolve: E.RequireOrRequireResolve,
-            e_require: E.Require,
-
-            g_property: *G.Property,
-
-            inline_inject: []JSNode,
-            inline_identifier: i32,
-
-            pub fn callArgs(this: Data) ExprNodeList {
-                if (this == .e_call)
-                    return this.e_call.args
-                else
-                    return ExprNodeList{};
-            }
-
-            pub fn booleanValue(this: Data) bool {
-                return switch (this) {
-                    .inline_false => false,
-                    .inline_true => true,
-                    .e_boolean => this.e_boolean.value,
-                };
-            }
-        };
-        pub const Tag = enum(u8) {
-            e_array,
-            e_unary,
-            e_binary,
-            e_function,
-            e_new_target,
-            e_import_meta,
-            e_call,
-            e_dot,
-            e_index,
-            e_arrow,
-            e_identifier,
-            e_import_identifier,
-            e_private_identifier,
-            e_jsx_element,
-            e_big_int,
-            e_object,
-            e_spread,
-            e_string,
-            e_template_part,
-            e_template,
-            e_reg_exp,
-            e_await,
-            e_yield,
-            e_if,
-            e_require_or_require_resolve,
-            e_import,
-            e_this,
-            e_class,
-            e_require,
-            s_import,
-            s_block,
-
-            g_property,
-
-            e_missing,
-            e_boolean,
-            e_super,
-            e_null,
-            e_number,
-            e_undefined,
-
-            inline_true,
-            inline_false,
-            inline_inject,
-            inline_identifier,
-
-            fragment,
-
-            pub const ids: std.EnumArray(Tag, Expr.Data) = brk: {
-                var list = std.EnumArray(Tag, Expr.Data).initFill(Expr.Data{ .e_number = E.Number{ .value = 0.0 } });
-                const fields: []const std.builtin.TypeInfo.EnumField = @typeInfo(Tag).Enum.fields;
-                for (fields) |field| {
-                    list.set(@intToEnum(Tag, field.value), Expr.Data{ .e_number = E.Number{ .value = @intToFloat(f64, field.value) } });
-                }
-
-                break :brk list;
-            };
-
-            pub const names = ComptimeStringMap(Tag, .{
-                .{ "array", Tag.e_array },
-                .{ "unary", Tag.e_unary },
-                .{ "binary", Tag.e_binary },
-                .{ "bool", Tag.e_boolean },
-                .{ "super", Tag.e_super },
-                .{ "null", Tag.e_null },
-                .{ "undefined", Tag.e_undefined },
-                .{ "function", Tag.e_function },
-                .{ "new_target", Tag.e_new_target },
-                .{ "import-meta", Tag.e_import_meta },
-                .{ "call", Tag.e_call },
-                .{ "dot", Tag.e_dot },
-                .{ "index", Tag.e_index },
-                .{ "arrow", Tag.e_arrow },
-                .{ "import-id", Tag.e_import_identifier },
-                .{ "private-id", Tag.e_private_identifier },
-                .{ "jsx", Tag.e_jsx_element },
-                .{ "missing", Tag.e_missing },
-                .{ "number", Tag.e_number },
-                .{ "bigint", Tag.e_big_int },
-                .{ "object", Tag.e_object },
-                .{ "spread", Tag.e_spread },
-                .{ "string", Tag.e_string },
-                .{ "template-part", Tag.e_template_part },
-                .{ "template", Tag.e_template },
-                .{ "regex", Tag.e_reg_exp },
-                .{ "await", Tag.e_await },
-                .{ "yield", Tag.e_yield },
-                .{ "if", Tag.e_if },
-                .{ "dynamic", Tag.e_import },
-                .{ "this", Tag.e_this },
-                .{ "class", Tag.e_class },
-                .{ "require", Tag.e_require },
-                .{ "import", Tag.s_import },
-                .{ "property", Tag.g_property },
-                .{ "block", Tag.s_block },
-                .{ "true", Tag.inline_true },
-                .{ "false", Tag.inline_false },
-                .{ "inject", Tag.inline_inject },
-
-                .{ "id", Tag.inline_identifier },
-            });
-
-            pub const as_expr_tag: std.EnumArray(Tag, Expr.Tag) = brk: {
-                var list = std.EnumArray(Tag, Expr.Tag).initFill(Expr.Tag.e_missing);
-                list.set(Tag.e_array, Expr.Tag.e_array);
-                list.set(Tag.e_unary, Expr.Tag.e_unary);
-                list.set(Tag.e_binary, Expr.Tag.e_binary);
-                list.set(Tag.e_boolean, Expr.Tag.e_boolean);
-                list.set(Tag.e_super, Expr.Tag.e_super);
-                list.set(Tag.e_null, Expr.Tag.e_null);
-                list.set(Tag.e_undefined, Expr.Tag.e_undefined);
-                list.set(Tag.e_function, Expr.Tag.e_function);
-                list.set(Tag.e_new_target, Expr.Tag.e_new_target);
-                list.set(Tag.e_import_meta, Expr.Tag.e_import_meta);
-                list.set(Tag.e_call, Expr.Tag.e_call);
-                list.set(Tag.e_dot, Expr.Tag.e_dot);
-                list.set(Tag.e_index, Expr.Tag.e_index);
-                list.set(Tag.e_arrow, Expr.Tag.e_arrow);
-                list.set(Tag.e_identifier, Expr.Tag.e_identifier);
-                list.set(Tag.e_import_identifier, Expr.Tag.e_import_identifier);
-                list.set(Tag.e_private_identifier, Expr.Tag.e_private_identifier);
-                list.set(Tag.e_jsx_element, Expr.Tag.e_jsx_element);
-                list.set(Tag.e_missing, Expr.Tag.e_missing);
-                list.set(Tag.e_number, Expr.Tag.e_number);
-                list.set(Tag.e_big_int, Expr.Tag.e_big_int);
-                list.set(Tag.e_object, Expr.Tag.e_object);
-                list.set(Tag.e_spread, Expr.Tag.e_spread);
-                list.set(Tag.e_string, Expr.Tag.e_string);
-                list.set(Tag.e_template_part, Expr.Tag.e_template_part);
-                list.set(Tag.e_template, Expr.Tag.e_template);
-                list.set(Tag.e_reg_exp, Expr.Tag.e_reg_exp);
-                list.set(Tag.e_await, Expr.Tag.e_await);
-                list.set(Tag.e_yield, Expr.Tag.e_yield);
-                list.set(Tag.e_if, Expr.Tag.e_if);
-                list.set(Tag.e_require_or_require_resolve, Expr.Tag.e_require_or_require_resolve);
-                list.set(Tag.e_import, Expr.Tag.e_import);
-                list.set(Tag.e_this, Expr.Tag.e_this);
-                list.set(Tag.e_class, Expr.Tag.e_class);
-                list.set(Tag.e_require, Expr.Tag.e_require);
-                break :brk list;
-            };
-
-            pub const to_expr_tag: std.EnumArray(Expr.Tag, Tag) = brk: {
-                var list = std.EnumArray(Expr.Tag, Tag).initFill(Tag.wip);
-                list.set(Expr.Tag.e_array, Tag.e_array);
-                list.set(Expr.Tag.e_unary, Tag.e_unary);
-                list.set(Expr.Tag.e_binary, Tag.e_binary);
-                list.set(Expr.Tag.e_boolean, Tag.e_boolean);
-                list.set(Expr.Tag.e_super, Tag.e_super);
-                list.set(Expr.Tag.e_null, Tag.e_null);
-                list.set(Expr.Tag.e_undefined, Tag.e_undefined);
-                list.set(Expr.Tag.e_function, Tag.e_function);
-                list.set(Expr.Tag.e_new_target, Tag.e_new_target);
-                list.set(Expr.Tag.e_import_meta, Tag.e_import_meta);
-                list.set(Expr.Tag.e_call, Tag.e_call);
-                list.set(Expr.Tag.e_dot, Tag.e_dot);
-                list.set(Expr.Tag.e_index, Tag.e_index);
-                list.set(Expr.Tag.e_arrow, Tag.e_arrow);
-                list.set(Expr.Tag.e_identifier, Tag.e_identifier);
-                list.set(Expr.Tag.e_import_identifier, Tag.e_import_identifier);
-                list.set(Expr.Tag.e_private_identifier, Tag.e_private_identifier);
-                list.set(Expr.Tag.e_jsx_element, Tag.e_jsx_element);
-                list.set(Expr.Tag.e_missing, Tag.e_missing);
-                list.set(Expr.Tag.e_number, Tag.e_number);
-                list.set(Expr.Tag.e_big_int, Tag.e_big_int);
-                list.set(Expr.Tag.e_object, Tag.e_object);
-                list.set(Expr.Tag.e_spread, Tag.e_spread);
-                list.set(Expr.Tag.e_string, Tag.e_string);
-                list.set(Expr.Tag.e_template_part, Tag.e_template_part);
-                list.set(Expr.Tag.e_template, Tag.e_template);
-                list.set(Expr.Tag.e_reg_exp, Tag.e_reg_exp);
-                list.set(Expr.Tag.e_await, Tag.e_await);
-                list.set(Expr.Tag.e_yield, Tag.e_yield);
-                list.set(Expr.Tag.e_if, Tag.e_if);
-                list.set(Expr.Tag.e_require_or_require_resolve, Tag.e_require_or_require_resolve);
-                list.set(Expr.Tag.e_import, Tag.e_import);
-                list.set(Expr.Tag.e_this, Tag.e_this);
-                list.set(Expr.Tag.e_class, Tag.e_class);
-                list.set(Expr.Tag.e_require, Tag.e_require);
-                break :brk list;
-            };
-
-            pub const Validator = struct {
-                pub const List = std.EnumArray(JSNode.Tag, bool);
-                fn NewList(comptime valid_tags: anytype) List {
-                    return comptime brk: {
-                        var list = List.initFill(false);
-                        for (std.meta.fieldNames(@TypeOf(valid_tags))) |index| {
-                            const name = @tagName(@field(valid_tags, index));
-
-                            if (!@hasField(JSNode.Tag, name)) {
-                                @compileError(
-                                    "JSNode.Tag does not have a \"" ++ name ++ "\" field. Valid fields are " ++ std.fmt.comptimePrint(
-                                        "{s}",
-                                        .{
-                                            std.meta.fieldNames(@TypeOf(valid_tags)),
-                                        },
-                                    ),
-                                );
-                            }
-                            list.set(@field(JSNode.Tag, name), true);
-                        }
-
-                        break :brk list;
-                    };
-                }
-
-                pub const valid_object_tags = Tag.Validator.NewList(.{
-                    .g_property,
-                    .e_spread,
-                    .e_identifier,
-                    .e_import_identifier,
-                    .e_index,
-                    .e_call,
-                    .e_private_identifier,
-                    .e_dot,
-                    .e_unary,
-                    .e_binary,
-                });
-
-                pub const valid_inject_tags = Tag.Validator.NewList(.{
-                    .s_import,
-                });
-            };
-
-            pub const max_tag: u8 = brk: {
-                const Enum: std.builtin.TypeInfo.Enum = @typeInfo(Tag).Enum;
-                var max_value: u8 = 0;
-                for (Enum.fields) |field| {
-                    max_value = std.math.max(@as(u8, field.value), max_value);
-                }
-                break :brk max_value;
-            };
-
-            pub const min_tag: u8 = brk: {
-                const Enum: std.builtin.TypeInfo.Enum = @typeInfo(Tag).Enum;
-                var min: u8 = 255;
-                for (Enum.fields) |field| {
-                    min = std.math.min(@as(u8, field.value), min);
-                }
-                break :brk min;
-            };
-        };
-
-        pub const JSNodeList = std.ArrayListUnmanaged(JSNode);
-
-        pub fn NewJSXWriter(comptime P: type) type {
-            return struct {
-                const JSXWriter = @This();
-                p: *P,
-                bun_jsx_ref: Ref,
-                log: *logger.Log,
-                args: ExprList,
-                bun_identifier: *E.Identifier,
-                allocator: std.mem.Allocator,
-                parent_tag: Tag = Tag.e_missing,
-
-                pub fn initWriter(p: *P, bun_identifier: *E.Identifier) JSXWriter {
-                    return JSXWriter{
-                        .p = p,
-                        .log = p.log,
-                        .bun_jsx_ref = p.bun_jsx_ref,
-                        .args = ExprList.init(p.allocator),
-                        .allocator = p.allocator,
-                        .bun_identifier = bun_identifier,
-                    };
-                }
-
-                fn hasPropertyNamed(props: []G.Property, comptime name: string) bool {
-                    return indexOfPropertyByName(props, name) != null;
-                }
-
-                fn indexOfPropertyByName(props: []G.Property, comptime name: string) ?u32 {
-                    for (props) |prop, i| {
-                        const key = prop.key orelse continue;
-                        if (key.data != .e_string or !key.data.e_string.isUTF8()) continue;
-                        if (strings.eqlComptime(key.data.e_string.data, name)) return @intCast(u32, i);
-                    }
-
-                    return null;
-                }
-
-                fn propertyValueNamed(props: []G.Property, comptime name: string) ?Expr {
-                    for (props) |prop| {
-                        const key = prop.key orelse continue;
-                        if (key.data != .e_string or !key.data.e_string.isUTF8()) continue;
-                        if (strings.eqlComptime(key.data.e_string.data, name)) return prop.value;
-                    }
-
-                    return null;
-                }
-
-                pub fn writeNodeType(self: *JSXWriter, tag: JSNode.Tag, props: []G.Property, children: []Expr, loc: logger.Loc) bool {
-                    switch (tag) {
-
-                        // <bool value={foo} />
-                        // intended for dynamic values
-                        Tag.e_boolean => {
-                            self.args.ensureUnusedCapacity(2) catch unreachable;
-                            self.args.appendAssumeCapacity(Expr{ .loc = loc, .data = comptime Tag.ids.get(Tag.e_boolean) });
-                            const value_i = indexOfPropertyByName(props, "value") orelse {
-                                self.log.addError(self.p.source, loc, "<bool> should have a \"value\" prop") catch unreachable;
-                                self.args.append(Expr{ .data = .{ .e_boolean = .{ .value = true } }, .loc = loc }) catch unreachable;
-                                return true;
-                            };
-                            const value = props[value_i].value orelse Expr{ .data = .{ .e_boolean = .{ .value = true } }, .loc = loc };
-
-                            switch (value.data) {
-                                .e_jsx_element => |el| {
-                                    return self.writeElement(el.*);
-                                },
-                                .e_string => {
-                                    self.log.addError(self.p.source, value.loc, "\"value\" shouldn't be a string") catch unreachable;
-                                    self.args.appendAssumeCapacity(Expr{ .data = .{ .e_boolean = .{ .value = true } }, .loc = value.loc });
-                                },
-                                .e_boolean => {
-                                    self.args.appendAssumeCapacity(value);
-                                },
-                                .e_missing => {
-                                    self.args.appendAssumeCapacity(Expr{ .data = .{ .e_boolean = .{ .value = true } }, .loc = value.loc });
-                                },
-                                // null and undefined literals are coerced to false
-                                .e_null, .e_undefined => {
-                                    self.args.appendAssumeCapacity(Expr{ .data = .{ .e_boolean = .{ .value = false } }, .loc = value.loc });
-                                },
-                                .e_number => {
-                                    // Numbers are cooerced to booleans
-                                    self.args.appendAssumeCapacity(Expr{ .data = .{ .e_boolean = .{ .value = value.data.e_number.value > 0.0 } }, .loc = value.loc });
-                                },
-                                // these ones are not statically analyzable so we just leave them in as-is
-                                .e_if, .e_identifier, .e_import_identifier, .e_index, .e_call, .e_private_identifier, .e_dot, .e_unary, .e_binary => {
-                                    self.args.appendAssumeCapacity(self.p.visitExpr(value));
-                                },
-                                // everything else is invalid
-                                else => {
-                                    self.log.addError(self.p.source, value.loc, "\"value\" should be a bool, jsx element, number, identifier, index, call, private identifier, or dot") catch unreachable;
-                                    self.args.appendAssumeCapacity(Expr{ .data = .{ .e_boolean = .{ .value = false } }, .loc = value.loc });
-                                },
-                            }
-
-                            return true;
-                        },
-                        // <number value={1.0} />
-                        Tag.e_number => {
-                            self.args.ensureUnusedCapacity(2) catch unreachable;
-                            self.args.appendAssumeCapacity(Expr{ .loc = loc, .data = comptime Tag.ids.get(Tag.e_number) });
-                            const invalid_value = Expr{ .data = .{ .e_number = .{ .value = 0.0 } }, .loc = loc };
-                            const value_i = indexOfPropertyByName(props, "value") orelse {
-                                self.log.addError(self.p.source, loc, "<number> should have a \"value\" prop") catch unreachable;
-                                self.args.append(invalid_value) catch unreachable;
-                                return true;
-                            };
-                            const value = props[value_i].value orelse invalid_value;
-
-                            switch (value.data) {
-                                .e_jsx_element => |el| {
-                                    return self.writeElement(el.*);
-                                },
-                                .e_string => {
-                                    self.log.addError(self.p.source, loc, "<number> should not be a string.") catch unreachable;
-                                    self.args.appendAssumeCapacity(invalid_value);
-                                },
-                                .e_boolean => {
-                                    // Booleans are cooerced to numbers
-                                    self.args.appendAssumeCapacity(
-                                        Expr{
-                                            .data = .{
-                                                .e_number = E.Number{
-                                                    .value = @intToFloat(f64, @boolToInt(value.data.e_boolean.value)),
-                                                },
-                                            },
-                                            .loc = value.loc,
-                                        },
-                                    );
-                                },
-                                .e_missing => {
-                                    self.args.appendAssumeCapacity(invalid_value);
-                                },
-                                // null and undefined literals are coerced to 0
-                                .e_null, .e_undefined => {
-                                    self.args.appendAssumeCapacity(Expr{ .data = .{ .e_number = .{ .value = 0 } }, .loc = value.loc });
-                                },
-                                // <number>123</number>
-                                .e_number => {
-                                    // Numbers are cooerced to booleans
-                                    self.args.appendAssumeCapacity(value);
-                                },
-                                // these ones are not statically analyzable so we just leave them in as-is
-                                .e_if, .e_identifier, .e_import_identifier, .e_index, .e_call, .e_private_identifier, .e_dot, .e_unary, .e_binary => {
-                                    self.args.appendAssumeCapacity(self.p.visitExpr(value));
-                                },
-                                // everything else is invalid
-                                else => {
-                                    self.log.addError(self.p.source, value.loc, "<number value> should be a number, jsx element, identifier, index, call, private identifier, or dot expression") catch unreachable;
-                                    self.args.appendAssumeCapacity(invalid_value);
-                                },
-                            }
-
-                            return true;
-                        },
-                        Tag.e_big_int => {
-                            self.args.ensureUnusedCapacity(2) catch unreachable;
-                            self.args.appendAssumeCapacity(Expr{ .loc = loc, .data = comptime Tag.ids.get(Tag.e_big_int) });
-                            const invalid_value = Expr{ .data = .{ .e_big_int = &E.BigInt.empty }, .loc = loc };
-                            const value_i = indexOfPropertyByName(props, "value") orelse {
-                                self.log.addError(self.p.source, loc, "<big-int> should have a \"value\" prop") catch unreachable;
-                                self.args.append(invalid_value) catch unreachable;
-                                return true;
-                            };
-                            const value = props[value_i].value orelse invalid_value;
-
-                            switch (value.data) {
-                                .e_jsx_element => |el| {
-                                    return self.writeElement(el.*);
-                                },
-                                .e_string => |str| {
-                                    self.args.appendAssumeCapacity(Expr.init(E.BigInt, E.BigInt{ .value = std.mem.trimRight(u8, str.data, "n") }, value.loc));
-                                },
-                                .e_big_int => {
-                                    self.args.appendAssumeCapacity(value);
-                                },
-                                .e_missing => {
-                                    self.args.appendAssumeCapacity(invalid_value);
-                                },
-                                // null and undefined literals are coerced to 0
-                                .e_null, .e_undefined => {
-                                    self.args.appendAssumeCapacity(Expr{ .data = .{ .e_big_int = &E.BigInt.empty }, .loc = value.loc });
-                                },
-                                // these ones are not statically analyzable so we just leave them in as-is
-                                .e_if, .e_identifier, .e_import_identifier, .e_index, .e_call, .e_private_identifier, .e_dot, .e_unary, .e_binary => {
-                                    self.args.appendAssumeCapacity(self.p.visitExpr(value));
-                                },
-                                // everything else is invalid
-                                else => {
-                                    self.log.addError(self.p.source, value.loc, "\"value\" should be a BigInt, jsx element, identifier, index, call, private identifier, or dot expression") catch unreachable;
-                                    self.args.appendAssumeCapacity(invalid_value);
-                                },
-                            }
-
-                            return true;
-                        },
-                        Tag.e_array => {
-                            self.args.ensureUnusedCapacity(2 + children.len) catch unreachable;
-                            self.args.appendAssumeCapacity(Expr{ .loc = loc, .data = comptime Tag.ids.get(Tag.e_array) });
-                            const children_count = @truncate(u16, children.len);
-                            self.args.appendAssumeCapacity(Expr{ .loc = loc, .data = .{ .e_number = E.Number{ .value = @intToFloat(f64, children_count) } } });
-
-                            var old_parent = self.parent_tag;
-                            self.parent_tag = Tag.e_array;
-                            defer self.parent_tag = old_parent;
-                            for (children) |child| {
-                                switch (child.data) {
-                                    .e_jsx_element => |el| {
-                                        if (!self.writeElement(el.*)) return false;
-                                    },
-                                    // TODO: handle when simplification changes the expr type
-                                    .e_template, .e_if, .e_spread, .e_identifier, .e_import_identifier, .e_index, .e_call, .e_private_identifier, .e_dot, .e_unary, .e_binary => {
-                                        const visited_expr = self.p.visitExpr(child);
-                                        switch (visited_expr.data) {
-                                            .e_jsx_element => |el| {
-                                                if (!self.writeElement(el.*)) return false;
-                                            },
-                                            .e_template, .e_if, .e_spread, .e_identifier, .e_import_identifier, .e_index, .e_call, .e_private_identifier, .e_dot, .e_unary, .e_binary => {
-                                                self.args.append(visited_expr) catch unreachable;
-                                            },
-                                            else => {
-                                                self.log.addError(self.p.source, visited_expr.loc, "<array> should only contain other jsx elements") catch unreachable;
-                                                self.args.append(Expr{ .data = .{ .e_missing = E.Missing{} }, .loc = visited_expr.loc }) catch unreachable;
-                                            },
-                                        }
-                                    },
-                                    else => {
-                                        self.log.addError(self.p.source, child.loc, "<array> should only contain other jsx elements") catch unreachable;
-                                        self.args.append(Expr{ .data = .{ .e_missing = E.Missing{} }, .loc = child.loc }) catch unreachable;
-                                    },
-                                }
-                            }
-
-                            return true;
-                        },
-                        Tag.e_object => {
-                            self.args.ensureUnusedCapacity(2 + children.len) catch unreachable;
-                            self.args.appendAssumeCapacity(Expr{ .loc = loc, .data = comptime Tag.ids.get(Tag.e_object) });
-                            const children_count = @truncate(u16, children.len);
-                            self.args.appendAssumeCapacity(Expr{ .loc = loc, .data = .{ .e_number = E.Number{ .value = @intToFloat(f64, children_count) } } });
-
-                            var old_parent = self.parent_tag;
-                            self.parent_tag = Tag.e_object;
-                            defer self.parent_tag = old_parent;
-
-                            for (children) |child| {
-                                switch (child.data) {
-                                    .e_jsx_element => |el| {
-                                        if (!self.writeElementWithValidTagList(el.*, comptime Tag.Validator.valid_object_tags)) return false;
-                                    },
-                                    .e_template, .e_if, .e_spread, .e_identifier, .e_import_identifier, .e_index, .e_call, .e_private_identifier, .e_dot, .e_unary, .e_binary => {
-                                        const visited = self.p.visitExpr(child);
-                                        switch (visited.data) {
-                                            .e_jsx_element => |el| {
-                                                if (!self.writeElementWithValidTagList(el.*, comptime Tag.Validator.valid_object_tags)) return false;
-                                            },
-                                            .e_template, .e_if, .e_spread, .e_identifier, .e_import_identifier, .e_index, .e_call, .e_private_identifier, .e_dot, .e_unary, .e_binary => {
-                                                self.args.append(visited) catch unreachable;
-                                            },
-                                            else => {
-                                                self.log.addError(self.p.source, child.loc, "<object> should only contain other jsx elements") catch unreachable;
-                                                self.args.append(Expr{ .data = .{ .e_missing = E.Missing{} }, .loc = child.loc }) catch unreachable;
-                                            },
-                                        }
-                                    },
-                                    else => {
-                                        self.log.addError(self.p.source, child.loc, "<object> should only contain other jsx elements") catch unreachable;
-                                        self.args.append(Expr{ .data = .{ .e_missing = E.Missing{} }, .loc = child.loc }) catch unreachable;
-                                    },
-                                }
-                            }
-
-                            return true;
-                        },
-
-                        Tag.g_property => {
-                            const name_property = propertyValueNamed(props, "name");
-                            const value_property = propertyValueNamed(props, "value");
-                            const init_property = propertyValueNamed(props, "init");
-
-                            var old_parent = self.parent_tag;
-                            if (old_parent != .e_object) {
-                                self.args.append(Expr{ .loc = loc, .data = comptime Tag.ids.get(Tag.g_property) }) catch unreachable;
-                            }
-
-                            self.parent_tag = Tag.g_property;
-                            defer self.parent_tag = old_parent;
-
-                            if (value_property) |prop| {
-                                switch (prop.data) {
-                                    .e_jsx_element => |el| {
-                                        if (!self.writeElement(el.*)) return false;
-                                    },
-                                    .e_template, .e_if, .e_spread, .e_identifier, .e_import_identifier, .e_index, .e_call, .e_private_identifier, .e_dot, .e_unary, .e_binary => {
-                                        self.args.append(self.p.visitExpr(prop)) catch unreachable;
-                                    },
-                                    else => {
-                                        self.log.addError(self.p.source, prop.loc, "value should only contain other jsx elements") catch unreachable;
-                                        self.args.append(Expr{ .data = .{ .e_missing = E.Missing{} }, .loc = prop.loc }) catch unreachable;
-                                    },
-                                }
-                            } else {
-                                self.args.append(Expr{ .data = comptime Tag.ids.get(.e_undefined), .loc = loc }) catch unreachable;
-                            }
-
-                            if (init_property) |prop| {
-                                switch (prop.data) {
-                                    .e_jsx_element => |el| {
-                                        if (!self.writeElement(el.*)) return false;
-                                    },
-
-                                    .e_template, .e_spread, .e_identifier, .e_import_identifier, .e_index, .e_call, .e_private_identifier, .e_dot, .e_unary, .e_binary => {
-                                        self.args.append(self.p.visitExpr(prop)) catch unreachable;
-                                    },
-                                    else => {
-                                        self.log.addError(self.p.source, prop.loc, "init should only contain other jsx elements") catch unreachable;
-                                        self.args.append(Expr{ .data = .{ .e_missing = E.Missing{} }, .loc = prop.loc }) catch unreachable;
-                                    },
-                                }
-                            } else {
-                                self.args.append(Expr{ .data = comptime Tag.ids.get(.e_undefined), .loc = loc }) catch unreachable;
-                            }
-
-                            if (name_property) |prop| {
-                                switch (prop.data) {
-                                    .e_jsx_element => |el| {
-                                        if (!self.writeElement(el.*)) return false;
-                                    },
-                                    .e_string => {
-                                        self.args.append(prop) catch unreachable;
-                                    },
-                                    .e_template, .e_if, .e_spread, .e_identifier, .e_import_identifier, .e_index, .e_call, .e_private_identifier, .e_dot, .e_unary, .e_binary => {
-                                        self.args.append(self.p.visitExpr(prop)) catch unreachable;
-                                    },
-                                    else => {
-                                        self.log.addError(self.p.source, prop.loc, "should only contain other jsx elements or a string") catch unreachable;
-                                        self.args.append(Expr{ .data = .{ .e_missing = E.Missing{} }, .loc = prop.loc }) catch unreachable;
-                                    },
-                                }
-                            }
-
-                            return true;
-                        },
-                        Tag.e_string => {
-                            self.args.ensureUnusedCapacity(2) catch unreachable;
-                            self.args.appendAssumeCapacity(Expr{ .loc = loc, .data = comptime Tag.ids.get(Tag.e_string) });
-                            const invalid_value = Expr{ .data = .{ .e_string = &E.String.empty }, .loc = loc };
-                            const value_i = indexOfPropertyByName(props, "value") orelse {
-                                self.log.addError(self.p.source, loc, "<string> should have a \"value\" prop") catch unreachable;
-                                self.args.append(invalid_value) catch unreachable;
-                                return true;
-                            };
-                            const value = props[value_i].value orelse invalid_value;
-
-                            switch (value.data) {
-                                .e_jsx_element => |el| {
-                                    return self.writeElement(el.*);
-                                },
-                                .e_string => {
-                                    self.args.appendAssumeCapacity(value);
-                                },
-                                .e_missing => {
-                                    self.args.appendAssumeCapacity(invalid_value);
-                                },
-                                // null is cooerced to "null"
-                                .e_null => {
-                                    self.args.appendAssumeCapacity(Expr{ .loc = value.loc, .data = .{ .e_string = &E.String.@"null" } });
-                                },
-                                // undefined is cooerced to "undefined"
-                                .e_undefined => {
-                                    self.args.appendAssumeCapacity(Expr{ .loc = value.loc, .data = .{ .e_string = &E.String.@"undefined" } });
-                                },
-                                .e_boolean => |boolean| {
-                                    self.args.appendAssumeCapacity(Expr{ .loc = value.loc, .data = .{ .e_string = if (boolean.value) &E.String.@"true" else &E.String.@"false" } });
-                                },
-                                // these ones are not statically analyzable so we just leave them in as-is
-                                .e_template, .e_if, .e_identifier, .e_import_identifier, .e_index, .e_call, .e_private_identifier, .e_dot, .e_unary, .e_binary => {
-                                    self.args.appendAssumeCapacity(self.p.visitExpr(value));
-                                },
-                                // everything else is invalid
-                                else => {
-                                    self.log.addError(self.p.source, value.loc, "<string value> should be a string, jsx element, identifier, index, call, private identifier, or dot expression") catch unreachable;
-                                    self.args.appendAssumeCapacity(invalid_value);
-                                },
-                            }
-                        },
-                        Tag.e_reg_exp => {
-                            self.args.ensureUnusedCapacity(2) catch unreachable;
-                            self.args.appendAssumeCapacity(Expr{ .loc = loc, .data = comptime Tag.ids.get(Tag.e_reg_exp) });
-                            const invalid_value = Expr{ .data = .{ .e_reg_exp = &E.RegExp.empty }, .loc = loc };
-
-                            const value_i = indexOfPropertyByName(props, "value") orelse {
-                                self.log.addError(self.p.source, loc, "<regex> should have a \"value\" prop") catch unreachable;
-                                self.args.append(invalid_value) catch unreachable;
-                                return true;
-                            };
-
-                            const value = props[value_i].value orelse invalid_value;
-
-                            switch (value.data) {
-                                .e_string => |str| {
-                                    self.args.appendAssumeCapacity(Expr.init(E.RegExp, E.RegExp{ .value = str.data }, value.loc));
-                                },
-                                .e_reg_exp => {
-                                    self.args.appendAssumeCapacity(value);
-                                },
-                                .e_missing, .e_null, .e_undefined => {
-                                    self.args.appendAssumeCapacity(invalid_value);
-                                },
-                                // these ones are not statically analyzable so we just leave them in as-is
-                                .e_if, .e_identifier, .e_import_identifier, .e_index, .e_call, .e_private_identifier, .e_dot, .e_unary, .e_binary => {
-                                    self.args.appendAssumeCapacity(self.p.visitExpr(value));
-                                },
-                                // everything else is invalid
-                                else => {
-                                    self.log.addError(self.p.source, value.loc, "<regex value> should be a string, jsx element, identifier, index, call, private identifier, or dot expression") catch unreachable;
-                                    self.args.appendAssumeCapacity(invalid_value);
-                                },
-                            }
-
-                            return true;
-                        },
-                        Tag.inline_inject => {
-
-                            // For <inject>, immediate children must be JSX types or arrays
-                            if (props.len > 0) {
-                                self.log.addError(
-                                    self.p.source,
-                                    loc,
-                                    "<inject> does not accept props",
-                                ) catch unreachable;
-                            }
-
-                            var count: usize = children.len;
-                            for (children) |c| {
-                                count += switch (c.data) {
-                                    .e_jsx_element => if (c.data.e_jsx_element.tag != null) 1 else brk: {
-                                        break :brk c.data.e_jsx_element.children.len;
-                                    },
-                                    else => 1,
-                                };
-                            }
-                            self.args.ensureUnusedCapacity(2 + count) catch unreachable;
-                            self.args.appendAssumeCapacity(Expr{ .loc = loc, .data = comptime Tag.ids.get(Tag.inline_inject) });
-                            self.args.appendAssumeCapacity(Expr{ .loc = loc, .data = .{ .e_number = .{ .value = @intToFloat(f64, @intCast(u32, children.len)) } } });
-
-                            const old_parent_tag = self.parent_tag;
-                            self.parent_tag = Tag.inline_inject;
-                            defer self.parent_tag = old_parent_tag;
-
-                            for (children) |child| {
-                                switch (child.data) {
-                                    .e_jsx_element => |el| {
-                                        if (!self.writeElementWithValidTagList(el.*, comptime Tag.Validator.valid_inject_tags)) return false;
-                                    },
-                                    else => {
-                                        self.args.append(self.p.visitExpr(child)) catch unreachable;
-                                    },
-                                }
-                            }
-
-                            return true;
-                        },
-
-                        Tag.inline_identifier => {
-                            // id only accepts "to" and it must be a int32
-                            self.args.ensureUnusedCapacity(2) catch unreachable;
-                            self.args.appendAssumeCapacity(Expr{ .loc = loc, .data = comptime Tag.ids.get(Tag.inline_identifier) });
-
-                            if (propertyValueNamed(props, "to")) |prop| {
-                                switch (prop.data) {
-                                    .e_number, .e_if, .e_identifier, .e_import_identifier, .e_index, .e_call, .e_private_identifier, .e_dot, .e_unary, .e_binary => {
-                                        self.args.appendAssumeCapacity(self.p.visitExpr(prop));
-                                    },
-                                    else => {
-                                        self.log.addError(
-                                            self.p.source,
-                                            prop.loc,
-                                            "\"to\" prop must be a number",
-                                        ) catch unreachable;
-                                        self.args.appendAssumeCapacity(prop);
-                                    },
-                                }
-                            } else {
-                                self.log.addError(
-                                    self.p.source,
-                                    loc,
-                                    "\"to\" prop is required",
-                                ) catch unreachable;
-                                self.args.appendAssumeCapacity(Expr{ .loc = loc, .data = .{ .e_number = .{ .value = 0 } } });
-                            }
-
-                            return true;
-                        },
-
-                        Tag.s_import => {
-                            var p = self.p;
-                            const default_property_ = propertyValueNamed(props, "default");
-                            const path_property = propertyValueNamed(props, "path") orelse {
-                                self.log.addError(
-                                    self.p.source,
-                                    loc,
-                                    "<import> must have a path",
-                                ) catch unreachable;
-                                return false;
-                            };
-                            const namespace_ = propertyValueNamed(props, "namespace");
-
-                            const items_count: u32 = 1 +
-                                @intCast(u32, @boolToInt(namespace_ != null));
-
-                            self.args.ensureUnusedCapacity(items_count) catch unreachable;
-                            self.args.appendAssumeCapacity(Expr{ .loc = loc, .data = comptime Tag.ids.get(Tag.s_import) });
-
-                            switch (path_property.data) {
-                                .e_string => {
-                                    self.args.appendAssumeCapacity(path_property);
-                                },
-                                .e_jsx_element => {
-                                    self.log.addError(
-                                        self.p.source,
-                                        path_property.loc,
-                                        "import path cannot be JSX",
-                                    ) catch unreachable;
-                                    return false;
-                                },
-                                .e_template, .e_if, .e_identifier, .e_import_identifier, .e_index, .e_call, .e_private_identifier, .e_dot, .e_unary, .e_binary => {
-                                    self.args.appendAssumeCapacity(p.visitExpr(path_property));
-                                },
-                                else => {
-                                    self.log.addError(
-                                        self.p.source,
-                                        path_property.loc,
-                                        "import path must be a string or identifier",
-                                    ) catch unreachable;
-                                    self.args.appendAssumeCapacity(path_property);
-                                },
-                            }
-
-                            if (namespace_) |namespace_expr| {
-                                switch (namespace_expr.data) {
-                                    .e_string => {
-                                        self.log.addError(
-                                            self.p.source,
-                                            namespace_expr.loc,
-                                            "import * as is not supported in macros yet",
-                                        ) catch unreachable;
-                                        self.args.appendAssumeCapacity(p.visitExpr(namespace_expr));
-                                        return false;
-                                    },
-                                    .e_jsx_element => {
-                                        self.log.addError(
-                                            self.p.source,
-                                            namespace_expr.loc,
-                                            "namespace cannot be JSX",
-                                        ) catch unreachable;
-                                        return false;
-                                    },
-
-                                    .e_object, .e_if, .e_identifier, .e_import_identifier, .e_index, .e_call, .e_private_identifier, .e_dot, .e_unary, .e_binary => {
-                                        self.args.appendAssumeCapacity(p.visitExpr(namespace_expr));
-                                    },
-
-                                    else => {
-                                        self.log.addError(
-                                            self.p.source,
-                                            namespace_expr.loc,
-                                            "namespace must be an object shaped like {\"fromName\": \"toName\"}",
-                                        ) catch unreachable;
-                                        self.args.appendAssumeCapacity(namespace_expr);
-                                    },
-                                }
-                            } else {
-                                self.args.appendAssumeCapacity(Expr{
-                                    .loc = loc,
-                                    .data = .{
-                                        .e_null = E.Null{},
-                                    },
-                                });
-                            }
-
-                            if (default_property_) |default| {
-                                switch (default.data) {
-                                    .e_string => {
-                                        self.args.appendAssumeCapacity(default);
-                                    },
-                                    .e_jsx_element => {
-                                        self.log.addError(
-                                            self.p.source,
-                                            default.loc,
-                                            "default import cannot be JSX",
-                                        ) catch unreachable;
-                                        return false;
-                                    },
-                                    .e_template, .e_if, .e_identifier, .e_import_identifier, .e_index, .e_call, .e_private_identifier, .e_dot, .e_unary, .e_binary => {
-                                        self.args.appendAssumeCapacity(p.visitExpr(default));
-                                    },
-                                    else => {
-                                        self.log.addError(self.p.source, default.loc, "default import must be a string or identifier") catch unreachable;
-                                        self.args.appendAssumeCapacity(default);
-                                    },
-                                }
-                            } else {
-                                self.args.appendAssumeCapacity(Expr{
-                                    .loc = loc,
-                                    .data = .{
-                                        .e_null = E.Null{},
-                                    },
-                                });
-                            }
-
-                            return true;
-                        },
-                        Tag.fragment => {
-                            self.args.ensureUnusedCapacity(children.len + 2) catch unreachable;
-                            self.args.appendAssumeCapacity(Expr{ .loc = loc, .data = comptime Tag.ids.get(Tag.fragment) });
-                            self.args.appendAssumeCapacity(Expr{
-                                .loc = loc,
-                                .data = .{
-                                    .e_number = E.Number{
-                                        .value = @intToFloat(f64, children.len),
-                                    },
-                                },
-                            });
-
-                            for (children) |child| {
-                                switch (child.data) {
-                                    .e_jsx_element => |el| {
-                                        if (!self.writeElement(el.*)) return false;
-                                    },
-
-                                    .e_if, .e_spread, .e_identifier, .e_import_identifier, .e_index, .e_call, .e_private_identifier, .e_dot, .e_unary, .e_binary => {
-                                        const visited = self.p.visitExpr(child);
-                                        switch (visited.data) {
-                                            .e_jsx_element => |el| {
-                                                if (!self.writeElement(el.*)) return false;
-                                            },
-                                            .e_if, .e_spread, .e_identifier, .e_import_identifier, .e_index, .e_call, .e_private_identifier, .e_dot, .e_unary, .e_binary => {
-                                                self.args.append(visited) catch unreachable;
-                                            },
-                                            else => {
-                                                self.log.addError(self.p.source, child.loc, "<> should only contain other jsx elements") catch unreachable;
-                                                self.args.append(Expr{ .data = .{ .e_missing = E.Missing{} }, .loc = child.loc }) catch unreachable;
-                                            },
-                                        }
-                                    },
-                                    else => {
-                                        self.log.addError(self.p.source, child.loc, "<> should only contain other jsx elements") catch unreachable;
-                                        self.args.append(Expr{ .data = .{ .e_missing = E.Missing{} }, .loc = child.loc }) catch unreachable;
-                                    },
-                                }
-                            }
-
-                            return true;
-                        },
-                        // Tag.e_jsx_element => unreachable,
-                        // Tag.e_identifier => {
-                        //     // self.args.ensureUnusedCapacity(2) catch unreachable;
-                        //     Global.notimpl();
-                        // },
-                        // Tag.e_import_identifier => {
-                        //     Global.notimpl();
-                        // },
-                        // Tag.e_private_identifier => {
-                        //     Global.notimpl();
-                        // },
-
-                        // Tag.e_unary => {
-
-                        // },
-                        // Tag.e_binary => {},
-
-                        // Tag.e_function => {},
-                        // Tag.e_new_target => {},
-                        // Tag.e_import_meta => {},
-                        // Tag.e_call => {},
-                        // Tag.e_dot => {},
-                        // Tag.e_index => {},
-                        // Tag.e_arrow => {},
-
-                        // Tag.e_spread => {},
-
-                        // Tag.e_template_part => {},
-                        // Tag.e_template => {},
-                        // Tag.e_regex => {},
-                        // Tag.e_await => {},
-                        // Tag.e_yield => {},
-                        // Tag.e_if => {},
-                        // Tag.e_import => {},
-
-                        // Tag.e_class => {},
-                        // Tag.e_require => {},
-                        // Tag.s_import => {},
-
-                        // Tag.s_block => {},
-
-                        // The valueless ones
-                        Tag.e_super, Tag.e_null, Tag.e_undefined, Tag.e_missing, Tag.inline_true, Tag.inline_false, Tag.e_this => {
-                            self.args.append(Expr{ .loc = loc, .data = Tag.ids.get(tag) }) catch unreachable;
-                        },
-                        else => Global.panic("Tag \"{s}\" is not implemented yet.", .{@tagName(tag)}),
-                    }
-
-                    return true;
-                }
-
-                pub fn writeFunctionCall(self: *JSXWriter, element: E.JSXElement) Expr {
-                    if (element.tag) |tag_expr| {
-                        switch (tag_expr.data) {
-                            .e_string => {
-                                self.p.recordUsage(self.bun_jsx_ref);
-                                _ = self.writeElement(element);
-                                var call_args = ExprNodeList.one(
-                                    self.allocator,
-                                    Expr.init(
-                                        E.Array,
-                                        E.Array{ .items = ExprNodeList.fromList(self.args) },
-                                        tag_expr.loc,
-                                    ),
-                                ) catch unreachable;
-
-                                return Expr.init(
-                                    E.Call,
-                                    E.Call{
-                                        .target = Expr{
-                                            .data = .{
-                                                .e_identifier = self.bun_identifier.*,
-                                            },
-                                            .loc = tag_expr.loc,
-                                        },
-                                        .can_be_unwrapped_if_unused = true,
-                                        .args = call_args,
-                                    },
-                                    tag_expr.loc,
-                                );
-                            },
-                            else => Global.panic("Not implemented yet top-level jsx element: {s}", .{@tagName(tag_expr.data)}),
-                        }
-                    } else {
-                        const loc = logger.Loc.Empty;
-                        self.p.recordUsage(self.bun_jsx_ref);
-                        _ = self.writeNodeType(JSNode.Tag.fragment, element.properties.slice(), element.children.slice(), loc);
-                        var call_args = ExprNodeList.one(
-                            self.allocator,
-                            Expr.init(E.Array, E.Array{ .items = ExprNodeList.init(self.args.items) }, loc),
-                        ) catch unreachable;
-
-                        return Expr.init(
-                            E.Call,
-                            E.Call{
-                                .target = Expr{
-                                    .data = .{
-                                        .e_identifier = self.bun_identifier.*,
-                                    },
-                                    .loc = loc,
-                                },
-                                .can_be_unwrapped_if_unused = true,
-                                .args = call_args,
-                            },
-                            loc,
-                        );
-                    }
-
-                    return Expr{ .data = .{ .e_missing = .{} }, .loc = logger.Loc.Empty };
-                }
-
-                fn writeElementWithValidTagList(self: *JSXWriter, element: E.JSXElement, comptime valid_tags: Tag.Validator.List) bool {
-                    const tag_expr = element.tag orelse return false;
-                    if (tag_expr.data != .e_string) return false;
-                    const str = tag_expr.data.e_string;
-                    var p = self.p;
-
-                    const node_type: JSNode.Tag = JSNode.Tag.names.get(str.data) orelse {
-                        if (!str.isUTF8()) {
-                            self.log.addErrorFmt(p.source, tag_expr.loc, p.allocator, "Tag \"{s}\" is invalid", .{strings.toUTF8Alloc(self.p.allocator, str.slice16())}) catch unreachable;
-                        } else {
-                            self.log.addErrorFmt(p.source, tag_expr.loc, p.allocator, "Tag \"{s}\" is invalid", .{str.data}) catch unreachable;
-                        }
-                        return false;
-                    };
-
-                    if (!valid_tags.get(node_type)) {
-                        self.log.addErrorFmt(p.source, tag_expr.loc, p.allocator, "Tag \"{s}\" is invalid here", .{str.data}) catch unreachable;
-                    }
-
-                    return self.writeNodeType(node_type, element.properties.slice(), element.children.slice(), tag_expr.loc);
-                }
-
-                pub fn writeElement(self: *JSXWriter, element: E.JSXElement) bool {
-                    const tag_expr = element.tag orelse return false;
-                    if (tag_expr.data != .e_string) return false;
-                    const str = tag_expr.data.e_string;
-                    var p = self.p;
-
-                    const node_type: JSNode.Tag = JSNode.Tag.names.get(str.data) orelse {
-                        if (!str.isUTF8()) {
-                            self.log.addErrorFmt(p.source, tag_expr.loc, p.allocator, "Tag \"{s}\" is invalid", .{strings.toUTF8Alloc(self.p.allocator, str.slice16())}) catch unreachable;
-                        } else {
-                            self.log.addErrorFmt(p.source, tag_expr.loc, p.allocator, "Tag \"{s}\" is invalid", .{str.data}) catch unreachable;
-                        }
-                        return false;
-                    };
-
-                    return self.writeNodeType(node_type, element.properties.slice(), element.children.slice(), tag_expr.loc);
-                }
-            };
-        }
-
-        pub const SymbolMap = struct {
-            pub fn generateImportHash(name: string, path: string) i32 {
-                var hasher = std.hash.Wyhash.init(8);
-                hasher.update(path);
-                hasher.update("#");
-                hasher.update(name);
-                return @bitCast(i32, @truncate(u32, hasher.final()));
-            }
-        };
-
-        pub const Writer = struct {
-            log: *logger.Log,
-            exception: JSCBase.ExceptionValueRef = null,
-            ctx: js.JSContextRef,
-            errored: bool = false,
-            allocator: std.mem.Allocator,
-            loc: logger.Loc,
-            args_value: JSC.JSValue,
-            args_i: u32 = 0,
-            args_len: u32 = 0,
-
-            inject: std.ArrayList(JSNode),
-
-            pub inline fn eatArg(this: *Writer) ?JSC.JSValue {
-                if (this.args_i >= this.args_len) return null;
-                const i = this.args_i;
-
-                this.args_i += 1;
-                return JSC.JSObject.getIndex(this.args_value, this.ctx.ptr(), i);
-            }
-
-            pub inline fn peekArg(this: *Writer) ?JSC.JSValue {
-                if (this.args_i >= this.args_len) return null;
-                return JSC.JSObject.getIndex(this.args_value, this.ctx.ptr(), this.args_i);
-            }
-
-            pub inline fn nextJSValue(this: *Writer) ?JSC.JSValue {
-                return this.eatArg();
-            }
-
-            pub const TagOrJSNode = union(TagOrNodeType) {
-                tag: JSNode.Tag,
-                node: JSNode,
-                invalid: void,
-
-                pub const TagOrNodeType = enum {
-                    tag,
-                    node,
-                    invalid,
-                };
-
-                pub fn fromJSValueRefNoValidate(ctx: js.JSContextRef, value: js.JSValueRef) TagOrJSNode {
-                    switch (js.JSValueGetType(ctx, value)) {
-                        js.JSType.kJSTypeNumber => {
-                            const tag_int = @floatToInt(u8, JSC.JSValue.fromRef(value).asNumber());
-                            if (tag_int < Tag.min_tag or tag_int > Tag.max_tag) {
-                                return TagOrJSNode{ .invalid = .{} };
-                            }
-                            return TagOrJSNode{ .tag = @intToEnum(JSNode.Tag, tag_int) };
-                        },
-                        js.JSType.kJSTypeObject => {
-                            if (JSCBase.GetJSPrivateData(JSNode, value)) |node| {
-                                return TagOrJSNode{ .node = node.* };
-                            }
-
-                            return TagOrJSNode{ .invalid = .{} };
-                        },
-                        else => {
-                            return TagOrJSNode{ .invalid = .{} };
-                        },
-                    }
-                }
-
-                pub fn fromJSValueRef(writer: *Writer, ctx: js.JSContextRef, value: js.JSValueRef) TagOrJSNode {
-                    switch (js.JSValueGetType(ctx, value)) {
-                        js.JSType.kJSTypeNumber => {
-                            const tag_int = @floatToInt(u8, JSC.JSValue.fromRef(value).asNumber());
-                            if (tag_int < Tag.min_tag or tag_int > Tag.max_tag) {
-                                throwTypeError(ctx, "Node type has invalid value", writer.exception);
-                                writer.errored = true;
-                                return TagOrJSNode{ .invalid = .{} };
-                            }
-                            return TagOrJSNode{ .tag = @intToEnum(JSNode.Tag, tag_int) };
-                        },
-                        js.JSType.kJSTypeObject => {
-                            if (JSCBase.GetJSPrivateData(JSNode, value)) |node| {
-                                return TagOrJSNode{ .node = node.* };
-                            }
-
-                            return TagOrJSNode{ .invalid = .{} };
-                        },
-                        else => {
-                            throwTypeError(writer.ctx, "Invalid bun AST", writer.exception);
-                            return TagOrJSNode{ .invalid = .{} };
-                        },
-                    }
-                }
-
-                pub fn fromJSValue(writer: *Writer, value: JSC.JSValue) TagOrJSNode {
-                    return fromJSValueRef(writer, writer.ctx, value.asRef());
-                }
-            };
-
-            fn writeProperty(writer: *Writer, property: *G.Property) bool {
-
-                // Property is
-                // value
-                // initializer
-                // if property value is an e.spread, then key is skipped
-                // key
-
-                // value is first
-                var expect_key = true;
-                switch (TagOrJSNode.fromJSValue(writer, writer.eatArg() orelse return false)) {
-                    TagOrJSNode.tag => |tag| {
-                        var expr: Expr = Expr{ .loc = writer.loc, .data = .{ .e_null = E.Null{} } };
-
-                        if (!writer.writeFromJSWithTagInExpr(tag, &expr)) return false;
-                        property.value = switch (expr.data) {
-                            .e_missing, .e_undefined => null,
-                            else => expr,
-                        };
-                        property.flags.setPresent(.is_spread, expr.data == .e_spread);
-                        expect_key = property.value == null or !property.flags.contains(.is_spread);
-                    },
-                    TagOrJSNode.node => |node| {
-                        const expr = node.toExpr();
-                        property.value = switch (expr.data) {
-                            .e_missing, .e_undefined => null,
-                            else => expr,
-                        };
-                        property.flags.setPresent(.is_spread, expr.data == .e_spread);
-                        expect_key = property.value == null or !property.flags.contains(.is_spread);
-                    },
-                    TagOrJSNode.invalid => {
-                        return false;
-                    },
-                }
-
-                switch (TagOrJSNode.fromJSValue(writer, writer.eatArg() orelse return false)) {
-                    TagOrJSNode.tag => |tag| {
-                        var expr: Expr = Expr{ .loc = writer.loc, .data = .{ .e_null = E.Null{} } };
-
-                        if (!writer.writeFromJSWithTagInExpr(tag, &expr)) return false;
-                        property.initializer = switch (expr.data) {
-                            .e_missing, .e_undefined => null,
-                            else => expr,
-                        };
-                    },
-                    TagOrJSNode.node => |node| {
-                        const expr = node.toExpr();
-                        property.initializer = switch (expr.data) {
-                            .e_missing, .e_undefined => null,
-                            else => expr,
-                        };
-                    },
-                    TagOrJSNode.invalid => {
-                        return false;
-                    },
-                }
-
-                if (expect_key) {
-                    var next_arg = writer.peekArg() orelse return false;
-                    // its okay for property keys to literally be strings
-                    // <property name="foo">
-                    if (next_arg.isString()) {
-                        var expr: Expr = Expr{ .loc = writer.loc, .data = .{ .e_string = &E.String.empty } };
-                        if (!writer.writeFromJSWithTagInExpr(JSNode.Tag.e_string, &expr)) return false;
-                        property.key = expr;
-                    } else {
-                        switch (TagOrJSNode.fromJSValue(writer, writer.eatArg() orelse return false)) {
-                            TagOrJSNode.tag => |tag| {
-                                var expr: Expr = Expr{ .loc = writer.loc, .data = .{ .e_null = E.Null{} } };
-                                if (!writer.writeFromJSWithTagInExpr(tag, &expr)) return false;
-                                property.key = expr;
-                            },
-                            TagOrJSNode.node => |node| {
-                                property.key = node.toExpr();
-                            },
-                            TagOrJSNode.invalid => {
-                                return false;
-                            },
-                        }
-                    }
-                }
-
-                return true;
-            }
-
-            fn writeFromJSWithTagInNode(writer: *Writer, tag: JSNode.Tag) bool {
-                switch (tag) {
-                    .s_import => {
-                        const path_arg = writer.eatArg() orelse return false;
-                        // path should be a plain old JS string
-                        if (!path_arg.isString()) {
-                            throwTypeError(writer.ctx, "Import path must be a string", writer.exception);
-                            return false;
-                        }
-
-                        var path_zig_string = JSC.ZigString.Empty;
-                        path_arg.toZigString(&path_zig_string, writer.ctx.ptr());
-                        const import_path = path_zig_string.trimmedSlice();
-
-                        if (import_path.len == 0) {
-                            throwTypeError(writer.ctx, "Import path must be a non-empty string", writer.exception);
-                            return false;
-                        }
-
-                        var import = ImportData{
-                            .import = S.Import{
-                                .namespace_ref = Ref.None,
-                                .import_record_index = std.math.maxInt(u32),
-                            },
-                            .path = import_path,
-                        };
-                        var import_namespace_arg = writer.eatArg() orelse return false;
-                        var import_default_arg = writer.eatArg() orelse return false;
-
-                        const has_default = import_default_arg.isString();
-
-                        var import_default_name_string = JSC.ZigString.Empty;
-                        if (has_default) import_default_arg.toZigString(&import_default_name_string, writer.ctx.ptr());
-
-                        const import_default_name = import_default_name_string.slice();
-
-                        var import_item_i: u32 = 0;
-
-                        // TODO: verify it's safe to reuse the memory here
-                        if (!import_namespace_arg.isNull()) {
-                            if (import_namespace_arg.isObject()) {
-                                throwTypeError(writer.ctx, "Import namespace should be an object where the keys are import names and the values are aliases.", writer.exception);
-                                return false;
-                            }
-
-                            const JSLexer = @import("./js_lexer.zig");
-                            var array = js.JSObjectCopyPropertyNames(writer.ctx, import_namespace_arg.asObjectRef());
-                            defer js.JSPropertyNameArrayRelease(array);
-                            const property_names_count = @intCast(u32, js.JSPropertyNameArrayGetCount(array));
-                            var iter = JSCBase.JSPropertyNameIterator{
-                                .array = array,
-                                .count = @intCast(u32, property_names_count),
-                            };
-
-                            import.import.items = writer.allocator.alloc(
-                                ClauseItem,
-                                @intCast(u32, @boolToInt(has_default)) + property_names_count,
-                            ) catch return false;
-
-                            var object_ref = import_namespace_arg.asObjectRef();
-
-                            while (iter.next()) |prop| {
-                                const ptr = js.JSStringGetCharacters8Ptr(prop);
-                                const len = js.JSStringGetLength(prop);
-                                const name = ptr[0..len];
-
-                                const property_value = JSC.JSValue.fromRef(js.JSObjectGetProperty(writer.ctx, object_ref, prop, writer.exception));
-
-                                if (!property_value.isString()) {
-                                    return false;
-                                }
-
-                                var property_value_zig_string = JSC.ZigString.Empty;
-                                property_value.toZigString(&property_value_zig_string, writer.ctx.ptr());
-
-                                const alias = property_value_zig_string.slice();
-
-                                if (!JSLexer.isIdentifier(alias)) throwTypeError(writer.ctx, "import alias must be an identifier", writer.exception);
-
-                                import.import.items[import_item_i] = ClauseItem{
-                                    .alias = name,
-                                    .original_name = alias,
-                                    .name = .{ .loc = writer.loc, .ref = Ref.None },
-                                    .alias_loc = writer.loc,
-                                };
-
-                                import_item_i += 1;
-                            }
-                        } else {
-                            import.import.items = writer.allocator.alloc(
-                                ClauseItem,
-                                @intCast(u32, @boolToInt(has_default)),
-                            ) catch return false;
-                        }
-
-                        if (has_default) {
-                            import.import.items[import_item_i] = ClauseItem{
-                                .alias = ClauseItem.default_alias,
-                                .name = .{ .loc = writer.loc, .ref = Ref.None },
-                                .original_name = import_default_name,
-                                .alias_loc = writer.loc,
-                            };
-                            import_item_i += 1;
-                        }
-
-                        import.import.items = import.import.items[0..import_item_i];
-
-                        var import_ = writer.allocator.create(ImportData) catch return false;
-                        import_.* = import;
-                        writer.inject.append(JSNode{ .data = .{ .s_import = import_ }, .loc = writer.loc }) catch unreachable;
-                        return true;
-                    },
-                    else => {
-                        return false;
-                    },
-                }
-            }
-
-            fn writeFromJSWithTagInExpr(writer: *Writer, tag: JSNode.Tag, expr: *Expr) bool {
-                switch (tag) {
-                    .e_array => {
-                        // var e_array: E.Array = E.Array{ .items = writer.allocator.alloc(E.Array, args.len) catch return false };
-                        var count = (writer.nextJSValue() orelse return false).toU32();
-                        var i: @TypeOf(count) = 0;
-                        var items = ExprList.initCapacity(writer.allocator, count) catch unreachable;
-
-                        while (i < count) {
-                            var nextArg = writer.eatArg() orelse return false;
-                            if (js.JSValueIsArray(writer.ctx, nextArg.asRef())) {
-                                const extras = nextArg.getLengthOfArray(writer.ctx.ptr());
-                                count += std.math.max(@truncate(@TypeOf(count), extras), 1) - 1;
-                                items.ensureUnusedCapacity(extras) catch unreachable;
-                                items.expandToCapacity();
-                                var new_writer = writer.*;
-                                new_writer.args_i = 0;
-                                new_writer.args_len = extras;
-                                new_writer.args_value = nextArg;
-
-                                while (new_writer.nextJSValue()) |value| {
-                                    defer i += 1;
-                                    switch (TagOrJSNode.fromJSValue(&new_writer, value)) {
-                                        TagOrJSNode.tag => |tag_| {
-                                            if (!new_writer.writeFromJSWithTagInExpr(
-                                                tag_,
-                                                &items.items[i],
-                                            )) return false;
-                                        },
-                                        TagOrJSNode.node => |node_| {
-                                            const node: JSNode = node_;
-                                            switch (node.data) {
-                                                JSNode.Tag.s_import => return false,
-                                                else => {
-                                                    items.items[i] = node.toExpr();
-                                                },
-                                            }
-                                        },
-                                        TagOrJSNode.invalid => {
-                                            return false;
-                                        },
-                                    }
-                                }
-                            } else {
-                                defer i += 1;
-
-                                switch (TagOrJSNode.fromJSValue(writer, nextArg)) {
-                                    TagOrJSNode.tag => |tag_| {
-                                        if (!writer.writeFromJSWithTagInExpr(tag_, &items.items[i])) return false;
-                                    },
-                                    TagOrJSNode.node => |node_| {
-                                        const node: JSNode = node_;
-                                        switch (node.data) {
-                                            JSNode.Tag.s_import => return false,
-                                            else => {
-                                                items.items[i] = node.toExpr();
-                                            },
-                                        }
-                                    },
-                                    TagOrJSNode.invalid => {
-                                        return false;
-                                    },
-                                }
-                            }
-                        }
-                        items.items = items.items[0..i];
-                        expr.* = Expr.init(E.Array, E.Array{ .items = ExprNodeList.fromList(items) }, writer.loc);
-                        return true;
-                    },
-                    .e_boolean => {
-                        expr.* = Expr{ .loc = writer.loc, .data = .{ .e_boolean = .{
-                            .value = JSC.JSValue.toBoolean(writer.nextJSValue() orelse return false),
-                        } } };
-                        return true;
-                    },
-                    .inline_true => {
-                        expr.* = Expr{ .loc = writer.loc, .data = .{ .e_boolean = .{ .value = true } } };
-                        return true;
-                    },
-                    .inline_false => {
-                        expr.* = Expr{ .loc = writer.loc, .data = .{ .e_boolean = .{ .value = false } } };
-                        return true;
-                    },
-                    .e_null => {
-                        expr.* = Expr{ .loc = writer.loc, .data = .{ .e_null = E.Null{} } };
-                        return true;
-                    },
-                    .e_undefined => {
-                        expr.* = Expr{ .loc = writer.loc, .data = .{ .e_undefined = E.Undefined{} } };
-                        return true;
-                    },
-                    .e_number => {
-                        expr.* = Expr{
-                            .loc = writer.loc,
-                            .data = .{
-                                .e_number = .{
-                                    .value = JSC.JSValue.asNumber(writer.nextJSValue() orelse return false),
-                                },
-                            },
-                        };
-                        return true;
-                    },
-                    .e_string => {
-                        var wtf_string = JSC.JSValue.toWTFString(writer.nextJSValue() orelse return false, writer.ctx.ptr());
-                        if (wtf_string.isEmpty()) {
-                            expr.* = Expr{
-                                .loc = writer.loc,
-                                .data = .{
-                                    .e_string = &E.String.empty,
-                                },
-                            };
-                        } else if (wtf_string.is8Bit()) {
-                            expr.* = Expr.init(E.String, E.String.init(wtf_string.characters8()[0..wtf_string.length()]), writer.loc);
-                        } else if (wtf_string.is16Bit()) {
-                            expr.* = Expr.init(E.String, E.String.init(wtf_string.characters16()[0..wtf_string.length()]), writer.loc);
-                        } else {
-                            unreachable;
-                        }
-                        return true;
-                    },
-                    .e_reg_exp => {
-                        var jsstring = js.JSValueToStringCopy(writer.ctx, (writer.eatArg() orelse return false).asRef(), writer.exception);
-                        defer js.JSStringRelease(jsstring);
-
-                        const len = js.JSStringGetLength(jsstring);
-                        var str = writer.allocator.alloc(u8, len + 1) catch unreachable;
-                        const outlen = js.JSStringGetUTF8CString(jsstring, str.ptr, len + 1);
-                        expr.* = Expr.init(E.RegExp, E.RegExp{ .value = str[0..outlen] }, writer.loc);
-                        return true;
-                    },
-                    .e_object => {
-                        const len = (writer.nextJSValue() orelse return false).toU32();
-
-                        var properties = writer.allocator.alloc(G.Property, len) catch return false;
-                        var property_i: u32 = 0;
-
-                        while (property_i < properties.len) : (property_i += 1) {
-                            switch (TagOrJSNode.fromJSValue(writer, writer.eatArg() orelse return false)) {
-                                TagOrJSNode.tag => |tag_| {
-                                    if (tag_ != JSNode.Tag.g_property) return false;
-
-                                    if (!writer.writeProperty(
-                                        &properties[property_i],
-                                    )) return false;
-                                },
-                                TagOrJSNode.node => |node_| {
-                                    const node: JSNode = node_;
-                                    switch (node.data) {
-                                        .g_property => |property| {
-                                            properties[property_i] = property.*;
-                                        },
-                                        else => {
-                                            return false;
-                                        },
-                                    }
-                                },
-                                TagOrJSNode.invalid => {
-                                    return false;
-                                },
-                            }
-                        }
-
-                        return true;
-                    },
-                    .inline_identifier => {
-                        const to = (writer.nextJSValue() orelse return false).toInt32();
-                        expr.* = Expr{ .data = .{ .inline_identifier = to }, .loc = writer.loc };
-                        return true;
-                    },
-
-                    else => {
-                        return false;
-                    },
-
-                    // .e_call => {},
-
-                    // .e_dot => {},
-                    // .e_index => {},
-                    // .e_identifier => {},
-                    // .e_import_identifier => {},
-
-                    // .e_spread => {},
-
-                    // .e_template_part => {},
-                    // .e_template => {},
-
-                    // .e_await => {},
-                    // .e_yield => {},
-                    // .e_if => {},
-                    // .e_import => {},
-                    // .e_this => {},
-                    // .e_class => {},
-                    // s_import => {},
-                }
-
-                return false;
-            }
-
-            pub fn writeFromJS(writer: *Writer) ?JSNode {
-                switch (TagOrJSNode.fromJSValueRef(writer, writer.ctx, (writer.eatArg() orelse return null).asRef())) {
-                    TagOrJSNode.tag => |tag| {
-                        if (tag == Tag.inline_inject) {
-                            const count: u32 = (writer.eatArg() orelse return null).toU32();
-                            var i: u32 = 0;
-                            while (i < count) : (i += 1) {
-                                const next_value = (writer.eatArg() orelse return null);
-                                const next_value_ref = next_value.asRef();
-                                if (js.JSValueIsArray(writer.ctx, next_value_ref)) {
-                                    var iter = JSC.JSArrayIterator.init(next_value, writer.ctx.ptr());
-                                    while (iter.next()) |current_value| {
-                                        switch (TagOrJSNode.fromJSValueRef(writer, writer.ctx, current_value.asRef())) {
-                                            .node => |node| {
-                                                if (node.data != .s_import) {
-                                                    throwTypeError(writer.ctx, "inject must only contain imports", writer.exception);
-                                                    return null;
-                                                }
-                                                writer.inject.append(node) catch unreachable;
-                                            },
-                                            .tag => |t| {
-                                                if (!writer.writeFromJSWithTagInNode(t)) return null;
-                                            },
-                                            .invalid => {
-                                                return null;
-                                            },
-                                        }
-                                    }
-                                    i += 1;
-                                    continue;
-                                } else {
-                                    switch (TagOrJSNode.fromJSValueRef(writer, writer.ctx, next_value_ref)) {
-                                        .tag => |tag2| {
-                                            if (!writer.writeFromJSWithTagInNode(tag2)) return null;
-                                        },
-                                        TagOrJSNode.node => |node| {
-                                            writer.inject.append(node) catch unreachable;
-                                        },
-                                        TagOrJSNode.invalid => {
-                                            return null;
-                                        },
-                                    }
-                                }
-                            }
-                            return JSNode{ .data = .{ .inline_inject = writer.inject.toOwnedSlice() }, .loc = writer.loc };
-                        }
-
-                        if (tag == Tag.s_import) {
-                            if (!writer.writeFromJSWithTagInNode(tag)) return null;
-                            return writer.inject.items[0];
-                        }
-
-                        if (tag == Tag.fragment) {
-                            const count: u32 = (writer.eatArg() orelse return null).toU32();
-                            // collapse single-item fragments
-                            switch (count) {
-                                0 => {
-                                    return JSNode{ .data = .{ .fragment = &[_]JSNode{} }, .loc = writer.loc };
-                                },
-
-                                1 => {
-                                    var _node = writer.writeFromJS() orelse return null;
-                                    while (true) {
-                                        switch (_node.data) {
-                                            .fragment => |fragment| {
-                                                if (fragment.len == 1) {
-                                                    _node = fragment[0];
-                                                    continue;
-                                                }
-
-                                                return _node;
-                                            },
-                                            else => {
-                                                return _node;
-                                            },
-                                        }
-                                    }
-                                },
-                                else => {},
-                            }
-
-                            var i: u32 = 0;
-                            var fragment = std.ArrayList(JSNode).initCapacity(writer.allocator, count) catch return null;
-                            while (i < count) : (i += 1) {
-                                const node = writer.writeFromJS() orelse return null;
-                                fragment.append(node) catch unreachable;
-                            }
-
-                            return JSNode{ .data = .{ .fragment = fragment.toOwnedSlice() }, .loc = writer.loc };
-                        }
-
-                        var expr: Expr = Expr{ .loc = writer.loc, .data = .{ .e_null = E.Null{} } };
-
-                        if (!writer.writeFromJSWithTagInExpr(tag, &expr)) return null;
-                        return JSNode.initExpr(expr);
-                    },
-                    TagOrJSNode.node => |node| {
-                        return node;
-                    },
-                    TagOrJSNode.invalid => {
-                        return null;
-                    },
-                }
-            }
-        };
-
-        // pub fn isInstanceOf(
-        //     ctx: js.JSContextRef,
-        //     obj: js.JSObjectRef,
-        //     value: js.JSValueRef,
-        //     exception: js.ExceptionRef,
-        // ) bool {
-        //     js.JSValueToNumber(ctx, value, exception);
-        // }
-
-        fn throwTypeError(ctx: js.JSContextRef, comptime msg: string, exception: js.ExceptionRef) void {
-            JSCBase.JSError(JSCBase.getAllocator(ctx), msg, .{}, ctx, exception);
-        }
-
-        pub const BunJSXCallbackFunction = JSCBase.NewClass(
-            void,
-            .{ .name = "bunJSX" },
-            .{
-                .call = .{
-                    .rfn = createFromJavaScript,
-                    .ro = true,
-                },
-                .isNodeType = .{
-                    .rfn = isNodeType,
-                    .ro = true,
-                },
-            },
-            .{},
-        );
-
-        pub fn isNodeType(
-            _: void,
-            ctx: js.JSContextRef,
-            _: js.JSObjectRef,
-            _: js.JSObjectRef,
-            arguments: []const js.JSValueRef,
-            exception: js.ExceptionRef,
-        ) js.JSObjectRef {
-            if (arguments.len != 2) {
-                throwTypeError(ctx, "bunJSX.isNodeType() requires 2 arguments", exception);
-                return null;
-            }
-
-            const TagOrNodeType = Writer.TagOrJSNode.TagOrNodeType;
-
-            const left = Writer.TagOrJSNode.fromJSValueRefNoValidate(ctx, arguments[0]);
-            const right = Writer.TagOrJSNode.fromJSValueRefNoValidate(ctx, arguments[1]);
-
-            if (left == TagOrNodeType.invalid or right == TagOrNodeType.invalid) {
-                return js.JSValueMakeBoolean(ctx, false);
-            }
-
-            if (left == TagOrNodeType.node and right == TagOrNodeType.node) {
-                return js.JSValueMakeBoolean(ctx, @as(Tag, left.node.data) == @as(Tag, right.node.data));
-            }
-
-            if (left == TagOrNodeType.node) {
-                return js.JSValueMakeBoolean(ctx, @as(Tag, left.node.data) == right.tag);
-            }
-
-            if (right == TagOrNodeType.node) {
-                return js.JSValueMakeBoolean(ctx, @as(Tag, right.node.data) == left.tag);
-            }
-
-            unreachable;
-        }
-
-        pub fn createFromJavaScript(
-            _: void,
-            ctx: js.JSContextRef,
-            _: js.JSObjectRef,
-            _: js.JSObjectRef,
-            arguments: []const js.JSValueRef,
-            exception: js.ExceptionRef,
-        ) js.JSObjectRef {
-            if (arguments.len != 1 or !js.JSValueIsArray(ctx, arguments[0])) {
-                throwTypeError(ctx, "bunJSX requires one array argument", exception);
-                return null;
-            }
-
-            js.JSValueProtect(ctx, arguments[0]);
-            defer Output.flush();
-            const args_value = JSC.JSValue.fromRef(arguments[0]);
-            var writer = Writer{
-                .inject = std.ArrayList(JSNode).init(JSCBase.getAllocator(ctx)),
-                .log = JavaScript.VirtualMachine.vm.log,
-                .ctx = ctx,
-                .loc = logger.Loc.Empty,
-                .allocator = JSCBase.getAllocator(ctx),
-                .exception = exception,
-                .args_value = args_value,
-                .args_len = args_value.getLengthOfArray(ctx.ptr()),
-                .args_i = 0,
-                .errored = false,
-            };
-
-            if (writer.writeFromJS()) |node| {
-                var ptr = writer.allocator.create(JSNode) catch unreachable;
-                ptr.* = node;
-                var result = JSNode.Class.make(ctx, ptr);
-                js.JSValueProtect(ctx, result);
-                return result;
-            }
-
-            return null;
-        }
-    };
-
-    pub const LazyPropertiesObject = struct {
-        node: JSNode,
-
-        pub const Class = JSCBase.NewClass(
-            LazyPropertiesObject,
-            .{
-                .name = "LazyPropertiesObject",
-                .read_only = true,
-            },
-            .{
-                .getProperty = .{
-                    .rfn = getProperty,
-                },
-                .hasProperty = .{
-                    .rfn = hasProperty,
-                },
-                .getPropertyNames = .{
-                    .rfn = getPropertyNames,
-                },
-            },
-            .{},
-        );
-
-        pub fn getProperty(
-            ctx: js.JSContextRef,
-            thisObject: js.JSObjectRef,
-            propertyName: js.JSStringRef,
-            exception: js.ExceptionRef,
-        ) callconv(.C) js.JSValueRef {
-            var this: *LazyPropertiesObject = JSCBase.GetJSPrivateData(LazyPropertiesObject, thisObject) orelse return null;
-
-            const len = js.JSStringGetLength(propertyName);
-            const properties = this.node.data.e_object.properties.slice();
-            var ptr = js.JSStringGetCharacters8Ptr(propertyName);
-            var property_slice = ptr[0..len];
-            var value_node: JSNode = undefined;
-
-            for (properties) |property| {
-                const key = property.key orelse continue;
-                if (key.data != .e_string) continue;
-                const str = key.data.e_string.data;
-
-                if (strings.eql(property_slice, str)) {
-                    const value = property.value orelse return js.JSValueMakeUndefined(ctx);
-                    value_node = JSNode.initExpr(value);
-                    return JSNode.JSBindings.toPrimitive(&value_node, ctx, exception);
-                }
-            }
-
-            return js.JSValueMakeUndefined(ctx);
-        }
-
-        pub fn hasProperty(
-            _: js.JSContextRef,
-            thisObject: js.JSObjectRef,
-            propertyName: js.JSStringRef,
-        ) callconv(.C) bool {
-            var this: *LazyPropertiesObject = JSCBase.GetJSPrivateData(LazyPropertiesObject, thisObject) orelse return false;
-
-            const len = js.JSStringGetLength(propertyName);
-            const properties = this.node.data.e_object.properties.slice();
-            var ptr = js.JSStringGetCharacters8Ptr(propertyName);
-            var property_slice = ptr[0..len];
-
-            for (properties) |property| {
-                const key = property.key orelse continue;
-                if (key.data != .e_string) continue;
-                const str = key.data.e_string.data;
-
-                if (strings.eql(property_slice, str)) return true;
-            }
-
-            return false;
-        }
-
-        pub fn getPropertyNames(
-            _: js.JSContextRef,
-            thisObject: js.JSObjectRef,
-            props: js.JSPropertyNameAccumulatorRef,
-        ) callconv(.C) void {
-            var this: *LazyPropertiesObject = JSCBase.GetJSPrivateData(LazyPropertiesObject, thisObject) orelse return;
-
-            const properties = this.node.data.e_object.properties.slice();
-
-            for (properties) |property| {
-                const key = property.key orelse continue;
-                if (key.data != .e_string) continue;
-                const str = key.data.e_string.data;
-                js.JSPropertyNameAccumulatorAddName(props, js.JSStringCreate(str.ptr, str.len));
-            }
-        }
-    };
-
-    pub const ModuleNamespace = struct {
-        import_data: JSNode.ImportData,
-
-        pub const Class = JSCBase.NewClass(
-            ModuleNamespace,
-            .{
-                .name = "ModuleNamespace",
-                .read_only = true,
-            },
-            .{
-                .getProperty = .{
-                    .rfn = getProperty,
-                },
-                .hasProperty = .{
-                    .rfn = hasProperty,
-                },
-                .getPropertyNames = .{
-                    .rfn = getPropertyNames,
-                },
-            },
-            .{},
-        );
-
-        pub fn getProperty(
-            ctx: js.JSContextRef,
-            thisObject: js.JSObjectRef,
-            propertyName: js.JSStringRef,
-            _: js.ExceptionRef,
-        ) callconv(.C) js.JSValueRef {
-            var this: *ModuleNamespace = JSCBase.GetJSPrivateData(ModuleNamespace, thisObject) orelse return null;
-
-            const len = js.JSStringGetLength(propertyName);
-            const properties = this.import_data.import.items;
-            var ptr = js.JSStringGetCharacters8Ptr(propertyName);
-            var property_slice = ptr[0..len];
-
-            for (properties) |property| {
-                if (strings.eql(property.original_name, property_slice)) {
-                    return JSC.JSValue.jsNumberFromInt32(JSNode.SymbolMap.generateImportHash(property.original_name, this.import_data.path)).asRef();
-                }
-            }
-
-            return js.JSValueMakeUndefined(ctx);
-        }
-
-        pub fn hasProperty(
-            _: js.JSContextRef,
-            thisObject: js.JSObjectRef,
-            propertyName: js.JSStringRef,
-        ) callconv(.C) bool {
-            var this: *ModuleNamespace = JSCBase.GetJSPrivateData(ModuleNamespace, thisObject) orelse return false;
-
-            const len = js.JSStringGetLength(propertyName);
-            const properties = this.import_data.import.items;
-            var ptr = js.JSStringGetCharacters8Ptr(propertyName);
-            var property_slice = ptr[0..len];
-
-            for (properties) |property| {
-                if (strings.eql(property.original_name, property_slice)) return true;
-            }
-
-            return false;
-        }
-
-        pub fn getPropertyNames(
-            _: js.JSContextRef,
-            thisObject: js.JSObjectRef,
-            props: js.JSPropertyNameAccumulatorRef,
-        ) callconv(.C) void {
-            var this: *ModuleNamespace = JSCBase.GetJSPrivateData(ModuleNamespace, thisObject) orelse return;
-
-            const items = this.import_data.import.items;
-
-            for (items) |clause| {
-                const str = clause.original_name;
-                js.JSPropertyNameAccumulatorAddName(props, js.JSStringCreateStatic(str.ptr, str.len));
-            }
-        }
     };
 
     resolver: *Resolver,
@@ -7655,49 +8065,52 @@ pub const Macro = struct {
     pub fn init(
         _: std.mem.Allocator,
         resolver: *Resolver,
-        resolved: ResolveResult,
+        input_specifier: []const u8,
         log: *logger.Log,
         env: *DotEnv.Loader,
         function_name: string,
         specifier: string,
         hash: i32,
     ) !Macro {
-        const path = resolved.path_pair.primary;
-
-        var vm: *JavaScript.VirtualMachine = if (JavaScript.VirtualMachine.vm_loaded)
-            JavaScript.VirtualMachine.vm
+        var vm: *JavaScript.VirtualMachine = if (JavaScript.VirtualMachine.isLoaded())
+            JavaScript.VirtualMachine.get()
         else brk: {
-            var old_transform_options = resolver.opts.transform_options;
-            resolver.opts.transform_options.node_modules_bundle_path = null;
-            resolver.opts.transform_options.node_modules_bundle_path_server = null;
+            const old_transform_options = resolver.opts.transform_options;
             defer resolver.opts.transform_options = old_transform_options;
-            var _vm = try JavaScript.VirtualMachine.init(default_allocator, resolver.opts.transform_options, null, log, env);
+
+            // JSC needs to be initialized if building from CLI
+            JSC.initialize(false);
+
+            var _vm = try JavaScript.VirtualMachine.init(.{
+                .allocator = default_allocator,
+                .args = resolver.opts.transform_options,
+                .log = log,
+                .is_main_thread = false,
+                .env_loader = env,
+            });
 
             _vm.enableMacroMode();
+            _vm.eventLoop().ensureWaker();
 
-            try _vm.bundler.configureDefines();
+            try _vm.transpiler.configureDefines();
             break :brk _vm;
         };
 
         vm.enableMacroMode();
 
-        var loaded_result = try vm.loadMacroEntryPoint(path.text, function_name, specifier, hash);
+        const loaded_result = try vm.loadMacroEntryPoint(input_specifier, function_name, specifier, hash);
 
-        if (loaded_result.status(vm.global.vm()) == JSC.JSPromise.Status.Rejected) {
-            vm.runErrorHandler(loaded_result.result(vm.global.vm()), null);
-            vm.disableMacroMode();
-            return error.MacroLoadError;
+        switch (loaded_result.unwrap(vm.jsc, .leave_unhandled)) {
+            .rejected => |result| {
+                _ = vm.unhandledRejection(vm.global, result, loaded_result.asValue());
+                vm.disableMacroMode();
+                return error.MacroLoadError;
+            },
+            else => {},
         }
-
-        JavaScript.VirtualMachine.vm_loaded = true;
-
-        // We don't need to do anything with the result.
-        // We just want to make sure the promise is finished.
-        _ = loaded_result.result(vm.global.vm());
 
         return Macro{
             .vm = vm,
-            .resolved = resolved,
             .resolver = resolver,
         };
     }
@@ -7706,343 +8119,322 @@ pub const Macro = struct {
         const VisitMap = std.AutoHashMapUnmanaged(JSC.JSValue, Expr);
 
         threadlocal var args_buf: [3]js.JSObjectRef = undefined;
-        threadlocal var expr_nodes_buf: [1]JSNode = undefined;
         threadlocal var exception_holder: Zig.ZigException.Holder = undefined;
-        pub const MacroError = error{MacroFailed};
+        pub const MacroError = error{ MacroFailed, OutOfMemory } || ToJSError || bun.JSError;
 
-        pub fn NewRun(comptime Visitor: type) type {
-            return struct {
-                const Run = @This();
-                caller: Expr,
-                function_name: string,
-                macro: *const Macro,
-                global: *JSC.JSGlobalObject,
-                allocator: std.mem.Allocator,
-                id: i32,
+        pub const Run = struct {
+            caller: Expr,
+            function_name: string,
+            macro: *const Macro,
+            global: *JSC.JSGlobalObject,
+            allocator: std.mem.Allocator,
+            id: i32,
+            log: *logger.Log,
+            source: *const logger.Source,
+            visited: VisitMap = VisitMap{},
+            is_top_level: bool = false,
+
+            pub fn runAsync(
+                macro: Macro,
                 log: *logger.Log,
+                allocator: std.mem.Allocator,
+                function_name: string,
+                caller: Expr,
+                args: []JSC.JSValue,
                 source: *const logger.Source,
-                visited: VisitMap = VisitMap{},
-                visitor: Visitor,
-                is_top_level: bool = false,
+                id: i32,
+            ) MacroError!Expr {
+                if (comptime is_bindgen) return undefined;
+                const macro_callback = macro.vm.macros.get(id) orelse return caller;
 
-                pub fn runAsync(
-                    macro: Macro,
-                    log: *logger.Log,
-                    allocator: std.mem.Allocator,
-                    function_name: string,
-                    caller: Expr,
-                    args_count: usize,
-                    source: *const logger.Source,
-                    id: i32,
-                    visitor: Visitor,
-                ) callconv(.Async) MacroError!Expr {
-                    if (comptime is_bindgen) return undefined;
-                    var macro_callback = macro.vm.macros.get(id) orelse return caller;
+                const result = js.JSObjectCallAsFunctionReturnValueHoldingAPILock(
+                    macro.vm.global,
+                    macro_callback,
+                    null,
+                    args.len,
+                    @as([*]js.JSObjectRef, @ptrCast(args.ptr)),
+                );
 
-                    var result = js.JSObjectCallAsFunctionReturnValueHoldingAPILock(macro.vm.global.ref(), macro_callback, null, args_count, &args_buf);
+                var runner = Run{
+                    .caller = caller,
+                    .function_name = function_name,
+                    .macro = &macro,
+                    .allocator = allocator,
+                    .global = macro.vm.global,
+                    .id = id,
+                    .log = log,
+                    .source = source,
+                    .visited = VisitMap{},
+                };
 
-                    var runner = Run{
-                        .caller = caller,
-                        .function_name = function_name,
-                        .macro = &macro,
-                        .allocator = allocator,
-                        .global = macro.vm.global,
-                        .id = id,
-                        .log = log,
-                        .source = source,
-                        .visited = VisitMap{},
-                        .visitor = visitor,
-                    };
+                defer runner.visited.deinit(allocator);
 
-                    defer runner.visited.deinit(allocator);
+                return try runner.run(
+                    result,
+                );
+            }
 
-                    return try runner.run(
-                        result,
-                    );
-                }
+            pub fn run(
+                this: *Run,
+                value: JSC.JSValue,
+            ) MacroError!Expr {
+                return try switch (JSC.ConsoleObject.Formatter.Tag.get(value, this.global).tag) {
+                    .Error => this.coerce(value, .Error),
+                    .Undefined => this.coerce(value, .Undefined),
+                    .Null => this.coerce(value, .Null),
+                    .Private => this.coerce(value, .Private),
+                    .Boolean => this.coerce(value, .Boolean),
+                    .Array => this.coerce(value, .Array),
+                    .Object => this.coerce(value, .Object),
+                    .toJSON, .JSON => this.coerce(value, .JSON),
+                    .Integer => this.coerce(value, .Integer),
+                    .Double => this.coerce(value, .Double),
+                    .String => this.coerce(value, .String),
+                    .Promise => this.coerce(value, .Promise),
+                    else => brk: {
+                        const name = value.getClassInfoName() orelse "unknown";
 
-                pub fn run(
-                    this: *Run,
-                    value: JSC.JSValue,
-                ) MacroError!Expr {
-                    return try switch (JSC.ZigConsoleClient.Formatter.Tag.get(value, this.global).tag) {
-                        .Error => this.coerce(value, .Error),
-                        .Undefined => this.coerce(value, .Undefined),
-                        .Null => this.coerce(value, .Null),
-                        .Private => this.coerce(value, .Private),
-                        .Boolean => this.coerce(value, .Boolean),
-                        .Array => this.coerce(value, .Array),
-                        .Object => this.coerce(value, .Object),
-                        .JSON => this.coerce(value, .JSON),
-                        .Integer => this.coerce(value, .Integer),
-                        .Double => this.coerce(value, .Double),
-                        .String => this.coerce(value, .String),
-                        .Promise => this.coerce(value, .Promise),
-                        else => brk: {
-                            this.log.addErrorFmt(
-                                this.source,
-                                this.caller.loc,
-                                this.allocator,
-                                "cannot coerce {s} to Bun's AST. Please return a valid macro using the JSX syntax",
-                                .{@tagName(value.jsType())},
-                            ) catch unreachable;
-                            break :brk error.MacroFailed;
-                        },
-                    };
-                }
+                        this.log.addErrorFmt(
+                            this.source,
+                            this.caller.loc,
+                            this.allocator,
+                            "cannot coerce {s} ({s}) to Bun's AST. Please return a simpler type",
+                            .{ name, @tagName(value.jsType()) },
+                        ) catch unreachable;
+                        break :brk error.MacroFailed;
+                    },
+                };
+            }
 
-                pub fn coerce(
-                    this: *Run,
-                    value: JSC.JSValue,
-                    comptime tag: JSC.ZigConsoleClient.Formatter.Tag,
-                ) MacroError!Expr {
-                    switch (comptime tag) {
-                        .Error => {
-                            this.macro.vm.runErrorHandler(value, null);
-                            return this.caller;
-                        },
-                        .Undefined => if (this.is_top_level)
-                            return this.caller
-                        else
-                            return Expr.init(E.Undefined, E.Undefined{}, this.caller.loc),
-                        .Null => return Expr.init(E.Null, E.Null{}, this.caller.loc),
-                        .Private => {
-                            this.is_top_level = false;
-                            var _entry = this.visited.getOrPut(this.allocator, value) catch unreachable;
-                            if (_entry.found_existing) {
-                                return _entry.value_ptr.*;
+            pub fn coerce(
+                this: *Run,
+                value: JSC.JSValue,
+                comptime tag: JSC.ConsoleObject.Formatter.Tag,
+            ) MacroError!Expr {
+                switch (comptime tag) {
+                    .Error => {
+                        _ = this.macro.vm.uncaughtException(this.global, value, false);
+                        return this.caller;
+                    },
+                    .Undefined => if (this.is_top_level)
+                        return this.caller
+                    else
+                        return Expr.init(E.Undefined, E.Undefined{}, this.caller.loc),
+                    .Null => return Expr.init(E.Null, E.Null{}, this.caller.loc),
+                    .Private => {
+                        this.is_top_level = false;
+                        const _entry = this.visited.getOrPut(this.allocator, value) catch unreachable;
+                        if (_entry.found_existing) {
+                            return _entry.value_ptr.*;
+                        }
+
+                        var blob_: ?JSC.WebCore.Blob = null;
+                        const mime_type: ?MimeType = null;
+
+                        if (value.jsType() == .DOMWrapper) {
+                            if (value.as(JSC.WebCore.Response)) |resp| {
+                                return this.run(resp.getBlobWithoutCallFrame(this.global));
+                            } else if (value.as(JSC.WebCore.Request)) |resp| {
+                                return this.run(resp.getBlobWithoutCallFrame(this.global));
+                            } else if (value.as(JSC.WebCore.Blob)) |resp| {
+                                blob_ = resp.*;
+                                blob_.?.allocator = null;
+                            } else if (value.as(JSC.ResolveMessage) != null or value.as(JSC.BuildMessage) != null) {
+                                _ = this.macro.vm.uncaughtException(this.global, value, false);
+                                return error.MacroFailed;
                             }
-                            var private_data = JSCBase.JSPrivateDataPtr.from(JSC.C.JSObjectGetPrivate(value.asObjectRef()).?);
-                            var blob_: ?JSC.WebCore.Blob = null;
-                            var mime_type: ?HTTP.MimeType = null;
+                        }
 
-                            switch (private_data.tag()) {
-                                .JSNode => {
-                                    var node = private_data.as(JSNode);
-                                    _entry.value_ptr.* = node.toExpr();
-                                    node.visited = true;
-                                    node.updateSymbolsMap(Visitor, this.visitor);
-                                    return _entry.value_ptr.*;
-                                },
-                                .ResolveError, .BuildError => {
-                                    this.macro.vm.runErrorHandler(value, null);
+                        if (blob_) |*blob| {
+                            const out_expr = Expr.fromBlob(
+                                blob,
+                                this.allocator,
+                                mime_type,
+                                this.log,
+                                this.caller.loc,
+                            ) catch {
+                                blob.deinit();
+                                return error.MacroFailed;
+                            };
+                            if (out_expr.data == .e_string) {
+                                blob.deinit();
+                            }
+
+                            return out_expr;
+                        }
+
+                        return Expr.init(E.String, E.String.empty, this.caller.loc);
+                    },
+
+                    .Boolean => {
+                        return Expr{ .data = .{ .e_boolean = .{ .value = value.toBoolean() } }, .loc = this.caller.loc };
+                    },
+                    JSC.ConsoleObject.Formatter.Tag.Array => {
+                        this.is_top_level = false;
+
+                        const _entry = this.visited.getOrPut(this.allocator, value) catch unreachable;
+                        if (_entry.found_existing) {
+                            switch (_entry.value_ptr.*.data) {
+                                .e_object, .e_array => {
+                                    this.log.addErrorFmt(this.source, this.caller.loc, this.allocator, "converting circular structure to Bun AST is not implemented yet", .{}) catch unreachable;
                                     return error.MacroFailed;
-                                },
-                                .Request => {
-                                    var req: *JSC.WebCore.Request = private_data.as(JSC.WebCore.Request);
-                                    blob_ = req.body.use();
-                                    mime_type = HTTP.MimeType.init(req.mimeType());
-                                },
-                                .Response => {
-                                    var res: *JSC.WebCore.Response = private_data.as(JSC.WebCore.Response);
-                                    blob_ = res.body.use();
-                                    mime_type =
-                                        HTTP.MimeType.init(res.mimeType(null));
-                                },
-                                .Blob => {
-                                    var blob = private_data.as(JSC.WebCore.Blob);
-                                    blob_ = blob.*;
-                                    blob.* = JSC.WebCore.Blob.initEmpty(blob.globalThis);
                                 },
                                 else => {},
                             }
+                            return _entry.value_ptr.*;
+                        }
 
-                            if (blob_) |*blob| {
-                                const out_expr = Expr.fromBlob(
-                                    blob,
-                                    this.allocator,
-                                    mime_type,
-                                    this.log,
-                                    this.caller.loc,
-                                ) catch {
-                                    blob.deinit();
-                                    return error.MacroFailed;
-                                };
-                                if (out_expr.data == .e_string) {
-                                    blob.deinit();
-                                }
-
-                                return out_expr;
-                            }
-
-                            return Expr.init(E.String, E.String.empty, this.caller.loc);
-                        },
-
-                        .Boolean => {
-                            return Expr{ .data = .{ .e_boolean = .{ .value = value.toBoolean() } }, .loc = this.caller.loc };
-                        },
-                        JSC.ZigConsoleClient.Formatter.Tag.Array => {
-                            this.is_top_level = false;
-
-                            var _entry = this.visited.getOrPut(this.allocator, value) catch unreachable;
-                            if (_entry.found_existing) {
-                                switch (_entry.value_ptr.*.data) {
-                                    .e_object, .e_array => {
-                                        this.log.addErrorFmt(this.source, this.caller.loc, this.allocator, "converting circular structure to Bun AST is not implemented yet", .{}) catch unreachable;
-                                        return error.MacroFailed;
-                                    },
-                                    else => {},
-                                }
-                                return _entry.value_ptr.*;
-                            }
-
-                            var iter = JSC.JSArrayIterator.init(value, this.global);
-                            if (iter.len == 0) {
-                                const result = Expr.init(
-                                    E.Array,
-                                    E.Array{
-                                        .items = ExprNodeList.init(&[_]Expr{}),
-                                        .was_originally_macro = true,
-                                    },
-                                    this.caller.loc,
-                                );
-                                _entry.value_ptr.* = result;
-                                return result;
-                            }
-                            var array = this.allocator.alloc(Expr, iter.len) catch unreachable;
-                            var out = Expr.init(
+                        var iter = JSC.JSArrayIterator.init(value, this.global);
+                        if (iter.len == 0) {
+                            const result = Expr.init(
                                 E.Array,
                                 E.Array{
-                                    .items = ExprNodeList.init(array[0..0]),
+                                    .items = ExprNodeList.init(&[_]Expr{}),
                                     .was_originally_macro = true,
                                 },
                                 this.caller.loc,
                             );
-                            _entry.value_ptr.* = out;
-
-                            errdefer this.allocator.free(array);
-                            var i: usize = 0;
-                            while (iter.next()) |item| {
-                                array[i] = try this.run(item);
-                                if (array[i].isMissing())
-                                    continue;
-                                i += 1;
-                            }
-                            out.data.e_array.items = ExprNodeList.init(array);
-                            _entry.value_ptr.* = out;
-                            return out;
-                        },
-                        // TODO: optimize this
-                        JSC.ZigConsoleClient.Formatter.Tag.Object => {
-                            this.is_top_level = false;
-                            var _entry = this.visited.getOrPut(this.allocator, value) catch unreachable;
-                            if (_entry.found_existing) {
-                                switch (_entry.value_ptr.*.data) {
-                                    .e_object, .e_array => {
-                                        this.log.addErrorFmt(this.source, this.caller.loc, this.allocator, "converting circular structure to Bun AST is not implemented yet", .{}) catch unreachable;
-                                        return error.MacroFailed;
-                                    },
-                                    else => {},
-                                }
-                                return _entry.value_ptr.*;
-                            }
-
-                            var object = value.asObjectRef();
-                            var array = JSC.C.JSObjectCopyPropertyNames(this.global.ref(), object);
-                            defer JSC.C.JSPropertyNameArrayRelease(array);
-                            const count_ = JSC.C.JSPropertyNameArrayGetCount(array);
-                            var properties = this.allocator.alloc(G.Property, count_) catch unreachable;
-                            errdefer this.allocator.free(properties);
-                            var out = Expr.init(
-                                E.Object,
-                                E.Object{
-                                    .properties = BabyList(G.Property).init(properties),
-                                    .was_originally_macro = true,
-                                },
-                                this.caller.loc,
-                            );
-                            _entry.value_ptr.* = out;
-
-                            var i: usize = 0;
-                            while (i < count_) : (i += 1) {
-                                var property_name_ref = JSC.C.JSPropertyNameArrayGetNameAtIndex(array, i);
-                                defer JSC.C.JSStringRelease(property_name_ref);
-                                properties[i] = G.Property{
-                                    .key = Expr.init(E.String, E.String.init(this.allocator.dupe(
-                                        u8,
-                                        JSC.C.JSStringGetCharacters8Ptr(property_name_ref)[0..JSC.C.JSStringGetLength(property_name_ref)],
-                                    ) catch unreachable), this.caller.loc),
-                                    .value = try this.run(
-                                        JSC.JSValue.fromRef(JSC.C.JSObjectGetProperty(this.global.ref(), object, property_name_ref, null)),
-                                    ),
-                                };
-                            }
-                            out.data.e_object.properties = BabyList(G.Property).init(properties[0..i]);
-                            _entry.value_ptr.* = out;
-                            return out;
-                        },
-
-                        .JSON => {
-                            this.is_top_level = false;
-                            // if (console_tag.cell == .JSDate) {
-                            //     // in the code for printing dates, it never exceeds this amount
-                            //     var iso_string_buf = this.allocator.alloc(u8, 36) catch unreachable;
-                            //     var str = JSC.ZigString.init("");
-                            //     value.jsonStringify(this.global, 0, &str);
-                            //     var out_buf: []const u8 = std.fmt.bufPrint(iso_string_buf, "{}", .{str}) catch "";
-                            //     if (out_buf.len > 2) {
-                            //         // trim the quotes
-                            //         out_buf = out_buf[1 .. out_buf.len - 1];
-                            //     }
-                            //     return Expr.init(E.New, E.New{.target = Expr.init(E.Dot{.target = E}) })
-                            // }
-                        },
-
-                        .Integer => {
-                            return Expr.init(E.Number, E.Number{ .value = @intToFloat(f64, value.toInt32()) }, this.caller.loc);
-                        },
-                        .Double => {
-                            return Expr.init(E.Number, E.Number{ .value = value.asNumber() }, this.caller.loc);
-                        },
-                        .String => {
-                            var zig_str = value.getZigString(this.global);
-                            zig_str.detectEncoding();
-                            var sliced = zig_str.toSlice(this.allocator);
-                            return Expr.init(E.String, E.String.init(sliced.slice()), this.caller.loc);
-                        },
-                        .Promise => {
-                            var _entry = this.visited.getOrPut(this.allocator, value) catch unreachable;
-                            if (_entry.found_existing) {
-                                return _entry.value_ptr.*;
-                            }
-
-                            var promise = JSC.JSPromise.resolvedPromise(this.global, value);
-                            while (promise.status(this.global.vm()) == .Pending) {
-                                this.macro.vm.tick();
-                            }
-
-                            const rejected = promise.status(this.global.vm()) == .Rejected;
-                            const promise_result = promise.result(this.global.vm());
-
-                            if (promise_result.isUndefined() and this.is_top_level) {
-                                this.is_top_level = false;
-                                return this.caller;
-                            }
-
-                            if (rejected or promise_result.isError() or promise_result.isAggregateError(this.global) or promise_result.isException(this.global.vm())) {
-                                this.macro.vm.runErrorHandler(promise_result, null);
-                                return error.MacroFailed;
-                            }
-                            this.is_top_level = false;
-                            const result = try this.run(promise_result);
-
                             _entry.value_ptr.* = result;
                             return result;
-                        },
-                        else => {},
-                    }
+                        }
+                        var array = this.allocator.alloc(Expr, iter.len) catch unreachable;
+                        var out = Expr.init(
+                            E.Array,
+                            E.Array{
+                                .items = ExprNodeList.init(array[0..0]),
+                                .was_originally_macro = true,
+                            },
+                            this.caller.loc,
+                        );
+                        _entry.value_ptr.* = out;
 
-                    this.log.addErrorFmt(
-                        this.source,
-                        this.caller.loc,
-                        this.allocator,
-                        "cannot coerce {s} to Bun's AST. Please return a valid macro using the JSX syntax",
-                        .{@tagName(value.jsType())},
-                    ) catch unreachable;
-                    return error.MacroFailed;
+                        errdefer this.allocator.free(array);
+                        var i: usize = 0;
+                        while (iter.next()) |item| {
+                            array[i] = try this.run(item);
+                            if (array[i].isMissing())
+                                continue;
+                            i += 1;
+                        }
+                        out.data.e_array.items = ExprNodeList.init(array);
+                        _entry.value_ptr.* = out;
+                        return out;
+                    },
+                    // TODO: optimize this
+                    JSC.ConsoleObject.Formatter.Tag.Object => {
+                        this.is_top_level = false;
+                        const _entry = this.visited.getOrPut(this.allocator, value) catch unreachable;
+                        if (_entry.found_existing) {
+                            switch (_entry.value_ptr.*.data) {
+                                .e_object, .e_array => {
+                                    this.log.addErrorFmt(this.source, this.caller.loc, this.allocator, "converting circular structure to Bun AST is not implemented yet", .{}) catch unreachable;
+                                    return error.MacroFailed;
+                                },
+                                else => {},
+                            }
+                            return _entry.value_ptr.*;
+                        }
+
+                        var object_iter = try JSC.JSPropertyIterator(.{
+                            .skip_empty_name = false,
+                            .include_value = true,
+                        }).init(this.global, value);
+                        defer object_iter.deinit();
+                        var properties = this.allocator.alloc(G.Property, object_iter.len) catch unreachable;
+                        errdefer this.allocator.free(properties);
+                        var out = Expr.init(
+                            E.Object,
+                            E.Object{
+                                .properties = BabyList(G.Property).init(properties),
+                                .was_originally_macro = true,
+                            },
+                            this.caller.loc,
+                        );
+                        _entry.value_ptr.* = out;
+
+                        while (try object_iter.next()) |prop| {
+                            properties[object_iter.i] = G.Property{
+                                .key = Expr.init(E.String, E.String.init(prop.toOwnedSlice(this.allocator) catch unreachable), this.caller.loc),
+                                .value = try this.run(object_iter.value),
+                            };
+                        }
+                        out.data.e_object.properties = BabyList(G.Property).init(properties[0..object_iter.i]);
+                        _entry.value_ptr.* = out;
+                        return out;
+                    },
+
+                    .JSON => {
+                        this.is_top_level = false;
+                        // if (console_tag.cell == .JSDate) {
+                        //     // in the code for printing dates, it never exceeds this amount
+                        //     var iso_string_buf = this.allocator.alloc(u8, 36) catch unreachable;
+                        //     var str = JSC.ZigString.init("");
+                        //     value.jsonStringify(this.global, 0, &str);
+                        //     var out_buf: []const u8 = std.fmt.bufPrint(iso_string_buf, "{}", .{str}) catch "";
+                        //     if (out_buf.len > 2) {
+                        //         // trim the quotes
+                        //         out_buf = out_buf[1 .. out_buf.len - 1];
+                        //     }
+                        //     return Expr.init(E.New, E.New{.target = Expr.init(E.Dot{.target = E}) })
+                        // }
+                    },
+
+                    .Integer => {
+                        return Expr.init(E.Number, E.Number{ .value = @as(f64, @floatFromInt(value.toInt32())) }, this.caller.loc);
+                    },
+                    .Double => {
+                        return Expr.init(E.Number, E.Number{ .value = value.asNumber() }, this.caller.loc);
+                    },
+                    .String => {
+                        var bun_str = value.toBunString(this.global);
+                        defer bun_str.deref();
+
+                        // encode into utf16 so the printer escapes the string correctly
+                        var utf16_bytes = this.allocator.alloc(u16, bun_str.length()) catch unreachable;
+                        const out_slice = utf16_bytes[0 .. (bun_str.encodeInto(std.mem.sliceAsBytes(utf16_bytes), .utf16le) catch 0) / 2];
+                        return Expr.init(E.String, E.String.init(out_slice), this.caller.loc);
+                    },
+                    .Promise => {
+                        const _entry = this.visited.getOrPut(this.allocator, value) catch unreachable;
+                        if (_entry.found_existing) {
+                            return _entry.value_ptr.*;
+                        }
+
+                        const promise = value.asAnyPromise() orelse @panic("Unexpected promise type");
+
+                        this.macro.vm.waitForPromise(promise);
+
+                        const promise_result = promise.result(this.macro.vm.jsc);
+                        const rejected = promise.status(this.macro.vm.jsc) == .rejected;
+
+                        if (promise_result.isUndefined() and this.is_top_level) {
+                            this.is_top_level = false;
+                            return this.caller;
+                        }
+
+                        if (rejected or promise_result.isError() or promise_result.isAggregateError(this.global) or promise_result.isException(this.global.vm())) {
+                            _ = this.macro.vm.unhandledRejection(this.global, promise_result, promise.asValue(this.global));
+                            return error.MacroFailed;
+                        }
+                        this.is_top_level = false;
+                        const result = try this.run(promise_result);
+
+                        _entry.value_ptr.* = result;
+                        return result;
+                    },
+                    else => {},
                 }
-            };
-        }
+
+                this.log.addErrorFmt(
+                    this.source,
+                    this.caller.loc,
+                    this.allocator,
+                    "cannot coerce {s} to Bun's AST. Please return a simpler type",
+                    .{@tagName(value.jsType())},
+                ) catch unreachable;
+                return error.MacroFailed;
+            }
+        };
 
         pub fn run(
             macro: Macro,
@@ -8050,48 +8442,343 @@ pub const Macro = struct {
             allocator: std.mem.Allocator,
             function_name: string,
             caller: Expr,
-            _: []Expr,
             source: *const logger.Source,
             id: i32,
-            comptime Visitor: type,
-            visitor: Visitor,
             javascript_object: JSC.JSValue,
         ) MacroError!Expr {
             if (comptime Environment.isDebug) Output.prettyln("<r><d>[macro]<r> call <d><b>{s}<r>", .{function_name});
 
             exception_holder = Zig.ZigException.Holder.init();
-            expr_nodes_buf[0] = JSNode.initExpr(caller);
-            args_buf[0] = JSNode.Class.make(
-                macro.vm.global.ref(),
-                &expr_nodes_buf[0],
-            );
-            args_buf[1] = if (javascript_object.isEmpty()) null else javascript_object.asObjectRef();
-            args_buf[2] = null;
-            const Run = NewRun(Visitor);
+            var js_args: []JSC.JSValue = &.{};
+            var js_processed_args_len: usize = 0;
+            defer {
+                for (js_args[0..js_processed_args_len -| @as(usize, @intFromBool(javascript_object != .zero))]) |arg| {
+                    arg.unprotect();
+                }
 
-            // Give it >= 256 KB stack space
-            // Cast to usize to ensure we get an 8 byte aligned pointer
-            const PooledFrame = ObjectPool([@maximum(@sizeOf(@Frame(Run.runAsync)), 256_000) / @sizeOf(usize)]usize, null, true, 1);
-            var pooled_frame = PooledFrame.get(default_allocator);
-            defer pooled_frame.release();
+                allocator.free(js_args);
+            }
 
-            var result: MacroError!Expr = error.MacroFailed;
+            const globalObject = JSC.VirtualMachine.get().global;
 
-            _ = nosuspend @asyncCall(std.mem.asBytes(&pooled_frame.data), &result, Run.runAsync, .{
+            switch (caller.data) {
+                .e_call => |call| {
+                    const call_args: []Expr = call.args.slice();
+                    js_args = try allocator.alloc(JSC.JSValue, call_args.len + @as(usize, @intFromBool(javascript_object != .zero)));
+                    js_processed_args_len = js_args.len;
+
+                    for (0.., call_args, js_args[0..call_args.len]) |i, in, *out| {
+                        const value = in.toJS(
+                            allocator,
+                            globalObject,
+                        ) catch |e| {
+                            // Keeping a separate variable instead of modifying js_args.len
+                            // due to allocator.free call in defer
+                            js_processed_args_len = i;
+                            return e;
+                        };
+                        value.protect();
+                        out.* = value;
+                    }
+                },
+                .e_template => {
+                    @panic("TODO: support template literals in macros");
+                },
+                else => {
+                    @panic("Unexpected caller type");
+                },
+            }
+
+            if (javascript_object != .zero) {
+                if (js_args.len == 0) {
+                    js_args = try allocator.alloc(JSC.JSValue, 1);
+                }
+
+                js_args[js_args.len - 1] = javascript_object;
+            }
+
+            const CallFunction = @TypeOf(Run.runAsync);
+            const CallArgs = std.meta.ArgsTuple(CallFunction);
+            const CallData = struct {
+                threadlocal var call_args: CallArgs = undefined;
+                threadlocal var result: MacroError!Expr = undefined;
+                pub fn callWrapper(args: CallArgs) MacroError!Expr {
+                    JSC.markBinding(@src());
+                    call_args = args;
+                    Bun__startMacro(&call, JSC.VirtualMachine.get().global);
+                    return result;
+                }
+
+                pub fn call() callconv(.C) void {
+                    const call_args_copy = call_args;
+                    const local_result = @call(.auto, Run.runAsync, call_args_copy);
+                    result = local_result;
+                }
+            };
+
+            // TODO: can change back to `return CallData.callWrapper(.{`
+            // when https://github.com/ziglang/zig/issues/16242 is fixed
+            return CallData.callWrapper(CallArgs{
                 macro,
                 log,
                 allocator,
                 function_name,
                 caller,
-                2 + @as(usize, @boolToInt(!javascript_object.isEmpty())),
+                js_args,
                 source,
                 id,
-                visitor,
             });
-            return result;
         }
+
+        extern "C" fn Bun__startMacro(function: *const anyopaque, *anyopaque) void;
     };
 };
+
+pub const ASTMemoryAllocator = struct {
+    const SFA = std.heap.StackFallbackAllocator(@min(8192, std.mem.page_size));
+
+    stack_allocator: SFA = undefined,
+    bump_allocator: std.mem.Allocator = undefined,
+    allocator: std.mem.Allocator,
+    previous: ?*ASTMemoryAllocator = null,
+
+    pub fn reset(this: *ASTMemoryAllocator) void {
+        this.stack_allocator = SFA{
+            .buffer = undefined,
+            .fallback_allocator = this.allocator,
+            .fixed_buffer_allocator = undefined,
+        };
+        this.bump_allocator = this.stack_allocator.get();
+    }
+
+    pub fn push(this: *ASTMemoryAllocator) void {
+        Stmt.Data.Store.memory_allocator = this;
+        Expr.Data.Store.memory_allocator = this;
+    }
+
+    pub fn pop(this: *ASTMemoryAllocator) void {
+        const prev = this.previous;
+        bun.assert(prev != this);
+        Stmt.Data.Store.memory_allocator = prev;
+        Expr.Data.Store.memory_allocator = prev;
+        this.previous = null;
+    }
+
+    pub fn append(this: ASTMemoryAllocator, comptime ValueType: type, value: anytype) *ValueType {
+        const ptr = this.bump_allocator.create(ValueType) catch unreachable;
+        ptr.* = value;
+        return ptr;
+    }
+};
+
+pub const UseDirective = enum(u2) {
+    // TODO: Remove this, and provide `UseDirective.Optional` instead
+    none,
+    /// "use client"
+    client,
+    /// "use server"
+    server,
+
+    pub const Boundering = enum(u2) {
+        client = @intFromEnum(UseDirective.client),
+        server = @intFromEnum(UseDirective.server),
+    };
+
+    pub const Flags = struct {
+        has_any_client: bool = false,
+    };
+
+    pub fn isBoundary(this: UseDirective, other: UseDirective) bool {
+        if (this == other or other == .none)
+            return false;
+
+        return true;
+    }
+
+    pub fn boundering(this: UseDirective, other: UseDirective) ?Boundering {
+        if (this == other or other == .none)
+            return null;
+        return @enumFromInt(@intFromEnum(other));
+    }
+
+    pub fn parse(contents: []const u8) ?UseDirective {
+        const truncated = std.mem.trimLeft(u8, contents, " \t\n\r;");
+
+        if (truncated.len < "'use client';".len)
+            return .none;
+
+        const directive_string = truncated[0.."'use client';".len].*;
+
+        const first_quote = directive_string[0];
+        const last_quote = directive_string[directive_string.len - 2];
+        if (first_quote != last_quote or (first_quote != '"' and first_quote != '\'' and first_quote != '`'))
+            return .none;
+
+        const unquoted = directive_string[1 .. directive_string.len - 2];
+
+        if (strings.eqlComptime(unquoted, "use client")) {
+            return .client;
+        }
+
+        if (strings.eqlComptime(unquoted, "use server")) {
+            return .server;
+        }
+
+        return null;
+    }
+};
+
+/// Represents a boundary between client and server code. Every boundary
+/// gets bundled twice, once for the desired target, and once to generate
+/// a module of "references". Specifically, the generated file takes the
+/// canonical Ast as input to derive a wrapper. See `Framework.ServerComponents`
+/// for more details about this generated file.
+///
+/// This is sometimes abbreviated as SCB
+pub const ServerComponentBoundary = struct {
+    use_directive: UseDirective,
+
+    /// The index of the original file.
+    source_index: Index.Int,
+
+    /// Index to the file imported on the opposite platform, which is
+    /// generated by the bundler. For client components, this is the
+    /// server's code. For server actions, this is the client's code.
+    reference_source_index: Index.Int,
+
+    /// When `bake.Framework.ServerComponents.separate_ssr_graph` is enabled this
+    /// points to the separated module. When the SSR graph is not separate, this is
+    /// equal to `reference_source_index`
+    //
+    // TODO: Is this used for server actions.
+    ssr_source_index: Index.Int,
+
+    /// The requirements for this data structure is to have reasonable lookup
+    /// speed, but also being able to pull a `[]const Index.Int` of all
+    /// boundaries for iteration.
+    pub const List = struct {
+        list: std.MultiArrayList(ServerComponentBoundary) = .{},
+        /// Used to facilitate fast lookups into `items` by `.source_index`
+        map: Map = .{},
+
+        const Map = std.ArrayHashMapUnmanaged(void, void, struct {}, true);
+
+        /// Can only be called on the bundler thread.
+        pub fn put(
+            m: *List,
+            allocator: std.mem.Allocator,
+            source_index: Index.Int,
+            use_directive: UseDirective,
+            reference_source_index: Index.Int,
+            ssr_source_index: Index.Int,
+        ) !void {
+            try m.list.append(allocator, .{
+                .source_index = source_index,
+                .use_directive = use_directive,
+                .reference_source_index = reference_source_index,
+                .ssr_source_index = ssr_source_index,
+            });
+            const gop = try m.map.getOrPutAdapted(
+                allocator,
+                source_index,
+                Adapter{ .list = m.list.slice() },
+            );
+            bun.assert(!gop.found_existing);
+        }
+
+        /// Can only be called on the bundler thread.
+        pub fn getIndex(l: *const List, real_source_index: Index.Int) ?usize {
+            return l.map.getIndexAdapted(
+                real_source_index,
+                Adapter{ .list = l.list.slice() },
+            );
+        }
+
+        /// Use this to improve speed of accessing fields at the cost of
+        /// storing more pointers. Invalidated when input is mutated.
+        pub fn slice(l: List) Slice {
+            return .{ .list = l.list.slice(), .map = l.map };
+        }
+
+        pub const Slice = struct {
+            list: std.MultiArrayList(ServerComponentBoundary).Slice,
+            map: Map,
+
+            pub fn getIndex(l: *const Slice, real_source_index: Index.Int) ?usize {
+                return l.map.getIndexAdapted(
+                    real_source_index,
+                    Adapter{ .list = l.list },
+                ) orelse return null;
+            }
+
+            pub fn getReferenceSourceIndex(l: *const Slice, real_source_index: Index.Int) ?u32 {
+                const i = l.map.getIndexAdapted(
+                    real_source_index,
+                    Adapter{ .list = l.list },
+                ) orelse return null;
+                bun.unsafeAssert(l.list.capacity > 0); // optimize MultiArrayList.Slice.items
+                return l.list.items(.reference_source_index)[i];
+            }
+
+            pub fn bitSet(scbs: Slice, alloc: std.mem.Allocator, input_file_count: usize) !bun.bit_set.DynamicBitSetUnmanaged {
+                var scb_bitset = try bun.bit_set.DynamicBitSetUnmanaged.initEmpty(alloc, input_file_count);
+                for (scbs.list.items(.source_index)) |source_index| {
+                    scb_bitset.set(source_index);
+                }
+                return scb_bitset;
+            }
+        };
+
+        pub const Adapter = struct {
+            list: std.MultiArrayList(ServerComponentBoundary).Slice,
+
+            pub fn hash(_: Adapter, key: Index.Int) u32 {
+                return std.hash.uint32(key);
+            }
+
+            pub fn eql(adapt: Adapter, a: Index.Int, _: void, b_index: usize) bool {
+                bun.unsafeAssert(adapt.list.capacity > 0); // optimize MultiArrayList.Slice.items
+                return a == adapt.list.items(.source_index)[b_index];
+            }
+        };
+    };
+};
+
+pub const GlobalStoreHandle = struct {
+    prev_memory_allocator: ?*ASTMemoryAllocator = null,
+
+    var global_store_ast: ?*ASTMemoryAllocator = null;
+    var global_store_threadsafe: std.heap.ThreadSafeAllocator = undefined;
+
+    pub fn get() ?*ASTMemoryAllocator {
+        if (global_store_ast == null) {
+            var global = bun.default_allocator.create(ASTMemoryAllocator) catch unreachable;
+            global.allocator = bun.default_allocator;
+            global.bump_allocator = bun.default_allocator;
+            global_store_ast = global;
+        }
+
+        const prev = Stmt.Data.Store.memory_allocator;
+        Stmt.Data.Store.memory_allocator = global_store_ast;
+        Expr.Data.Store.memory_allocator = global_store_ast;
+        return prev;
+    }
+
+    pub fn unget(handle: ?*ASTMemoryAllocator) void {
+        Stmt.Data.Store.memory_allocator = handle;
+        Expr.Data.Store.memory_allocator = handle;
+    }
+};
+
+extern fn JSC__jsToNumber(latin1_ptr: [*]const u8, len: usize) f64;
+
+fn stringToEquivalentNumberValue(str: []const u8) f64 {
+    // +"" -> 0
+    if (str.len == 0) return 0;
+    if (!bun.strings.isAllASCII(str))
+        return std.math.nan(f64);
+    return JSC__jsToNumber(str.ptr, str.len);
+}
 
 // test "Binding.init" {
 //     var binding = Binding.alloc(
@@ -8205,7 +8892,7 @@ pub const Macro = struct {
 //     printmem("E.Await:                   {d} bits\n", .{@bitSizeOf(E.Await)});
 //     printmem("E.Yield:                   {d} bits\n", .{@bitSizeOf(E.Yield)});
 //     printmem("E.If:                      {d} bits\n", .{@bitSizeOf(E.If)});
-//     printmem("E.RequireOrRequireResolve: {d} bits\n", .{@bitSizeOf(E.RequireOrRequireResolve)});
+//     printmem("E.RequireResolveString: {d} bits\n", .{@bitSizeOf(E.RequireResolveString)});
 //     printmem("E.Import:                  {d} bits\n", .{@bitSizeOf(E.Import)});
 //     printmem("----------Expr:            {d} bits\n", .{@bitSizeOf(Expr)});
 // }
@@ -8281,3 +8968,12 @@ pub const Macro = struct {
 // Stmt               | 192
 // STry               | 384
 // -- ESBuild bit sizes
+
+const ToJSError = error{
+    @"Cannot convert argument type to JS",
+    @"Cannot convert identifier to JS. Try a statically-known value",
+    MacroError,
+    OutOfMemory,
+};
+
+const writeAnyToHasher = bun.writeAnyToHasher;

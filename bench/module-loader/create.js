@@ -23,7 +23,7 @@ export const hello${i} = "hello${i}";
 ${saveStack ? `globalThis.evaluationOrder.push("${file}");` : ""}
 globalThis.counter++;
 `,
-    "utf8"
+    "utf8",
   );
   var file2 = output + "/file" + i + ".js";
 
@@ -39,7 +39,7 @@ module.exports.hello${i} = "hello${i}";
 ${saveStack ? `globalThis.evaluationOrder.push("${file2}");` : ""}
 globalThis.counter++;
 `,
-    "utf8"
+    "utf8",
   );
 }
 
@@ -47,26 +47,18 @@ fs.writeFileSync(
   output + `/file${count}.mjs`,
   `
     export const THE_END = true;
-  ${
-    saveStack
-      ? `globalThis.evaluationOrder.push("${output}/file${count}.mjs");`
-      : ""
-  }    
+  ${saveStack ? `globalThis.evaluationOrder.push("${output}/file${count}.mjs");` : ""}    
 `,
-  "utf8"
+  "utf8",
 );
 
 fs.writeFileSync(
   output + `/file${count}.js`,
   `
       module.exports.THE_END = true;
-      ${
-        saveStack
-          ? `globalThis.evaluationOrder.push("${output}/file${count}.js");`
-          : ""
-      }
+      ${saveStack ? `globalThis.evaluationOrder.push("${output}/file${count}.js");` : ""}
       `,
-  "utf8"
+  "utf8",
 );
 
 fs.writeFileSync(
@@ -79,7 +71,7 @@ fs.writeFileSync(
   console.timeEnd("import");
   ${saveStack ? `console.log(globalThis.evaluationOrder.join("\\n"));` : ""}
   console.log("Loaded", globalThis.counter, "files", "totaling", new Intl.NumberFormat().format(globalThis.exportCounter), 'exports');`,
-  "utf8"
+  "utf8",
 );
 
 fs.writeFileSync(
@@ -92,7 +84,7 @@ export const THE_END = Foo.THE_END;
 console.timeEnd("import.meta.require");
 ${saveStack ? `console.log(globalThis.evaluationOrder.join("\\n"));` : ""}
 console.log("Loaded", globalThis.counter, "files", "totaling", new Intl.NumberFormat().format(globalThis.exportCounter), 'exports');`,
-  "utf8"
+  "utf8",
 );
 
 fs.writeFileSync(
@@ -106,7 +98,7 @@ fs.writeFileSync(
   console.timeEnd("import.meta.require");
   ${saveStack ? `console.log(globalThis.evaluationOrder.join("\\n"));` : ""}
   console.log("Loaded", globalThis.counter, "files", "totaling", new Intl.NumberFormat().format(globalThis.exportCounter), 'exports');`,
-  "utf8"
+  "utf8",
 );
 
 fs.writeFileSync(
@@ -120,7 +112,7 @@ fs.writeFileSync(
   ${saveStack ? `console.log(globalThis.evaluationOrder.join("\\n"));` : ""}
   console.log("Loaded", globalThis.counter, "files", "totaling", new Intl.NumberFormat().format(globalThis.exportCounter), 'exports');
   `,
-  "utf8"
+  "utf8",
 );
 
 console.log(`

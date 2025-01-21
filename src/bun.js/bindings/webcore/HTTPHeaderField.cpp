@@ -29,8 +29,17 @@
 namespace WebCore {
 
 namespace RFC7230 {
-    
+
 bool isTokenCharacter(UChar c)
+{
+    return c < 0x80 && isTokenCharacter(static_cast<LChar>(c));
+}
+bool isDelimiter(UChar c)
+{
+    return c < 0x80 && isDelimiter(static_cast<LChar>(c));
+}
+
+bool isTokenCharacter(LChar c)
 {
     return isASCIIAlpha(c) || isASCIIDigit(c)
         || c == '!' || c == '#' || c == '$'
@@ -40,7 +49,7 @@ bool isTokenCharacter(UChar c)
         || c == '`' || c == '|' || c == '~';
 }
 
-bool isDelimiter(UChar c)
+bool isDelimiter(LChar c)
 {
     return c == '(' || c == ')' || c == ','
         || c == '/' || c == ':' || c == ';'
@@ -118,7 +127,7 @@ static bool isValidValue(StringView value)
     State state = State::OptionalWhitespace;
     size_t commentDepth = 0;
     bool hadNonWhitespace = false;
-    
+
     for (size_t i = 0; i < value.length(); ++i) {
         UChar c = value[i];
         switch (state) {
@@ -141,7 +150,7 @@ static bool isValidValue(StringView value)
                 continue;
             }
             return false;
-            
+
         case State::Token:
             if (isTokenCharacter(c))
                 continue;
@@ -187,7 +196,7 @@ static bool isValidValue(StringView value)
             continue;
         }
     }
-    
+
     switch (state) {
     case State::OptionalWhitespace:
     case State::Token:
@@ -204,14 +213,14 @@ static bool isValidValue(StringView value)
 
 std::optional<HTTPHeaderField> HTTPHeaderField::create(String&& unparsedName, String&& unparsedValue)
 {
-    StringView strippedName = StringView(unparsedName).stripLeadingAndTrailingMatchedCharacters(RFC7230::isWhitespace);
-    StringView strippedValue = StringView(unparsedValue).stripLeadingAndTrailingMatchedCharacters(RFC7230::isWhitespace);
-    if (!RFC7230::isValidName(strippedName) || !RFC7230::isValidValue(strippedValue))
+    auto trimmedName = StringView(unparsedName).trim(isTabOrSpace<UChar>);
+    auto trimmedValue = StringView(unparsedValue).trim(isTabOrSpace<UChar>);
+    if (!RFC7230::isValidName(trimmedName) || !RFC7230::isValidValue(trimmedValue))
         return std::nullopt;
 
-    String name = strippedName.length() == unparsedName.length() ? WTFMove(unparsedName) : strippedName.toString();
-    String value = strippedValue.length() == unparsedValue.length() ? WTFMove(unparsedValue) : strippedValue.toString();
-    return {{ WTFMove(name), WTFMove(value) }};
+    auto name = trimmedName.length() == unparsedName.length() ? WTFMove(unparsedName) : trimmedName.toString();
+    auto value = trimmedValue.length() == unparsedValue.length() ? WTFMove(unparsedValue) : trimmedValue.toString();
+    return { { WTFMove(name), WTFMove(value) } };
 }
 
 }

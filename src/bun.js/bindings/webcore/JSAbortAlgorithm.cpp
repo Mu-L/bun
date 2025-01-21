@@ -24,6 +24,7 @@
 #include "JSDOMConvertBase.h"
 #include "JSDOMExceptionHandling.h"
 #include "ScriptExecutionContext.h"
+#include "DeleteCallbackDataTask.h"
 
 namespace WebCore {
 using namespace JSC;
@@ -49,7 +50,7 @@ JSAbortAlgorithm::~JSAbortAlgorithm()
 #endif
 }
 
-CallbackResult<typename IDLUndefined::ImplementationType> JSAbortAlgorithm::handleEvent()
+CallbackResult<typename IDLUndefined::ImplementationType> JSAbortAlgorithm::handleEvent(JSValue value)
 {
     if (!canInvokeCallback())
         return CallbackResultType::UnableToExecute;
@@ -63,6 +64,7 @@ CallbackResult<typename IDLUndefined::ImplementationType> JSAbortAlgorithm::hand
     auto& lexicalGlobalObject = globalObject;
     JSValue thisValue = jsUndefined();
     MarkedArgumentBuffer args;
+    args.append(value);
     ASSERT(!args.hasOverflowed());
 
     NakedPtr<JSC::Exception> returnedException;

@@ -36,6 +36,7 @@
 #include <wtf/URL.h>
 #include <wtf/HashSet.h>
 #include <wtf/Lock.h>
+#include "FetchHeaders.h"
 
 namespace uWS {
 template<bool, bool, typename>
@@ -59,6 +60,8 @@ public:
     static ExceptionOr<Ref<WebSocket>> create(ScriptExecutionContext&, const String& url);
     static ExceptionOr<Ref<WebSocket>> create(ScriptExecutionContext&, const String& url, const String& protocol);
     static ExceptionOr<Ref<WebSocket>> create(ScriptExecutionContext&, const String& url, const Vector<String>& protocols);
+    static ExceptionOr<Ref<WebSocket>> create(ScriptExecutionContext&, const String& url, const Vector<String>& protocols, std::optional<FetchHeaders::Init>&&);
+    static ExceptionOr<Ref<WebSocket>> create(ScriptExecutionContext& context, const String& url, const Vector<String>& protocols, std::optional<FetchHeaders::Init>&& headers, bool rejectUnauthorized);
     ~WebSocket();
 
     enum State {
@@ -66,19 +69,46 @@ public:
         OPEN = 1,
         CLOSING = 2,
         CLOSED = 3,
+    };
 
+    enum Opcode : unsigned char {
+        Continue = 0x0,
+        Text = 0x1,
+        Binary = 0x2,
+        Close = 0x8,
+        Ping = 0x9,
+        Pong = 0xA,
+    };
+
+    enum CleanStatus {
+        NotClean = 0,
+        Clean = 1,
     };
 
     ExceptionOr<void> connect(const String& url);
     ExceptionOr<void> connect(const String& url, const String& protocol);
     ExceptionOr<void> connect(const String& url, const Vector<String>& protocols);
+    ExceptionOr<void> connect(const String& url, const Vector<String>& protocols, std::optional<FetchHeaders::Init>&&);
 
     ExceptionOr<void> send(const String& message);
     ExceptionOr<void> send(JSC::ArrayBuffer&);
     ExceptionOr<void> send(JSC::ArrayBufferView&);
     // ExceptionOr<void> send(Blob&);
 
+    ExceptionOr<void> ping();
+    ExceptionOr<void> ping(const String& message);
+    ExceptionOr<void> ping(JSC::ArrayBuffer&);
+    ExceptionOr<void> ping(JSC::ArrayBufferView&);
+    // ExceptionOr<void> ping(Blob&);
+
+    ExceptionOr<void> pong();
+    ExceptionOr<void> pong(const String& message);
+    ExceptionOr<void> pong(JSC::ArrayBuffer&);
+    ExceptionOr<void> pong(JSC::ArrayBufferView&);
+    // ExceptionOr<void> ping(Blob&);
+
     ExceptionOr<void> close(std::optional<unsigned short> code, const String& reason);
+    ExceptionOr<void> terminate();
 
     const URL& url() const;
     State readyState() const;
@@ -95,68 +125,100 @@ public:
     using RefCounted::deref;
     using RefCounted::ref;
     void didConnect();
+    void disablePendingActivity();
     void didClose(unsigned unhandledBufferedAmount, unsigned short code, const String& reason);
     void didConnect(us_socket_t* socket, char* bufferedData, size_t bufferedDataSize);
     void didFailWithErrorCode(int32_t code);
 
     void didReceiveMessage(String&& message);
     void didReceiveData(const char* data, size_t length);
-    void didReceiveBinaryData(Vector<uint8_t>&&);
+    void didReceiveBinaryData(const AtomString& eventName, const std::span<const uint8_t> binaryData);
+
+    void updateHasPendingActivity();
+    bool hasPendingActivity() const
+    {
+        return m_hasPendingActivity.load();
+    }
+
+    void setRejectUnauthorized(bool rejectUnauthorized)
+    {
+        m_rejectUnauthorized = rejectUnauthorized;
+    }
+
+    bool rejectUnauthorized() const
+    {
+        return m_rejectUnauthorized;
+    }
+
+    void incPendingActivityCount()
+    {
+        ASSERT(m_pendingActivityCount < std::numeric_limits<size_t>::max());
+        m_pendingActivityCount++;
+        ref();
+        updateHasPendingActivity();
+    }
+
+    void decPendingActivityCount()
+    {
+        ASSERT(m_pendingActivityCount > 0);
+        m_pendingActivityCount--;
+        deref();
+        updateHasPendingActivity();
+    }
+
+    size_t memoryCost() const;
 
 private:
     typedef union AnyWebSocket {
         WebSocketClient* client;
         WebSocketClientTLS* clientSSL;
-        uWS::WebSocket<false, true, WebCore::WebSocket*>* server;
-        uWS::WebSocket<true, true, WebCore::WebSocket*>* serverSSL;
     } AnyWebSocket;
     enum ConnectedWebSocketKind {
         None,
         Client,
         ClientSSL,
-        Server,
-        ServerSSL
     };
+
+    std::atomic<bool> m_hasPendingActivity { true };
 
     explicit WebSocket(ScriptExecutionContext&);
     explicit WebSocket(ScriptExecutionContext&, const String& url);
-
-    void dispatchErrorEventIfNeeded();
-
-    // void contextDestroyed() final;
-    // void suspend(ReasonForSuspension) final;
-    // void resume() final;
-    // void stop() final;
-    // const char* activeDOMObjectName() const final;
 
     EventTargetInterface eventTargetInterface() const final;
 
     void refEventTarget() final { ref(); }
     void derefEventTarget() final { deref(); }
 
-    void didReceiveMessageError(WTF::StringImpl::StaticStringImpl* reason);
+    void didReceiveClose(CleanStatus wasClean, unsigned short code, WTF::String reason, bool isConnectionError = false);
     void didUpdateBufferedAmount(unsigned bufferedAmount);
     void didStartClosingHandshake();
 
-    void sendWebSocketString(const String& message);
-    void sendWebSocketData(const char* data, size_t length);
-
-    void failAsynchronously();
+    void sendWebSocketString(const String& message, const Opcode opcode);
+    void sendWebSocketData(const char* data, size_t length, const Opcode opcode);
 
     enum class BinaryType { Blob,
-        ArrayBuffer };
+        ArrayBuffer,
+        // non-standard:
+        NodeBuffer };
 
     State m_state { CONNECTING };
     URL m_url;
     unsigned m_bufferedAmount { 0 };
     unsigned m_bufferedAmountAfterClose { 0 };
-    BinaryType m_binaryType { BinaryType::ArrayBuffer };
+    // In browsers, the default is Blob, however most applications
+    // immediately change the default to ArrayBuffer.
+    //
+    // And since we know the typical usage is to override the default,
+    // we set NodeBuffer as the default to match the default of ServerWebSocket.
+    BinaryType m_binaryType { BinaryType::NodeBuffer };
     String m_subprotocol;
     String m_extensions;
     void* m_upgradeClient { nullptr };
     bool m_isSecure { false };
+    bool m_rejectUnauthorized { false };
     AnyWebSocket m_connectedWebSocket { nullptr };
     ConnectedWebSocketKind m_connectedWebSocketKind { ConnectedWebSocketKind::None };
+    size_t m_pendingActivityCount { 0 };
 
     bool m_dispatchedErrorEvent { false };
     // RefPtr<PendingActivity<WebSocket>> m_pendingActivity;

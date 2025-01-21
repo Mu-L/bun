@@ -95,7 +95,7 @@ STATIC_ASSERT_ISO_SUBSPACE_SHARABLE(JSWritableStreamPrototype, JSWritableStreamP
 
 using JSWritableStreamDOMConstructor = JSDOMConstructor<JSWritableStream>;
 
-template<> EncodedJSValue JSC_HOST_CALL_ATTRIBUTES JSWritableStreamDOMConstructor::construct(JSGlobalObject* lexicalGlobalObject, CallFrame* callFrame)
+template<> JSC::EncodedJSValue JSC_HOST_CALL_ATTRIBUTES JSWritableStreamDOMConstructor::construct(JSGlobalObject* lexicalGlobalObject, CallFrame* callFrame)
 {
     VM& vm = lexicalGlobalObject->vm();
     auto throwScope = DECLARE_THROW_SCOPE(vm);
@@ -103,10 +103,10 @@ template<> EncodedJSValue JSC_HOST_CALL_ATTRIBUTES JSWritableStreamDOMConstructo
     ASSERT(castedThis);
     EnsureStillAliveScope argument0 = callFrame->argument(0);
     auto underlyingSink = argument0.value().isUndefined() ? std::optional<Converter<IDLObject>::ReturnType>() : std::optional<Converter<IDLObject>::ReturnType>(convert<IDLObject>(*lexicalGlobalObject, argument0.value()));
-    RETURN_IF_EXCEPTION(throwScope, encodedJSValue());
+    RETURN_IF_EXCEPTION(throwScope, {});
     EnsureStillAliveScope argument1 = callFrame->argument(1);
     auto strategy = argument1.value().isUndefined() ? std::optional<Converter<IDLObject>::ReturnType>() : std::optional<Converter<IDLObject>::ReturnType>(convert<IDLObject>(*lexicalGlobalObject, argument1.value()));
-    RETURN_IF_EXCEPTION(throwScope, encodedJSValue());
+    RETURN_IF_EXCEPTION(throwScope, {});
     auto object = WritableStream::create(*castedThis->globalObject(), WTFMove(underlyingSink), WTFMove(strategy));
     if constexpr (IsExceptionOr<decltype(object)>)
         RETURN_IF_EXCEPTION(throwScope, {});
@@ -140,11 +140,11 @@ template<> void JSWritableStreamDOMConstructor::initializeProperties(VM& vm, JSD
 /* Hash table for prototype */
 
 static const HashTableValue JSWritableStreamPrototypeTableValues[] = {
-    { "constructor"_s, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum), NoIntrinsic, { (intptr_t) static_cast<PropertySlot::GetValueFunc>(jsWritableStreamConstructor), (intptr_t) static_cast<PutPropertySlot::PutValueFunc>(0) } },
-    { "locked"_s, static_cast<unsigned>(JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::CustomAccessor | JSC::PropertyAttribute::DOMAttribute), NoIntrinsic, { (intptr_t) static_cast<PropertySlot::GetValueFunc>(jsWritableStream_locked), (intptr_t) static_cast<PutPropertySlot::PutValueFunc>(0) } },
-    { "abort"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { (intptr_t) static_cast<RawNativeFunction>(jsWritableStreamPrototypeFunction_abort), (intptr_t)(0) } },
-    { "close"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { (intptr_t) static_cast<RawNativeFunction>(jsWritableStreamPrototypeFunction_close), (intptr_t)(0) } },
-    { "getWriter"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { (intptr_t) static_cast<RawNativeFunction>(jsWritableStreamPrototypeFunction_getWriter), (intptr_t)(0) } },
+    { "constructor"_s, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum), NoIntrinsic, { HashTableValue::GetterSetterType, jsWritableStreamConstructor, 0 } },
+    { "locked"_s, static_cast<unsigned>(JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::CustomAccessor | JSC::PropertyAttribute::DOMAttribute), NoIntrinsic, { HashTableValue::GetterSetterType, jsWritableStream_locked, 0 } },
+    { "abort"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { HashTableValue::NativeFunctionType, jsWritableStreamPrototypeFunction_abort, 0 } },
+    { "close"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { HashTableValue::NativeFunctionType, jsWritableStreamPrototypeFunction_close, 0 } },
+    { "getWriter"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { HashTableValue::NativeFunctionType, jsWritableStreamPrototypeFunction_getWriter, 0 } },
 };
 
 const ClassInfo JSWritableStreamPrototype::s_info = { "WritableStream"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(JSWritableStreamPrototype) };
@@ -173,7 +173,9 @@ void JSWritableStream::finishCreation(VM& vm)
 
 JSObject* JSWritableStream::createPrototype(VM& vm, JSDOMGlobalObject& globalObject)
 {
-    return JSWritableStreamPrototype::create(vm, &globalObject, JSWritableStreamPrototype::createStructure(vm, &globalObject, globalObject.objectPrototype()));
+    auto* structure = JSWritableStreamPrototype::createStructure(vm, &globalObject, globalObject.objectPrototype());
+    structure->setMayBePrototype(true);
+    return JSWritableStreamPrototype::create(vm, &globalObject, structure);
 }
 
 JSObject* JSWritableStream::prototype(VM& vm, JSDOMGlobalObject& globalObject)
@@ -192,7 +194,7 @@ void JSWritableStream::destroy(JSC::JSCell* cell)
     thisObject->JSWritableStream::~JSWritableStream();
 }
 
-JSC_DEFINE_CUSTOM_GETTER(jsWritableStreamConstructor, (JSGlobalObject * lexicalGlobalObject, EncodedJSValue thisValue, PropertyName))
+JSC_DEFINE_CUSTOM_GETTER(jsWritableStreamConstructor, (JSGlobalObject * lexicalGlobalObject, JSC::EncodedJSValue thisValue, PropertyName))
 {
     VM& vm = JSC::getVM(lexicalGlobalObject);
     auto throwScope = DECLARE_THROW_SCOPE(vm);
@@ -210,7 +212,7 @@ static inline JSValue jsWritableStream_lockedGetter(JSGlobalObject& lexicalGloba
     RELEASE_AND_RETURN(throwScope, (toJS<IDLBoolean>(lexicalGlobalObject, throwScope, impl.locked())));
 }
 
-JSC_DEFINE_CUSTOM_GETTER(jsWritableStream_locked, (JSGlobalObject * lexicalGlobalObject, EncodedJSValue thisValue, PropertyName attributeName))
+JSC_DEFINE_CUSTOM_GETTER(jsWritableStream_locked, (JSGlobalObject * lexicalGlobalObject, JSC::EncodedJSValue thisValue, PropertyName attributeName))
 {
     return IDLAttribute<JSWritableStream>::get<jsWritableStream_lockedGetter, CastedThisErrorBehavior::Assert>(*lexicalGlobalObject, thisValue, attributeName);
 }
@@ -262,9 +264,9 @@ JSC::GCClient::IsoSubspace* JSWritableStream::subspaceForImpl(JSC::VM& vm)
     return WebCore::subspaceForImpl<JSWritableStream, UseCustomHeapCellType::No>(
         vm,
         [](auto& spaces) { return spaces.m_clientSubspaceForWritableStream.get(); },
-        [](auto& spaces, auto&& space) { spaces.m_clientSubspaceForWritableStream = WTFMove(space); },
+        [](auto& spaces, auto&& space) { spaces.m_clientSubspaceForWritableStream = std::forward<decltype(space)>(space); },
         [](auto& spaces) { return spaces.m_subspaceForWritableStream.get(); },
-        [](auto& spaces, auto&& space) { spaces.m_subspaceForWritableStream = WTFMove(space); });
+        [](auto& spaces, auto&& space) { spaces.m_subspaceForWritableStream = std::forward<decltype(space)>(space); });
 }
 
 void JSWritableStream::analyzeHeap(JSCell* cell, HeapAnalyzer& analyzer)
@@ -272,11 +274,11 @@ void JSWritableStream::analyzeHeap(JSCell* cell, HeapAnalyzer& analyzer)
     auto* thisObject = jsCast<JSWritableStream*>(cell);
     analyzer.setWrappedObjectForCell(cell, &thisObject->wrapped());
     if (thisObject->scriptExecutionContext())
-        analyzer.setLabelForCell(cell, "url " + thisObject->scriptExecutionContext()->url().string());
+        analyzer.setLabelForCell(cell, makeString("url "_s, thisObject->scriptExecutionContext()->url().string()));
     Base::analyzeHeap(cell, analyzer);
 }
 
-bool JSWritableStreamOwner::isReachableFromOpaqueRoots(JSC::Handle<JSC::Unknown> handle, void*, AbstractSlotVisitor& visitor, const char** reason)
+bool JSWritableStreamOwner::isReachableFromOpaqueRoots(JSC::Handle<JSC::Unknown> handle, void*, AbstractSlotVisitor& visitor, ASCIILiteral* reason)
 {
     UNUSED_PARAM(handle);
     UNUSED_PARAM(visitor);

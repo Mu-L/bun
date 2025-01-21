@@ -1,5 +1,6 @@
-const BoringSSL = @import("boringssl");
+const BoringSSL = bun.BoringSSL;
 const std = @import("std");
+pub const bun = @import("root").bun;
 
 fn NewHasher(comptime digest_size: comptime_int, comptime ContextType: type, comptime Full: anytype, comptime Init: anytype, comptime Update: anytype, comptime Final: anytype) type {
     return struct {
@@ -9,76 +10,83 @@ fn NewHasher(comptime digest_size: comptime_int, comptime ContextType: type, com
         pub const digest: comptime_int = digest_size;
 
         pub fn init() @This() {
+            BoringSSL.load();
             var this: @This() = .{
                 .hasher = undefined,
             };
 
-            std.debug.assert(Init(&this.hasher) == 1);
+            bun.assert(Init(&this.hasher) == 1);
             return this;
         }
 
         pub fn hash(bytes: []const u8, out: *Digest) void {
+            @setRuntimeSafety(false);
             _ = Full(bytes.ptr, bytes.len, out);
         }
 
         pub fn update(this: *@This(), data: []const u8) void {
-            std.debug.assert(Update(&this.hasher, data.ptr, data.len) == 1);
+            @setRuntimeSafety(false);
+            bun.assert(Update(&this.hasher, data.ptr, data.len) == 1);
         }
 
         pub fn final(this: *@This(), out: *Digest) void {
-            std.debug.assert(Final(out, &this.hasher) == 1);
+            @setRuntimeSafety(false);
+            bun.assert(Final(out, &this.hasher) == 1);
         }
     };
 }
 
-fn NewEVP(
-    comptime digest_size: comptime_int,
-    comptime MDName: []const u8,
-) type {
+fn NewEVP(comptime digest_size: comptime_int, comptime MDName: []const u8) type {
     return struct {
-        ctx: BoringSSL.EVP_MD_CTX,
+        ctx: BoringSSL.EVP_MD_CTX = undefined,
 
         pub const Digest = [digest_size]u8;
         pub const digest: comptime_int = digest_size;
 
         pub fn init() @This() {
-            const md = @call(.{}, @field(BoringSSL, MDName), .{});
-            var this: @This() = .{
-                .ctx = undefined,
-            };
+            BoringSSL.load();
+
+            const md = @field(BoringSSL, MDName)();
+            var this = @This(){};
 
             BoringSSL.EVP_MD_CTX_init(&this.ctx);
 
-            std.debug.assert(BoringSSL.EVP_DigestInit(&this.ctx, md) == 1);
+            bun.assert(BoringSSL.EVP_DigestInit(&this.ctx, md) == 1);
 
             return this;
         }
 
         pub fn hash(bytes: []const u8, out: *Digest, engine: *BoringSSL.ENGINE) void {
-            const md = @call(.{}, @field(BoringSSL, MDName), .{});
+            const md = @field(BoringSSL, MDName)();
 
-            std.debug.assert(BoringSSL.EVP_Digest(bytes.ptr, bytes.len, out, null, md, engine) == 1);
+            bun.assert(BoringSSL.EVP_Digest(bytes.ptr, bytes.len, out, null, md, engine) == 1);
         }
 
         pub fn update(this: *@This(), data: []const u8) void {
-            std.debug.assert(BoringSSL.EVP_DigestUpdate(&this.ctx, data.ptr, data.len) == 1);
+            bun.assert(BoringSSL.EVP_DigestUpdate(&this.ctx, data.ptr, data.len) == 1);
         }
 
         pub fn final(this: *@This(), out: *Digest) void {
-            std.debug.assert(BoringSSL.EVP_DigestFinal(&this.ctx, out, null) == 1);
+            bun.assert(BoringSSL.EVP_DigestFinal(&this.ctx, out, null) == 1);
+        }
+
+        pub fn deinit(this: *@This()) void {
+            _ = BoringSSL.EVP_MD_CTX_cleanup(&this.ctx);
         }
     };
 }
+
 pub const EVP = struct {
     pub const SHA1 = NewEVP(std.crypto.hash.Sha1.digest_length, "EVP_sha1");
-    pub const MD5 = NewEVP(32, "EVP_md5");
-    pub const MD4 = NewEVP(32, "EVP_md4");
+    pub const MD5 = NewEVP(16, "EVP_md5");
+    pub const MD4 = NewEVP(16, "EVP_md4");
     pub const SHA224 = NewEVP(28, "EVP_sha224");
     pub const SHA512 = NewEVP(std.crypto.hash.sha2.Sha512.digest_length, "EVP_sha512");
     pub const SHA384 = NewEVP(std.crypto.hash.sha2.Sha384.digest_length, "EVP_sha384");
     pub const SHA256 = NewEVP(std.crypto.hash.sha2.Sha256.digest_length, "EVP_sha256");
-    pub const SHA512_256 = NewEVP(std.crypto.hash.sha2.Sha512256.digest_length, "EVP_sha512_256");
+    pub const SHA512_256 = NewEVP(std.crypto.hash.sha2.Sha512T256.digest_length, "EVP_sha512_256");
     pub const MD5_SHA1 = NewEVP(std.crypto.hash.Sha1.digest_length, "EVP_md5_sha1");
+    pub const Blake2 = NewEVP(256 / 8, "EVP_blake2b256");
 };
 
 pub const SHA1 = EVP.SHA1;
@@ -130,12 +138,21 @@ pub const Hashers = struct {
     );
 
     pub const SHA512_256 = NewHasher(
-        std.crypto.hash.sha2.Sha512256.digest_length,
+        std.crypto.hash.sha2.Sha512T256.digest_length,
         BoringSSL.SHA512_CTX,
         BoringSSL.SHA512_256,
         BoringSSL.SHA512_256_Init,
         BoringSSL.SHA512_256_Update,
         BoringSSL.SHA512_256_Final,
+    );
+
+    pub const RIPEMD160 = NewHasher(
+        BoringSSL.RIPEMD160_DIGEST_LENGTH,
+        BoringSSL.RIPEMD160_CTX,
+        BoringSSL.RIPEMD160,
+        BoringSSL.RIPEMD160_Init,
+        BoringSSL.RIPEMD160_Update,
+        BoringSSL.RIPEMD160_Final,
     );
 };
 
@@ -144,7 +161,10 @@ const boring = [_]type{
     Hashers.SHA512,
     Hashers.SHA384,
     Hashers.SHA256,
+    // Hashers.SHA512_224,
     Hashers.SHA512_256,
+    void,
+    void,
 };
 
 const zig = [_]type{
@@ -152,7 +172,9 @@ const zig = [_]type{
     std.crypto.hash.sha2.Sha512,
     std.crypto.hash.sha2.Sha384,
     std.crypto.hash.sha2.Sha256,
-    std.crypto.hash.sha2.Sha512256,
+    std.crypto.hash.sha2.Sha512T256,
+    std.crypto.hash.blake2.Blake2b256,
+    std.crypto.hash.Blake3,
 };
 
 const evp = [_]type{
@@ -161,6 +183,8 @@ const evp = [_]type{
     EVP.SHA384,
     EVP.SHA256,
     EVP.SHA512_256,
+    EVP.Blake2,
+    void,
 };
 
 const labels = [_][]const u8{
@@ -169,71 +193,6 @@ const labels = [_][]const u8{
     "SHA384",
     "SHA256",
     "SHA512_256",
+    "Blake2",
+    "Blake3",
 };
-pub fn main() anyerror!void {
-    var file = try std.fs.cwd().openFileZ(std.os.argv[std.os.argv.len - 1], .{});
-    var bytes = try file.readToEndAlloc(std.heap.c_allocator, std.math.maxInt(usize));
-
-    var engine = BoringSSL.ENGINE_new().?;
-
-    inline for (boring) |BoringHasher, i| {
-        const ZigHasher = zig[i];
-        std.debug.print(
-            comptime labels[i] ++ " - hashing {.3f}:\n",
-            .{std.fmt.fmtIntSizeBin(bytes.len)},
-        );
-        var digest1: BoringHasher.Digest = undefined;
-        var digest2: BoringHasher.Digest = undefined;
-        var digest3: BoringHasher.Digest = undefined;
-        var digest4: BoringHasher.Digest = undefined;
-
-        var clock1 = try std.time.Timer.start();
-        ZigHasher.hash(bytes, &digest1, .{});
-        const zig_time = clock1.read();
-
-        var clock2 = try std.time.Timer.start();
-        BoringHasher.hash(bytes, &digest2);
-        const boring_time = clock2.read();
-
-        var clock3 = try std.time.Timer.start();
-        evp[i].hash(bytes, &digest3, engine);
-        const evp_time = clock3.read();
-
-        var evp_in = evp[i].init();
-        var clock4 = try std.time.Timer.start();
-        evp_in.update(bytes);
-        evp_in.final(&digest4);
-        const evp_in_time = clock4.read();
-
-        std.debug.print(
-            "     zig: {}\n",
-            .{std.fmt.fmtDuration(zig_time)},
-        );
-        std.debug.print(
-            "  boring: {}\n",
-            .{std.fmt.fmtDuration(boring_time)},
-        );
-        std.debug.print(
-            "    evp: {}\n",
-            .{std.fmt.fmtDuration(evp_time)},
-        );
-        std.debug.print(
-            "  evp in: {}\n\n",
-            .{std.fmt.fmtDuration(evp_in_time)},
-        );
-
-        if (!std.mem.eql(u8, &digest3, &digest2)) {
-            @panic("\ndigests don't match! for " ++ labels[i]);
-        }
-    }
-}
-
-// TODO(sno2): update SHA256 test to include BoringSSL engine
-// test "sha256" {
-//     const value: []const u8 = "hello, world! hello, world! hello, world! hello, world! hello, world! hello, world! hello, world! hello, world! hello, world! hello, world! hello, world! hello, world! hello, world! hello, world! hello, world! hello, world! hello, world! hello, world! hello, world! hello, world!";
-//     var hash: SHA256.Digest = undefined;
-//     var hash2: SHA256.Digest = undefined;
-//     SHA256.hash(value, &hash);
-//     std.crypto.hash.sha2.Sha256.hash(value, &hash2, .{});
-//     try std.testing.expectEqual(hash, hash2);
-// }

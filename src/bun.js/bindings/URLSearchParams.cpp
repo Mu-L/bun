@@ -25,9 +25,33 @@
 #include "URLSearchParams.h"
 
 #include "DOMURL.h"
-#include "wtf/URLParser.h"
+#include <wtf/URLParser.h>
+#include "helpers.h"
+#include "JSURLSearchParams.h"
 
 namespace WebCore {
+
+extern "C" JSC::EncodedJSValue URLSearchParams__create(JSDOMGlobalObject* globalObject, const ZigString* input)
+{
+    String str = Zig::toString(*input);
+    auto result = URLSearchParams::create(str, nullptr);
+    return JSC::JSValue::encode(WebCore::toJSNewlyCreated(globalObject, globalObject, WTFMove(result)));
+}
+
+extern "C" WebCore::URLSearchParams* URLSearchParams__fromJS(JSC::EncodedJSValue value)
+{
+    return WebCoreCast<WebCore::JSURLSearchParams, WebCore::URLSearchParams>(value);
+}
+
+// callback accepting a void* and a const ZigString*, returning void
+typedef void (*URLSearchParams__toStringCallback)(void* ctx, const ZigString* str);
+
+extern "C" void URLSearchParams__toString(WebCore::URLSearchParams* urlSearchParams, void* ctx, URLSearchParams__toStringCallback callback)
+{
+    String str = urlSearchParams->toString();
+    auto zig = Zig::toZigString(str);
+    callback(ctx, &zig);
+}
 
 URLSearchParams::URLSearchParams(const String& init, DOMURL* associatedURL)
     : m_associatedURL(associatedURL)
@@ -39,6 +63,8 @@ URLSearchParams::URLSearchParams(const Vector<KeyValuePair<String, String>>& pai
     : m_pairs(pairs)
 {
 }
+
+URLSearchParams::~URLSearchParams() = default;
 
 ExceptionOr<Ref<URLSearchParams>> URLSearchParams::create(std::variant<Vector<Vector<String>>, Vector<KeyValuePair<String, String>>, String>&& variant)
 {
@@ -53,7 +79,7 @@ ExceptionOr<Ref<URLSearchParams>> URLSearchParams::create(std::variant<Vector<Ve
     return std::visit(visitor, variant);
 }
 
-String URLSearchParams::get(const String& name) const
+String URLSearchParams::get(const StringView name) const
 {
     for (const auto& pair : m_pairs) {
         if (pair.key == name)
@@ -62,10 +88,10 @@ String URLSearchParams::get(const String& name) const
     return String();
 }
 
-bool URLSearchParams::has(const String& name) const
+bool URLSearchParams::has(const StringView name, const String& value) const
 {
     for (const auto& pair : m_pairs) {
-        if (pair.key == name)
+        if (pair.key == name && (value.isNull() || pair.value == value))
             return true;
     }
     return false;
@@ -77,6 +103,7 @@ void URLSearchParams::sort()
         return WTF::codePointCompareLessThan(a.key, b.key);
     });
     updateURL();
+    needsSorting = false;
 }
 
 void URLSearchParams::set(const String& name, const String& value)
@@ -96,9 +123,11 @@ void URLSearchParams::set(const String& name, const String& value)
             return false;
         });
         updateURL();
+        needsSorting = true;
         return;
     }
     m_pairs.append({ name, value });
+    needsSorting = true;
     updateURL();
 }
 
@@ -106,26 +135,28 @@ void URLSearchParams::append(const String& name, const String& value)
 {
     m_pairs.append({ name, value });
     updateURL();
+    needsSorting = true;
 }
 
-Vector<String> URLSearchParams::getAll(const String& name) const
+Vector<String> URLSearchParams::getAll(const StringView name) const
 {
     Vector<String> values;
     values.reserveInitialCapacity(m_pairs.size());
     for (const auto& pair : m_pairs) {
         if (pair.key == name)
-            values.uncheckedAppend(pair.value);
+            values.unsafeAppendWithoutCapacityCheck(pair.value);
     }
     values.shrinkToFit();
     return values;
 }
 
-void URLSearchParams::remove(const String& name)
+void URLSearchParams::remove(const StringView name, const String& value)
 {
     m_pairs.removeAllMatching([&](const auto& pair) {
-        return pair.key == name;
+        return pair.key == name && (value.isNull() || pair.value == value);
     });
     updateURL();
+    needsSorting = true;
 }
 
 String URLSearchParams::toString() const
@@ -136,7 +167,7 @@ String URLSearchParams::toString() const
 void URLSearchParams::updateURL()
 {
     if (m_associatedURL)
-        m_associatedURL->setQuery(WTF::URLParser::serialize(m_pairs));
+        m_associatedURL->setSearch(WTF::URLParser::serialize(m_pairs));
 }
 
 void URLSearchParams::updateFromAssociatedURL()
@@ -161,4 +192,13 @@ URLSearchParams::Iterator::Iterator(URLSearchParams& params)
 {
 }
 
+size_t URLSearchParams::memoryCost() const
+{
+    size_t cost = sizeof(URLSearchParams);
+    for (const auto& pair : m_pairs) {
+        cost += pair.key.sizeInBytes();
+        cost += pair.value.sizeInBytes();
+    }
+    return cost;
+}
 }

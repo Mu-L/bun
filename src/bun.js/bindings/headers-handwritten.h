@@ -1,12 +1,79 @@
 #pragma once
+#include "wtf/Compiler.h"
+#include "wtf/text/OrdinalNumber.h"
+#include "JavaScriptCore/JSCJSValue.h"
+#include "JavaScriptCore/ArgList.h"
+#include <set>
 
+#ifndef HEADERS_HANDWRITTEN
+#define HEADERS_HANDWRITTEN
 typedef uint16_t ZigErrorCode;
 typedef struct VirtualMachine VirtualMachine;
+// exists to make headers.h happy
+typedef struct CppWebSocket CppWebSocket;
+
+namespace WTF {
+class String;
+}
 
 typedef struct ZigString {
     const unsigned char* ptr;
     size_t len;
 } ZigString;
+
+#ifndef __cplusplus
+typedef uint8_t BunStringTag;
+typedef union BunStringImpl {
+    ZigString zig;
+    void* wtf;
+} BunStringImpl;
+
+#else
+namespace WTF {
+class StringImpl;
+class String;
+}
+
+typedef union BunStringImpl {
+    ZigString zig;
+    WTF::StringImpl* wtf;
+} BunStringImpl;
+
+enum class BunStringTag : uint8_t {
+    Dead = 0,
+    WTFStringImpl = 1,
+    ZigString = 2,
+    StaticZigString = 3,
+    Empty = 4,
+};
+#endif
+
+typedef struct BunString {
+    BunStringTag tag;
+    BunStringImpl impl;
+
+    enum ZeroCopyTag { ZeroCopy };
+
+    // If it's not a WTFStringImpl, this does nothing
+    inline void ref();
+
+    // If it's not a WTFStringImpl, this does nothing
+    inline void deref();
+
+    static size_t utf8ByteLength(const WTF::String&);
+
+    // Zero copy is kind of a lie.
+    // We clone it if it's non-ASCII UTF-8.
+    // We don't clone it if it was marked as static
+    // if it was a ZigString, it still allocates a WTF::StringImpl.
+    // It's only truly zero-copy if it was already a WTFStringImpl (which it is if it came from JS and we didn't use ZigString)
+    WTF::String toWTFString(ZeroCopyTag) const;
+
+    // This one usually will clone the raw bytes.
+    WTF::String toWTFString() const;
+
+} BunString;
+
 typedef struct ZigErrorType {
     ZigErrorCode code;
     void* ptr;
@@ -19,14 +86,29 @@ typedef struct ErrorableZigString {
     ErrorableZigStringResult result;
     bool success;
 } ErrorableZigString;
+typedef union ErrorableStringResult {
+    BunString value;
+    ZigErrorType err;
+} ErrorableStringResult;
+typedef struct ErrorableString {
+    ErrorableStringResult result;
+    bool success;
+} ErrorableString;
 typedef struct ResolvedSource {
-    ZigString specifier;
-    ZigString source_code;
-    ZigString source_url;
+    BunString specifier;
+    BunString source_code;
+    BunString source_url;
+    bool isCommonJSModule;
     uint32_t hash;
     void* allocator;
-    uint64_t tag;
+    JSC::EncodedJSValue jsvalue_for_export;
+    uint32_t tag;
+    bool needsDeref;
+    bool already_bundled;
+    uint8_t* bytecode_cache;
+    size_t bytecode_cache_size;
 } ResolvedSource;
+static const uint32_t ResolvedSourceTagPackageJSONTypeModule = 1;
 typedef union ErrorableResolvedSourceResult {
     ResolvedSource value;
     ZigErrorType err;
@@ -38,13 +120,22 @@ typedef struct ErrorableResolvedSource {
 
 typedef struct SystemError {
     int errno_;
-    ZigString code;
-    ZigString message;
-    ZigString path;
-    ZigString syscall;
+    BunString code;
+    BunString message;
+    BunString path;
+    BunString syscall;
+    BunString hostname;
+    int fd;
+    BunString dest;
 } SystemError;
 
 typedef void* ArrayBufferSink;
+
+typedef uint8_t BunPluginTarget;
+const BunPluginTarget BunPluginTargetBun = 0;
+const BunPluginTarget BunPluginTargetBrowser = 1;
+const BunPluginTarget BunPluginTargetNode = 2;
+const BunPluginTarget BunPluginTargetMax = BunPluginTargetNode;
 
 typedef uint8_t ZigStackFrameCode;
 const ZigStackFrameCode ZigStackFrameCodeNone = 0;
@@ -55,46 +146,55 @@ const ZigStackFrameCode ZigStackFrameCodeGlobal = 4;
 const ZigStackFrameCode ZigStackFrameCodeWasm = 5;
 const ZigStackFrameCode ZigStackFrameCodeConstructor = 6;
 
+extern "C" void __attribute((__noreturn__)) Bun__panic(const char* message, size_t length);
+#define BUN_PANIC(message) Bun__panic(message, sizeof(message) - 1)
+
 typedef struct ZigStackFramePosition {
-    int32_t source_offset;
-    int32_t line;
-    int32_t line_start;
-    int32_t line_stop;
-    int32_t column_start;
-    int32_t column_stop;
-    int32_t expression_start;
-    int32_t expression_stop;
+    int32_t line_zero_based;
+    int32_t column_zero_based;
+    int32_t byte_position;
+
+    ALWAYS_INLINE WTF::OrdinalNumber column()
+    {
+        return OrdinalNumber::fromZeroBasedInt(this->column_zero_based);
+    }
+    ALWAYS_INLINE WTF::OrdinalNumber line()
+    {
+        return OrdinalNumber::fromZeroBasedInt(this->line_zero_based);
+    }
 } ZigStackFramePosition;
 
 typedef struct ZigStackFrame {
-    ZigString function_name;
-    ZigString source_url;
+    BunString function_name;
+    BunString source_url;
     ZigStackFramePosition position;
     ZigStackFrameCode code_type;
     bool remapped;
 } ZigStackFrame;
 
 typedef struct ZigStackTrace {
-    ZigString* source_lines_ptr;
-    int32_t* source_lines_numbers;
+    BunString* source_lines_ptr;
+    OrdinalNumber* source_lines_numbers;
     uint8_t source_lines_len;
     uint8_t source_lines_to_collect;
     ZigStackFrame* frames_ptr;
     uint8_t frames_len;
+    JSC::SourceProvider* referenced_source_provider;
 } ZigStackTrace;
 
 typedef struct ZigException {
-    unsigned char code;
+    unsigned char type;
     uint16_t runtime_type;
     int errno_;
-    ZigString syscall;
-    ZigString code_;
-    ZigString path;
-    ZigString name;
-    ZigString message;
+    BunString syscall;
+    BunString system_code;
+    BunString path;
+    BunString name;
+    BunString message;
     ZigStackTrace stack;
     void* exception;
     bool remapped;
+    int fd;
 } ZigException;
 
 typedef uint8_t JSErrorCode;
@@ -109,6 +209,19 @@ const JSErrorCode JSErrorCodeAggregateError = 7;
 const JSErrorCode JSErrorCodeOutOfMemoryError = 8;
 const JSErrorCode JSErrorCodeStackOverflow = 253;
 const JSErrorCode JSErrorCodeUserErrorCode = 254;
+
+typedef uint8_t BunLoaderType;
+const BunLoaderType BunLoaderTypeNone = 254;
+const BunLoaderType BunLoaderTypeJSX = 0;
+const BunLoaderType BunLoaderTypeJS = 1;
+const BunLoaderType BunLoaderTypeTS = 2;
+const BunLoaderType BunLoaderTypeTSX = 3;
+const BunLoaderType BunLoaderTypeCSS = 4;
+const BunLoaderType BunLoaderTypeFILE = 5;
+const BunLoaderType BunLoaderTypeJSON = 6;
+const BunLoaderType BunLoaderTypeTOML = 7;
+const BunLoaderType BunLoaderTypeWASM = 8;
+const BunLoaderType BunLoaderTypeNAPI = 9;
 
 #pragma mark - Stream
 
@@ -160,76 +273,183 @@ typedef void WebSocketClientTLS;
 
 #ifndef __cplusplus
 typedef struct Bun__ArrayBuffer Bun__ArrayBuffer;
+typedef struct Uint8Array_alias Uint8Array_alias;
 #endif
 
 #ifdef __cplusplus
 
+extern "C" void Bun__WTFStringImpl__deref(WTF::StringImpl* impl);
+extern "C" void Bun__WTFStringImpl__ref(WTF::StringImpl* impl);
+extern "C" bool BunString__fromJS(JSC::JSGlobalObject*, JSC::EncodedJSValue, BunString*);
+extern "C" JSC::EncodedJSValue BunString__toJS(JSC::JSGlobalObject*, const BunString*);
+extern "C" void BunString__toWTFString(BunString*);
+
+namespace Bun {
+JSC::JSValue toJS(JSC::JSGlobalObject*, BunString);
+BunString toString(JSC::JSGlobalObject* globalObject, JSC::JSValue value);
+BunString toString(const char* bytes, size_t length);
+BunString toString(WTF::String& wtfString);
+BunString toString(const WTF::String& wtfString);
+BunString toString(WTF::StringImpl* wtfString);
+
+BunString toStringRef(JSC::JSGlobalObject* globalObject, JSC::JSValue value);
+BunString toStringRef(WTF::String& wtfString);
+BunString toStringRef(const WTF::String& wtfString);
+BunString toStringRef(WTF::StringImpl* wtfString);
+
+// This creates a detached string view, which cannot be ref/unref.
+// Be very careful using this, and ensure the memory owner does not get destroyed.
+BunString toStringView(WTF::StringView view);
+}
+
+using Uint8Array_alias = JSC::JSUint8Array;
+
 typedef struct {
     char* ptr;
-    uint32_t offset;
-    uint32_t len;
-    uint32_t byte_len;
+    size_t offset;
+    size_t len;
+    size_t byte_len;
     uint8_t cell_type;
-    uint64_t _value;
+    int64_t _value;
+    bool shared;
 } Bun__ArrayBuffer;
+
+#include "SyntheticModuleType.h"
+
+extern "C" const char* Bun__userAgent;
 
 extern "C" ZigErrorCode Zig_ErrorCodeParserError;
 
 extern "C" void ZigString__free(const unsigned char* ptr, size_t len, void* allocator);
-extern "C" void Microtask__run(void* ptr, void* global);
-extern "C" void Microtask__run_default(void* ptr, void* global);
+
+extern "C" bool Bun__transpileVirtualModule(
+    JSC::JSGlobalObject* global,
+    const BunString* specifier,
+    const BunString* referrer,
+    ZigString* sourceCode,
+    BunLoaderType loader,
+    ErrorableResolvedSource* result);
+
+extern "C" JSC::EncodedJSValue Bun__runVirtualModule(
+    JSC::JSGlobalObject* global,
+    const BunString* specifier);
+
+extern "C" JSC::JSInternalPromise* Bun__transpileFile(
+    void* bunVM,
+    JSC::JSGlobalObject* global,
+    BunString* specifier,
+    BunString* referrer,
+    const BunString* typeAttribute,
+    ErrorableResolvedSource* result, bool allowPromise);
+
+extern "C" bool Bun__fetchBuiltinModule(
+    void* bunVM,
+    JSC::JSGlobalObject* global,
+    const BunString* specifier,
+    const BunString* referrer,
+    ErrorableResolvedSource* result);
 
 // Used in process.version
 extern "C" const char* Bun__version;
+extern "C" const char* Bun__version_with_sha;
 
 // Used in process.versions
-extern "C" const char* Bun__versions_webkit;
-extern "C" const char* Bun__versions_mimalloc;
-extern "C" const char* Bun__versions_libarchive;
-extern "C" const char* Bun__versions_picohttpparser;
 extern "C" const char* Bun__versions_boringssl;
-extern "C" const char* Bun__versions_zlib;
+extern "C" const char* Bun__versions_libarchive;
+extern "C" const char* Bun__versions_mimalloc;
+extern "C" const char* Bun__versions_picohttpparser;
+extern "C" const char* Bun__versions_uws;
+extern "C" const char* Bun__versions_webkit;
+extern "C" const char* Bun__versions_libdeflate;
 extern "C" const char* Bun__versions_zig;
+extern "C" const char* Bun__versions_zlib;
+extern "C" const char* Bun__versions_tinycc;
+extern "C" const char* Bun__versions_lolhtml;
+extern "C" const char* Bun__versions_c_ares;
+extern "C" const char* Bun__versions_lshpack;
+extern "C" const char* Bun__versions_zstd;
+extern "C" const char* Bun__versions_usockets;
+
+extern "C" const char* Bun__version_sha;
 
 extern "C" void ZigString__free_global(const unsigned char* ptr, size_t len);
 
-extern "C" int64_t Bun__encoding__writeLatin1AsHex(const unsigned char* ptr, size_t len, unsigned char* to, size_t other_len);
-extern "C" int64_t Bun__encoding__writeUTF16AsHex(const UChar* ptr, size_t len, unsigned char* to, size_t other_len);
-extern "C" int64_t Bun__encoding__writeLatin1AsURLSafeBase64(const unsigned char* ptr, size_t len, unsigned char* to, size_t other_len);
-extern "C" int64_t Bun__encoding__writeUTF16AsURLSafeBase64(const UChar* ptr, size_t len, unsigned char* to, size_t other_len);
-extern "C" int64_t Bun__encoding__writeLatin1AsBase64(const unsigned char* ptr, size_t len, unsigned char* to, size_t other_len);
-extern "C" int64_t Bun__encoding__writeUTF16AsBase64(const UChar* ptr, size_t len, unsigned char* to, size_t other_len);
-extern "C" int64_t Bun__encoding__writeLatin1AsUTF16(const unsigned char* ptr, size_t len, unsigned char* to, size_t other_len);
-extern "C" int64_t Bun__encoding__writeUTF16AsUTF16(const UChar* ptr, size_t len, unsigned char* to, size_t other_len);
-extern "C" int64_t Bun__encoding__writeLatin1AsUTF8(const unsigned char* ptr, size_t len, unsigned char* to, size_t other_len);
-extern "C" int64_t Bun__encoding__writeUTF16AsUTF8(const UChar* ptr, size_t len, unsigned char* to, size_t other_len);
-extern "C" int64_t Bun__encoding__writeLatin1AsASCII(const unsigned char* ptr, size_t len, unsigned char* to, size_t other_len);
-extern "C" int64_t Bun__encoding__writeUTF16AsASCII(const UChar* ptr, size_t len, unsigned char* to, size_t other_len);
+extern "C" size_t Bun__encoding__writeLatin1(const unsigned char* ptr, size_t len, unsigned char* to, size_t other_len, Encoding encoding);
+extern "C" size_t Bun__encoding__writeUTF16(const UChar* ptr, size_t len, unsigned char* to, size_t other_len, Encoding encoding);
 
-extern "C" size_t Bun__encoding__byteLengthLatin1AsHex(const unsigned char* ptr, size_t len);
-extern "C" size_t Bun__encoding__byteLengthUTF16AsHex(const UChar* ptr, size_t len);
-extern "C" size_t Bun__encoding__byteLengthLatin1AsURLSafeBase64(const unsigned char* ptr, size_t len);
-extern "C" size_t Bun__encoding__byteLengthUTF16AsURLSafeBase64(const UChar* ptr, size_t len);
-extern "C" size_t Bun__encoding__byteLengthLatin1AsBase64(const unsigned char* ptr, size_t len);
-extern "C" size_t Bun__encoding__byteLengthUTF16AsBase64(const UChar* ptr, size_t len);
-extern "C" size_t Bun__encoding__byteLengthLatin1AsUTF16(const unsigned char* ptr, size_t len);
-extern "C" size_t Bun__encoding__byteLengthUTF16AsUTF16(const UChar* ptr, size_t len);
-extern "C" size_t Bun__encoding__byteLengthLatin1AsUTF8(const unsigned char* ptr, size_t len);
-extern "C" size_t Bun__encoding__byteLengthUTF16AsUTF8(const UChar* ptr, size_t len);
-extern "C" size_t Bun__encoding__byteLengthLatin1AsASCII(const unsigned char* ptr, size_t len);
-extern "C" size_t Bun__encoding__byteLengthUTF16AsASCII(const UChar* ptr, size_t len);
+extern "C" size_t Bun__encoding__byteLengthLatin1(const unsigned char* ptr, size_t len, Encoding encoding);
+extern "C" size_t Bun__encoding__byteLengthUTF16(const UChar* ptr, size_t len, Encoding encoding);
 
-extern "C" int64_t Bun__encoding__constructFromLatin1AsHex(void*, const unsigned char* ptr, size_t len);
-extern "C" int64_t Bun__encoding__constructFromUTF16AsHex(void*, const UChar* ptr, size_t len);
-extern "C" int64_t Bun__encoding__constructFromLatin1AsURLSafeBase64(void*, const unsigned char* ptr, size_t len);
-extern "C" int64_t Bun__encoding__constructFromUTF16AsURLSafeBase64(void*, const UChar* ptr, size_t len);
-extern "C" int64_t Bun__encoding__constructFromLatin1AsBase64(void*, const unsigned char* ptr, size_t len);
-extern "C" int64_t Bun__encoding__constructFromUTF16AsBase64(void*, const UChar* ptr, size_t len);
-extern "C" int64_t Bun__encoding__constructFromLatin1AsUTF16(void*, const unsigned char* ptr, size_t len);
-extern "C" int64_t Bun__encoding__constructFromUTF16AsUTF16(void*, const UChar* ptr, size_t len);
-extern "C" int64_t Bun__encoding__constructFromLatin1AsUTF8(void*, const unsigned char* ptr, size_t len);
-extern "C" int64_t Bun__encoding__constructFromUTF16AsUTF8(void*, const UChar* ptr, size_t len);
-extern "C" int64_t Bun__encoding__constructFromLatin1AsASCII(void*, const unsigned char* ptr, size_t len);
-extern "C" int64_t Bun__encoding__constructFromUTF16AsASCII(void*, const UChar* ptr, size_t len);
+extern "C" int64_t Bun__encoding__constructFromLatin1(void*, const unsigned char* ptr, size_t len, Encoding encoding);
+extern "C" int64_t Bun__encoding__constructFromUTF16(void*, const UChar* ptr, size_t len, Encoding encoding);
 
-#endif
+template<bool isStrict, bool enableAsymmetricMatchers>
+bool Bun__deepEquals(JSC::JSGlobalObject* globalObject, JSC::JSValue v1, JSC::JSValue v2, JSC::MarkedArgumentBuffer&, Vector<std::pair<JSC::JSValue, JSC::JSValue>, 16>& stack, JSC::ThrowScope* scope, bool addToStack);
+
+/**
+ * @brief `Bun.deepMatch(a, b)`
+ *
+ * `object` and `subset` must be objects. In the future we should change the
+ * signature of this function to only take `JSC::JSCell`. For now, panics
+ * if either `object` or `subset` are not `JSCCell`.
+ *
+ * @note
+ * The sets recording already visited properties (`seenObjProperties` and
+ * `seenSubsetProperties`) aren not needed when both `enableAsymmetricMatchers`
+ * and `isMatchingObjectContaining` are true. In this case, it is safe to pass a
+ * `nullptr`.
+ *
+ * `gcBuffer` ensures JSC's stack scan does not come up empty-handed and free
+ * properties currently within those stacks. Likely unnecessary, but better to
+ * be safe tnan sorry
+ *
+ *
+ * @tparam enableAsymmetricMatchers
+ * @param objValue
+ * @param seenObjProperties already visited properties of `objValue`.
+ * @param subsetValue
+ * @param seenSubsetProperties already visited properties of `subsetValue`.
+ * @param globalObject
+ * @param Scope
+ * @param gcBuffer
+ * @param replacePropsWithAsymmetricMatchers
+ * @param isMatchingObjectContaining
+ *
+ * @return true
+ * @return false
+ */
+template<bool enableAsymmetricMatchers>
+bool Bun__deepMatch(
+    JSC::JSValue object,
+    std::set<JSC::EncodedJSValue>* seenObjProperties,
+    JSC::JSValue subset,
+    std::set<JSC::EncodedJSValue>* seenSubsetProperties,
+    JSC::JSGlobalObject* globalObject,
+    JSC::ThrowScope* throwScope,
+    JSC::MarkedArgumentBuffer* gcBuffer,
+    bool replacePropsWithAsymmetricMatchers,
+    bool isMatchingObjectContaining);
+
+extern "C" void Bun__remapStackFramePositions(JSC::JSGlobalObject*, ZigStackFrame*, size_t);
+
+namespace Inspector {
+class ScriptArguments;
+}
+
+using ScriptArguments = Inspector::ScriptArguments;
+
+ALWAYS_INLINE void BunString::ref()
+{
+    if (this->tag == BunStringTag::WTFStringImpl) {
+        this->impl.wtf->ref();
+    }
+}
+ALWAYS_INLINE void BunString::deref()
+{
+    if (this->tag == BunStringTag::WTFStringImpl) {
+        this->impl.wtf->deref();
+    }
+}
+
+#endif // __cplusplus
+#endif // HEADERS_HANDWRITTEN

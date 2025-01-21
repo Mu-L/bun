@@ -1,4 +1,5 @@
 const std = @import("std");
+const bun = @import("root").bun;
 
 fn SinglyLinkedList(comptime T: type, comptime Parent: type) type {
     return struct {
@@ -154,10 +155,39 @@ pub fn ObjectPool(
         pub fn has() bool {
             return data().loaded and data().list.first != null;
         }
+
+        pub fn push(allocator: std.mem.Allocator, pooled: Type) void {
+            if (comptime @import("./env.zig").allow_assert)
+                bun.assert(!full());
+
+            const new_node = allocator.create(LinkedList.Node) catch unreachable;
+            new_node.* = LinkedList.Node{
+                .allocator = allocator,
+                .data = pooled,
+            };
+            release(new_node);
+        }
+
+        pub fn getIfExists() ?*LinkedList.Node {
+            if (!data().loaded) {
+                return null;
+            }
+
+            var node = data().list.popFirst() orelse return null;
+            if (std.meta.hasFn(Type, "reset")) node.data.reset();
+            if (comptime max_count > 0) data().count -|= 1;
+
+            return node;
+        }
+
+        pub fn first(allocator: std.mem.Allocator) *Type {
+            return &get(allocator).data;
+        }
+
         pub fn get(allocator: std.mem.Allocator) *LinkedList.Node {
             if (data().loaded) {
                 if (data().list.popFirst()) |node| {
-                    if (comptime std.meta.trait.isContainer(Type) and @hasDecl(Type, "reset")) node.data.reset();
+                    if (comptime std.meta.hasFn(Type, "reset")) node.data.reset();
                     if (comptime max_count > 0) data().count -|= 1;
                     return node;
                 }
@@ -165,7 +195,7 @@ pub fn ObjectPool(
 
             if (comptime log_allocations) std.io.getStdErr().writeAll(comptime std.fmt.comptimePrint("Allocate {s} - {d} bytes\n", .{ @typeName(Type), @sizeOf(Type) })) catch {};
 
-            var new_node = allocator.create(LinkedList.Node) catch unreachable;
+            const new_node = allocator.create(LinkedList.Node) catch unreachable;
             new_node.* = LinkedList.Node{
                 .allocator = allocator,
                 .data = if (comptime Init) |init_|
@@ -179,11 +209,15 @@ pub fn ObjectPool(
             return new_node;
         }
 
+        pub fn releaseValue(value: *Type) void {
+            @as(*LinkedList.Node, @fieldParentPtr("data", value)).release();
+        }
+
         pub fn release(node: *LinkedList.Node) void {
             if (comptime max_count > 0) {
                 if (data().count >= max_count) {
                     if (comptime log_allocations) std.io.getStdErr().writeAll(comptime std.fmt.comptimePrint("Free {s} - {d} bytes\n", .{ @typeName(Type), @sizeOf(Type) })) catch {};
-                    if (comptime std.meta.trait.isContainer(Type) and @hasDecl(Type, "deinit")) node.data.deinit();
+                    if (std.meta.hasFn(Type, "deinit")) node.data.deinit();
                     node.allocator.destroy(node);
                     return;
                 }
@@ -198,6 +232,22 @@ pub fn ObjectPool(
 
             data().list = LinkedList{ .first = node };
             data().loaded = true;
+        }
+
+        pub fn deleteAll() void {
+            var dat = data();
+            if (!dat.loaded) {
+                return;
+            }
+            dat.loaded = false;
+            dat.count = 0;
+            var next = dat.list.first;
+            dat.list.first = null;
+            while (next) |node| {
+                next = node.next;
+                if (std.meta.hasFn(Type, "deinit")) node.data.deinit();
+                node.allocator.destroy(node);
+            }
         }
     };
 }

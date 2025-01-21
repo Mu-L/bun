@@ -1,10 +1,10 @@
 const std = @import("std");
-const js_ast = @import("./js_ast.zig");
-const logger = @import("logger.zig");
-const js_lexer = @import("js_lexer.zig");
-const json_parser = @import("json_parser.zig");
+const js_ast = bun.JSAst;
+const logger = bun.logger;
+const js_lexer = bun.js_lexer;
+const json_parser = bun.JSON;
 const fs = @import("fs.zig");
-const bun = @import("global.zig");
+const bun = @import("root").bun;
 const string = bun.string;
 const Output = bun.Output;
 const Global = bun.Global;
@@ -17,6 +17,7 @@ const C = bun.C;
 const Ref = @import("ast/base.zig").Ref;
 
 const GlobalDefinesKey = @import("./defines-table.zig").GlobalDefinesKey;
+const table = @import("./defines-table.zig");
 
 const Globals = struct {
     pub const Undefined = js_ast.E.Undefined{};
@@ -33,16 +34,9 @@ const Globals = struct {
 };
 
 const defines_path = fs.Path.initWithNamespace("defines.json", "internal");
-pub const RawDefines = std.StringArrayHashMap(string);
-pub const UserDefines = std.StringHashMap(DefineData);
-pub const UserDefinesArray = std.StringArrayHashMap(DefineData);
-
-const Rewrites = struct {
-    pub const global = "global";
-    pub const globalThis = "globalThis";
-};
-
-var globalThisIdentifier = js_ast.E.Identifier{};
+pub const RawDefines = bun.StringArrayHashMap(string);
+pub const UserDefines = bun.StringHashMap(DefineData);
+pub const UserDefinesArray = bun.StringArrayHashMap(DefineData);
 
 pub const DefineData = struct {
     value: js_ast.Expr.Data,
@@ -59,8 +53,24 @@ pub const DefineData = struct {
     // have any observable side effects.
     call_can_be_unwrapped_if_unused: bool = false,
 
+    method_call_must_be_replaced_with_undefined: bool = false,
+
     pub fn isUndefined(self: *const DefineData) bool {
         return self.valueless;
+    }
+
+    pub fn initBoolean(value: bool) DefineData {
+        return .{
+            .value = .{ .e_boolean = .{ .value = value } },
+            .can_be_removed_if_unused = true,
+        };
+    }
+
+    pub fn initStaticString(str: *const js_ast.E.String) DefineData {
+        return .{
+            .value = .{ .e_string = @constCast(str) },
+            .can_be_removed_if_unused = true,
+        };
     }
 
     pub fn merge(a: DefineData, b: DefineData) DefineData {
@@ -68,103 +78,87 @@ pub const DefineData = struct {
             .value = b.value,
             .can_be_removed_if_unused = a.can_be_removed_if_unused,
             .call_can_be_unwrapped_if_unused = a.call_can_be_unwrapped_if_unused,
+            .original_name = b.original_name,
+            .valueless = a.method_call_must_be_replaced_with_undefined or b.method_call_must_be_replaced_with_undefined,
+            .method_call_must_be_replaced_with_undefined = a.method_call_must_be_replaced_with_undefined or b.method_call_must_be_replaced_with_undefined,
         };
     }
 
-    pub fn from_mergable_input(defines: RawDefines, user_defines: *UserDefines, log: *logger.Log, allocator: std.mem.Allocator) !void {
-        try user_defines.ensureUnusedCapacity(@truncate(u32, defines.count()));
-        var iter = defines.iterator();
-        while (iter.next()) |entry| {
-            var splitter = std.mem.split(u8, entry.key_ptr.*, ".");
-            while (splitter.next()) |part| {
-                if (!js_lexer.isIdentifier(part)) {
-                    if (strings.eql(part, entry.key_ptr)) {
-                        try log.addErrorFmt(null, logger.Loc{}, allocator, "define key \"{s}\" must be a valid identifier", .{entry.key_ptr.*});
-                    } else {
-                        try log.addErrorFmt(null, logger.Loc{}, allocator, "define key \"{s}\" contains invalid identifier \"{s}\"", .{ part, entry.value_ptr.* });
-                    }
-                    break;
-                }
-            }
-
-            if (js_lexer.isIdentifier(entry.value_ptr.*) and !js_lexer.Keywords.has(entry.value_ptr.*)) {
-
-                // Special-case undefined. it's not an identifier here
-                // https://github.com/evanw/esbuild/issues/1407
-                if (strings.eqlComptime(entry.value_ptr.*, "undefined")) {
-                    user_defines.putAssumeCapacity(
-                        entry.key_ptr.*,
-                        DefineData{
-                            .value = js_ast.Expr.Data{ .e_undefined = js_ast.E.Undefined{} },
-                            .original_name = entry.value_ptr.*,
-                            .can_be_removed_if_unused = true,
-                        },
-                    );
+    pub fn fromMergeableInputEntry(user_defines: *UserDefines, key: []const u8, value_str: []const u8, value_is_undefined: bool, method_call_must_be_replaced_with_undefined: bool, log: *logger.Log, allocator: std.mem.Allocator) !void {
+        var keySplitter = std.mem.split(u8, key, ".");
+        while (keySplitter.next()) |part| {
+            if (!js_lexer.isIdentifier(part)) {
+                if (strings.eql(part, key)) {
+                    try log.addErrorFmt(null, logger.Loc{}, allocator, "define key \"{s}\" must be a valid identifier", .{key});
                 } else {
-                    const ident = js_ast.E.Identifier{ .ref = Ref.None, .can_be_removed_if_unused = true };
-
-                    user_defines.putAssumeCapacity(
-                        entry.key_ptr.*,
-                        DefineData{
-                            .value = js_ast.Expr.Data{ .e_identifier = ident },
-                            .original_name = entry.value_ptr.*,
-                            .can_be_removed_if_unused = true,
-                        },
-                    );
+                    try log.addErrorFmt(null, logger.Loc{}, allocator, "define key \"{s}\" contains invalid identifier \"{s}\"", .{ part, value_str });
                 }
-
-                // user_defines.putAssumeCapacity(
-                //     entry.key_ptr,
-                //     DefineData{ .value = js_ast.Expr.Data{.e_identifier = } },
-                // );
-                continue;
+                break;
             }
-            var _log = log;
-            var source = logger.Source{
-                .contents = entry.value_ptr.*,
-                .path = defines_path,
-                .key_path = fs.Path.initWithNamespace("defines", "internal"),
-            };
-            var expr = try json_parser.ParseEnvJSON(&source, _log, allocator);
-            var data: js_ast.Expr.Data = undefined;
-            switch (expr.data) {
-                .e_missing => {
-                    data = .{ .e_missing = js_ast.E.Missing{} };
-                },
-                // We must copy so we don't recycle
-                .e_string => {
-                    data = .{ .e_string = try allocator.create(js_ast.E.String) };
-                    data.e_string.* = try expr.data.e_string.clone(allocator);
-                },
-                .e_null, .e_boolean, .e_number => {
-                    data = expr.data;
-                },
-                // We must copy so we don't recycle
-                .e_object => |obj| {
-                    expr.data.e_object = try allocator.create(js_ast.E.Object);
-                    expr.data.e_object.* = obj.*;
-                    data = expr.data;
-                },
-                // We must copy so we don't recycle
-                .e_array => |obj| {
-                    expr.data.e_array = try allocator.create(js_ast.E.Array);
-                    expr.data.e_array.* = obj.*;
-                    data = expr.data;
-                },
-                else => {
-                    continue;
-                },
-            }
-
-            user_defines.putAssumeCapacity(entry.key_ptr.*, DefineData{
-                .value = data,
-            });
         }
+
+        // check for nested identifiers
+        var valueSplitter = std.mem.split(u8, value_str, ".");
+        var isIdent = true;
+
+        while (valueSplitter.next()) |part| {
+            if (!js_lexer.isIdentifier(part) or js_lexer.Keywords.has(part)) {
+                isIdent = false;
+                break;
+            }
+        }
+
+        if (isIdent) {
+            // Special-case undefined. it's not an identifier here
+            // https://github.com/evanw/esbuild/issues/1407
+            const value = if (value_is_undefined or strings.eqlComptime(value_str, "undefined"))
+                js_ast.Expr.Data{ .e_undefined = js_ast.E.Undefined{} }
+            else
+                js_ast.Expr.Data{ .e_identifier = .{
+                    .ref = Ref.None,
+                    .can_be_removed_if_unused = true,
+                } };
+
+            user_defines.putAssumeCapacity(
+                key,
+                DefineData{
+                    .value = value,
+                    .original_name = value_str,
+                    .can_be_removed_if_unused = true,
+                    .valueless = value_is_undefined,
+                    .method_call_must_be_replaced_with_undefined = method_call_must_be_replaced_with_undefined,
+                },
+            );
+            return;
+        }
+        const _log = log;
+        var source = logger.Source{
+            .contents = value_str,
+            .path = defines_path,
+        };
+        const expr = try json_parser.parseEnvJSON(&source, _log, allocator);
+        const cloned = try expr.data.deepClone(allocator);
+        user_defines.putAssumeCapacity(key, DefineData{
+            .value = cloned,
+            .can_be_removed_if_unused = expr.isPrimitiveLiteral(),
+            .valueless = value_is_undefined,
+            .method_call_must_be_replaced_with_undefined = method_call_must_be_replaced_with_undefined,
+        });
     }
 
-    pub fn from_input(defines: RawDefines, log: *logger.Log, allocator: std.mem.Allocator) !UserDefines {
+    pub fn fromInput(defines: RawDefines, drop: []const []const u8, log: *logger.Log, allocator: std.mem.Allocator) !UserDefines {
         var user_defines = UserDefines.init(allocator);
-        try from_mergable_input(defines, &user_defines, log, allocator);
+        var iterator = defines.iterator();
+        try user_defines.ensureUnusedCapacity(@truncate(defines.count() + drop.len));
+        while (iterator.next()) |entry| {
+            try fromMergeableInputEntry(&user_defines, entry.key_ptr.*, entry.value_ptr.*, false, false, log, allocator);
+        }
+
+        for (drop) |drop_item| {
+            if (drop_item.len > 0) {
+                try fromMergeableInputEntry(&user_defines, drop_item, "", true, true, log, allocator);
+            }
+        }
 
         return user_defines;
     }
@@ -174,14 +168,11 @@ fn arePartsEqual(a: []const string, b: []const string) bool {
     if (a.len != b.len) {
         return false;
     }
-
-    var i: usize = 0;
-    while (i < a.len) : (i += 1) {
+    for (0..a.len) |i| {
         if (!strings.eql(a[i], b[i])) {
             return false;
         }
     }
-
     return true;
 }
 
@@ -193,121 +184,115 @@ pub const DotDefine = struct {
 };
 
 // var nan_val = try allocator.create(js_ast.E.Number);
-var nan_val = js_ast.E.Number{ .value = std.math.nan_f64 };
-var inf_val = js_ast.E.Number{ .value = std.math.inf_f64 };
+const nan_val = js_ast.E.Number{ .value = std.math.nan(f64) };
+const inf_val = js_ast.E.Number{ .value = std.math.inf(f64) };
 
 pub const Define = struct {
-    identifiers: std.StringHashMap(IdentifierDefine),
-    dots: std.StringHashMap([]DotDefine),
+    identifiers: bun.StringHashMap(IdentifierDefine),
+    dots: bun.StringHashMap([]DotDefine),
+    drop_debugger: bool,
     allocator: std.mem.Allocator,
+
+    pub const Data = DefineData;
+
+    pub fn forIdentifier(this: *const Define, name: []const u8) ?IdentifierDefine {
+        if (this.identifiers.get(name)) |data| {
+            return data;
+        }
+
+        return table.pure_global_identifier_map.get(name);
+    }
 
     pub fn insertFromIterator(define: *Define, allocator: std.mem.Allocator, comptime Iterator: type, iter: Iterator) !void {
         while (iter.next()) |user_define| {
-            const user_define_key = user_define.key_ptr.*;
-            // If it has a dot, then it's a DotDefine.
-            // e.g. process.env.NODE_ENV
-            if (strings.lastIndexOfChar(user_define_key, '.')) |last_dot| {
-                const tail = user_define_key[last_dot + 1 .. user_define_key.len];
-                const remainder = user_define_key[0..last_dot];
-                const count = std.mem.count(u8, remainder, ".") + 1;
-                var parts = try allocator.alloc(string, count + 1);
-                var splitter = std.mem.split(u8, remainder, ".");
-                var i: usize = 0;
-                while (splitter.next()) |split| : (i += 1) {
-                    parts[i] = split;
-                }
-                parts[i] = tail;
-                var didFind = false;
-                var initial_values: []DotDefine = &([_]DotDefine{});
-
-                // "NODE_ENV"
-                if (define.dots.getEntry(tail)) |entry| {
-                    for (entry.value_ptr.*) |*part| {
-                        // ["process", "env"] === ["process", "env"] (if that actually worked)
-                        if (arePartsEqual(part.parts, parts)) {
-                            part.data = part.data.merge(user_define.value_ptr.*);
-                            didFind = true;
-                            break;
-                        }
-                    }
-
-                    initial_values = entry.value_ptr.*;
-                }
-
-                if (!didFind) {
-                    var list = try std.ArrayList(DotDefine).initCapacity(allocator, initial_values.len + 1);
-                    if (initial_values.len > 0) {
-                        list.appendSliceAssumeCapacity(initial_values);
-                    }
-
-                    list.appendAssumeCapacity(DotDefine{
-                        .data = user_define.value_ptr.*,
-                        // TODO: do we need to allocate this?
-                        .parts = parts,
-                    });
-                    try define.dots.put(tail, list.toOwnedSlice());
-                }
-            } else {
-
-                // e.g. IS_BROWSER
-                try define.identifiers.put(user_define_key, user_define.value_ptr.*);
-            }
+            try define.insert(allocator, user_define.key_ptr.*, user_define.value_ptr.*);
         }
     }
 
-    pub fn init(allocator: std.mem.Allocator, _user_defines: ?UserDefines, string_defines: ?UserDefinesArray) !*@This() {
-        var define = try allocator.create(Define);
+    pub fn insert(define: *Define, allocator: std.mem.Allocator, key: []const u8, value: DefineData) !void {
+        // If it has a dot, then it's a DotDefine.
+        // e.g. process.env.NODE_ENV
+        if (strings.lastIndexOfChar(key, '.')) |last_dot| {
+            const tail = key[last_dot + 1 .. key.len];
+            const remainder = key[0..last_dot];
+            const count = std.mem.count(u8, remainder, ".") + 1;
+            var parts = try allocator.alloc(string, count + 1);
+            var splitter = std.mem.split(u8, remainder, ".");
+            var i: usize = 0;
+            while (splitter.next()) |split| : (i += 1) {
+                parts[i] = split;
+            }
+            parts[i] = tail;
+            var initial_values: []DotDefine = &([_]DotDefine{});
+
+            // "NODE_ENV"
+            const gpe_entry = try define.dots.getOrPut(tail);
+
+            if (gpe_entry.found_existing) {
+                for (gpe_entry.value_ptr.*) |*part| {
+                    // ["process", "env"] === ["process", "env"] (if that actually worked)
+                    if (arePartsEqual(part.parts, parts)) {
+                        part.data = part.data.merge(value);
+                        return;
+                    }
+                }
+
+                initial_values = gpe_entry.value_ptr.*;
+            }
+
+            var list = try std.ArrayList(DotDefine).initCapacity(allocator, initial_values.len + 1);
+            if (initial_values.len > 0) {
+                list.appendSliceAssumeCapacity(initial_values);
+            }
+
+            list.appendAssumeCapacity(DotDefine{
+                .data = value,
+                // TODO: do we need to allocate this?
+                .parts = parts,
+            });
+            gpe_entry.value_ptr.* = try list.toOwnedSlice();
+        } else {
+            // e.g. IS_BROWSER
+            try define.identifiers.put(key, value);
+        }
+    }
+
+    pub fn init(allocator: std.mem.Allocator, _user_defines: ?UserDefines, string_defines: ?UserDefinesArray, drop_debugger: bool) bun.OOM!*@This() {
+        const define = try allocator.create(Define);
         define.allocator = allocator;
-        define.identifiers = std.StringHashMap(IdentifierDefine).init(allocator);
-        define.dots = std.StringHashMap([]DotDefine).init(allocator);
-        try define.identifiers.ensureTotalCapacity(641 + 2 + 1);
-        try define.dots.ensureTotalCapacity(64);
+        define.identifiers = bun.StringHashMap(IdentifierDefine).init(allocator);
+        define.dots = bun.StringHashMap([]DotDefine).init(allocator);
+        define.drop_debugger = drop_debugger;
+        try define.dots.ensureTotalCapacity(124);
 
-        var val = js_ast.Expr.Data{
-            .e_undefined = .{},
+        const value_define = DefineData{
+            .value = .{ .e_undefined = .{} },
+            .valueless = true,
+            .can_be_removed_if_unused = true,
         };
-
-        var value_define = DefineData{ .value = val, .valueless = true };
         // Step 1. Load the globals into the hash tables
         for (GlobalDefinesKey) |global| {
-            if (global.len == 1) {
-                define.identifiers.putAssumeCapacityNoClobber(global[0], value_define);
+            const key = global[global.len - 1];
+            const gpe = try define.dots.getOrPut(key);
+            if (gpe.found_existing) {
+                var list = try std.ArrayList(DotDefine).initCapacity(allocator, gpe.value_ptr.*.len + 1);
+                list.appendSliceAssumeCapacity(gpe.value_ptr.*);
+                list.appendAssumeCapacity(DotDefine{
+                    .parts = global[0..global.len],
+                    .data = value_define,
+                });
+
+                gpe.value_ptr.* = try list.toOwnedSlice();
             } else {
-                const key = global[global.len - 1];
-                // TODO: move this to comptime
-                if (define.dots.getEntry(key)) |entry| {
-                    var list = try std.ArrayList(DotDefine).initCapacity(allocator, entry.value_ptr.*.len + 1);
-                    list.appendSliceAssumeCapacity(entry.value_ptr.*);
-                    list.appendAssumeCapacity(DotDefine{
-                        .parts = global[0..global.len],
-                        .data = value_define,
-                    });
+                var list = try std.ArrayList(DotDefine).initCapacity(allocator, 1);
+                list.appendAssumeCapacity(DotDefine{
+                    .parts = global[0..global.len],
+                    .data = value_define,
+                });
 
-                    define.dots.putAssumeCapacity(key, list.toOwnedSlice());
-                } else {
-                    var list = try std.ArrayList(DotDefine).initCapacity(allocator, 1);
-                    list.appendAssumeCapacity(DotDefine{
-                        .parts = global[0..global.len],
-                        .data = value_define,
-                    });
-
-                    define.dots.putAssumeCapacity(key, list.toOwnedSlice());
-                }
+                gpe.value_ptr.* = try list.toOwnedSlice();
             }
         }
-
-        // Step 2. Swap in certain literal values because those can be constant folded
-        define.identifiers.putAssumeCapacity("undefined", .{
-            .value = val,
-            .valueless = false,
-            .can_be_removed_if_unused = true,
-        });
-        define.identifiers.putAssumeCapacity("NaN", DefineData{
-            .value = js_ast.Expr.Data{ .e_number = nan_val },
-        });
-        define.identifiers.putAssumeCapacity("Infinity", DefineData{
-            .value = js_ast.Expr.Data{ .e_number = inf_val },
-        });
 
         // Step 3. Load user data into hash tables
         // At this stage, user data has already been validated.
@@ -323,32 +308,6 @@ pub const Define = struct {
             try define.insertFromIterator(allocator, @TypeOf(&iter), &iter);
         }
 
-        {
-            var global_entry = define.identifiers.getOrPutAssumeCapacity(Rewrites.global);
-            if (!global_entry.found_existing) {
-                global_entry.value_ptr.* = DefineData{ .value = js_ast.Expr.Data{ .e_identifier = globalThisIdentifier }, .original_name = Rewrites.globalThis };
-            }
-        }
-
         return define;
     }
 };
-
-const expect = std.testing.expect;
-test "UserDefines" {
-    js_ast.Stmt.Data.Store.create(default_allocator);
-    js_ast.Expr.Data.Store.create(default_allocator);
-    var orig = RawDefines.init(default_allocator);
-    try orig.put("process.env.NODE_ENV", "\"development\"");
-    try orig.put("globalThis", "window");
-    var log = logger.Log.init(default_allocator);
-    var data = try DefineData.from_input(orig, &log, default_allocator);
-
-    try expect(data.contains("process.env.NODE_ENV"));
-    try expect(data.contains("globalThis"));
-    const globalThis = data.get("globalThis");
-    const val = data.get("process.env.NODE_ENV");
-    try expect(val != null);
-    try expect(val.?.value.e_string.eql([]const u8, "development"));
-    try std.testing.expectEqualStrings(globalThis.?.original_name.?, "window");
-}

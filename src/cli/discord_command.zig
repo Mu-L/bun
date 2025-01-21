@@ -1,4 +1,4 @@
-const bun = @import("../global.zig");
+const bun = @import("root").bun;
 const string = bun.string;
 const Output = bun.Output;
 const Global = bun.Global;
@@ -12,8 +12,8 @@ const std = @import("std");
 const open = @import("../open.zig");
 
 pub const DiscordCommand = struct {
-    const discord_url: string = "https://bun.sh/discord";
+    const discord_url = "https://bun.sh/discord";
     pub fn exec(_: std.mem.Allocator) !void {
-        try open.openURL(discord_url);
+        open.openURL(discord_url);
     }
 };

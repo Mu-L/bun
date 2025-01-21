@@ -91,9 +91,9 @@ STATIC_ASSERT_ISO_SUBSPACE_SHARABLE(JSWritableStreamSinkPrototype, JSWritableStr
 /* Hash table for prototype */
 
 static const HashTableValue JSWritableStreamSinkPrototypeTableValues[] = {
-    { "write"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { (intptr_t) static_cast<RawNativeFunction>(jsWritableStreamSinkPrototypeFunction_write), (intptr_t)(1) } },
-    { "close"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { (intptr_t) static_cast<RawNativeFunction>(jsWritableStreamSinkPrototypeFunction_close), (intptr_t)(0) } },
-    { "error"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { (intptr_t) static_cast<RawNativeFunction>(jsWritableStreamSinkPrototypeFunction_error), (intptr_t)(1) } },
+    { "write"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { HashTableValue::NativeFunctionType, jsWritableStreamSinkPrototypeFunction_write, 1 } },
+    { "close"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { HashTableValue::NativeFunctionType, jsWritableStreamSinkPrototypeFunction_close, 0 } },
+    { "error"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { HashTableValue::NativeFunctionType, jsWritableStreamSinkPrototypeFunction_error, 1 } },
 };
 
 const ClassInfo JSWritableStreamSinkPrototype::s_info = { "WritableStreamSink"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(JSWritableStreamSinkPrototype) };
@@ -122,7 +122,9 @@ void JSWritableStreamSink::finishCreation(VM& vm)
 
 JSObject* JSWritableStreamSink::createPrototype(VM& vm, JSDOMGlobalObject& globalObject)
 {
-    return JSWritableStreamSinkPrototype::create(vm, &globalObject, JSWritableStreamSinkPrototype::createStructure(vm, &globalObject, globalObject.objectPrototype()));
+    auto* structure = JSWritableStreamSinkPrototype::createStructure(vm, &globalObject, globalObject.objectPrototype());
+    structure->setMayBePrototype(true);
+    return JSWritableStreamSinkPrototype::create(vm, &globalObject, structure);
 }
 
 JSObject* JSWritableStreamSink::prototype(VM& vm, JSDOMGlobalObject& globalObject)
@@ -150,7 +152,7 @@ static inline JSC::EncodedJSValue jsWritableStreamSinkPrototypeFunction_writeBod
         return JSValue::encode(jsUndefined());
     EnsureStillAliveScope argument0 = callFrame->uncheckedArgument(0);
     auto value = convert<IDLAny>(*lexicalGlobalObject, argument0.value());
-    RETURN_IF_EXCEPTION(throwScope, encodedJSValue());
+    RETURN_IF_EXCEPTION(throwScope, {});
     RELEASE_AND_RETURN(throwScope, JSValue::encode(toJS<IDLPromise<IDLUndefined>>(*lexicalGlobalObject, *castedThis->globalObject(), throwScope, [&]() -> decltype(auto) { return impl.write(*context, WTFMove(value), WTFMove(promise)); })));
 }
 
@@ -185,7 +187,7 @@ static inline JSC::EncodedJSValue jsWritableStreamSinkPrototypeFunction_errorBod
         return throwVMError(lexicalGlobalObject, throwScope, createNotEnoughArgumentsError(lexicalGlobalObject));
     EnsureStillAliveScope argument0 = callFrame->uncheckedArgument(0);
     auto message = convert<IDLDOMString>(*lexicalGlobalObject, argument0.value());
-    RETURN_IF_EXCEPTION(throwScope, encodedJSValue());
+    RETURN_IF_EXCEPTION(throwScope, {});
     RELEASE_AND_RETURN(throwScope, JSValue::encode(toJS<IDLUndefined>(*lexicalGlobalObject, throwScope, [&]() -> decltype(auto) { return impl.error(WTFMove(message)); })));
 }
 
@@ -199,9 +201,9 @@ JSC::GCClient::IsoSubspace* JSWritableStreamSink::subspaceForImpl(JSC::VM& vm)
     return WebCore::subspaceForImpl<JSWritableStreamSink, UseCustomHeapCellType::No>(
         vm,
         [](auto& spaces) { return spaces.m_clientSubspaceForWritableStreamSink.get(); },
-        [](auto& spaces, auto&& space) { spaces.m_clientSubspaceForWritableStreamSink = WTFMove(space); },
+        [](auto& spaces, auto&& space) { spaces.m_clientSubspaceForWritableStreamSink = std::forward<decltype(space)>(space); },
         [](auto& spaces) { return spaces.m_subspaceForWritableStreamSink.get(); },
-        [](auto& spaces, auto&& space) { spaces.m_subspaceForWritableStreamSink = WTFMove(space); });
+        [](auto& spaces, auto&& space) { spaces.m_subspaceForWritableStreamSink = std::forward<decltype(space)>(space); });
 }
 
 void JSWritableStreamSink::analyzeHeap(JSCell* cell, HeapAnalyzer& analyzer)
@@ -209,11 +211,11 @@ void JSWritableStreamSink::analyzeHeap(JSCell* cell, HeapAnalyzer& analyzer)
     auto* thisObject = jsCast<JSWritableStreamSink*>(cell);
     analyzer.setWrappedObjectForCell(cell, &thisObject->wrapped());
     if (thisObject->scriptExecutionContext())
-        analyzer.setLabelForCell(cell, "url " + thisObject->scriptExecutionContext()->url().string());
+        analyzer.setLabelForCell(cell, makeString("url "_s, thisObject->scriptExecutionContext()->url().string()));
     Base::analyzeHeap(cell, analyzer);
 }
 
-bool JSWritableStreamSinkOwner::isReachableFromOpaqueRoots(JSC::Handle<JSC::Unknown> handle, void*, AbstractSlotVisitor& visitor, const char** reason)
+bool JSWritableStreamSinkOwner::isReachableFromOpaqueRoots(JSC::Handle<JSC::Unknown> handle, void*, AbstractSlotVisitor& visitor, ASCIILiteral* reason)
 {
     UNUSED_PARAM(handle);
     UNUSED_PARAM(visitor);

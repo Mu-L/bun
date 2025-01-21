@@ -1,11 +1,12 @@
 // react-ssr.tsx
-import { renderToPipeableStream } from "react-dom/server.node";
 import React from "react";
+import { renderToPipeableStream } from "react-dom/server.node";
 const http = require("http");
 const App = () => (
   <html>
     <body>
       <h1>Hello World</h1>
+      <p>This is an example.</p>
     </body>
   </html>
 );
@@ -24,9 +25,7 @@ http
       onShellError(error) {
         // Something errored before we could complete the shell so we emit an alternative shell.
         res.statusCode = 500;
-        res.send(
-          '<!doctype html><p>Loading...</p><script src="clientrender.js"></script>'
-        );
+        res.send('<!doctype html><p>Loading...</p><script src="clientrender.js"></script>');
       },
       onAllReady() {
         // If you don't want streaming, use this instead of onShellReady.

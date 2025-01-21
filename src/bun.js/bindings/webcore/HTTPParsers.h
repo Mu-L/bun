@@ -30,6 +30,7 @@
 
 #pragma once
 
+#include <wtf/text/StringImpl.h>
 #include <wtf/HashSet.h>
 #include <wtf/WallTime.h>
 #include <wtf/text/StringHash.h>
@@ -38,7 +39,7 @@ namespace WebCore {
 
 typedef HashSet<String, ASCIICaseInsensitiveHash> HTTPHeaderSet;
 
-enum class HTTPHeaderName;
+enum class HTTPHeaderName : uint8_t;
 
 enum class XSSProtectionDisposition {
     Invalid,
@@ -69,6 +70,9 @@ enum class CrossOriginResourcePolicy : uint8_t {
     Invalid
 };
 
+enum class RangeAllowWhitespace : bool { No,
+    Yes };
+
 bool isValidReasonPhrase(const String&);
 bool isValidHTTPHeaderValue(const String&);
 bool isValidAcceptHeaderValue(const String&);
@@ -76,8 +80,7 @@ bool isValidLanguageHeaderValue(const String&);
 #if USE(GLIB)
 WEBCORE_EXPORT bool isValidUserAgentHeaderValue(const String&);
 #endif
-bool isValidHTTPToken(const String&);
-bool isValidHTTPToken(StringView);
+bool isValidHTTPToken(const StringView);
 std::optional<WallTime> parseHTTPDate(const String&);
 StringView filenameFromHTTPContentDisposition(StringView);
 WEBCORE_EXPORT String extractMIMETypeFromMediaType(const String&);
@@ -97,82 +100,74 @@ size_t parseHTTPHeader(const uint8_t* data, size_t length, String& failureReason
 size_t parseHTTPRequestBody(const uint8_t* data, size_t length, Vector<uint8_t>& body);
 
 // HTTP Header routine as per https://fetch.spec.whatwg.org/#terminology-headers
-bool isForbiddenHeaderName(const String&);
-bool isNoCORSSafelistedRequestHeaderName(const String&);
-bool isPriviledgedNoCORSRequestHeaderName(const String&);
-bool isForbiddenResponseHeaderName(const String&);
-bool isForbiddenMethod(const String&);
-bool isSimpleHeader(const String& name, const String& value);
-bool isCrossOriginSafeHeader(HTTPHeaderName, const HTTPHeaderSet&);
-bool isCrossOriginSafeHeader(const String&, const HTTPHeaderSet&);
-bool isCrossOriginSafeRequestHeader(HTTPHeaderName, const String&);
+bool isForbiddenHeaderName(const StringView);
+bool isNoCORSSafelistedRequestHeaderName(const StringView);
+bool isPriviledgedNoCORSRequestHeaderName(const StringView);
+bool isForbiddenResponseHeaderName(const StringView);
+bool isForbiddenMethod(const StringView);
+bool isSimpleHeader(const StringView name, const StringView value);
+// bool isCrossOriginSafeHeader(HTTPHeaderName, const HTTPHeaderSet&);
+// bool isCrossOriginSafeHeader(const String&, const HTTPHeaderSet&);
+bool isCrossOriginSafeRequestHeader(HTTPHeaderName, const StringView);
 
 String normalizeHTTPMethod(const String&);
 bool isSafeMethod(const String&);
 
 WEBCORE_EXPORT CrossOriginResourcePolicy parseCrossOriginResourcePolicyHeader(StringView);
 
+// -1 could be set to one of the return parameters to indicate the value is not specified.
+WEBCORE_EXPORT bool parseRange(StringView, RangeAllowWhitespace, long long& rangeStart, long long& rangeEnd);
+
 inline bool isHTTPSpace(UChar character)
 {
     return character <= ' ' && (character == ' ' || character == '\n' || character == '\t' || character == '\r');
 }
 
-// Strip leading and trailing whitespace as defined in https://fetch.spec.whatwg.org/#concept-header-value-normalize.
-inline String stripLeadingAndTrailingHTTPSpaces(const String& string)
-{
-    return string.stripLeadingAndTrailingCharacters(isHTTPSpace);
-}
+// template<class HashType>
+// bool addToAccessControlAllowList(const String& string, unsigned start, unsigned end, HashSet<String, HashType>& set)
+// {
+//     StringImpl* stringImpl = string.impl();
+//     if (!stringImpl)
+//         return true;
 
-inline StringView stripLeadingAndTrailingHTTPSpaces(StringView string)
-{
-    return string.stripLeadingAndTrailingMatchedCharacters(isHTTPSpace);
-}
+//     // Skip white space from start.
+//     while (start <= end && isJSONOrHTTPWhitespace((*stringImpl)[start]))
+//         ++start;
 
-template<class HashType>
-bool addToAccessControlAllowList(const String& string, unsigned start, unsigned end, HashSet<String, HashType>& set)
-{
-    StringImpl* stringImpl = string.impl();
-    if (!stringImpl)
-        return true;
+//     // only white space
+//     if (start > end)
+//         return true;
 
-    // Skip white space from start.
-    while (start <= end && isHTTPSpace((*stringImpl)[start]))
-        ++start;
+//     // Skip white space from end.
+//     while (end && isJSONOrHTTPWhitespace((*stringImpl)[end]))
+//         --end;
 
-    // only white space
-    if (start > end)
-        return true;
+//     auto token = string.substring(start, end - start + 1);
+//     if (!isValidHTTPToken(token))
+//         return false;
 
-    // Skip white space from end.
-    while (end && isHTTPSpace((*stringImpl)[end]))
-        --end;
+//     set.add(WTFMove(token));
+//     return true;
+// }
 
-    auto token = string.substring(start, end - start + 1);
-    if (!isValidHTTPToken(token))
-        return false;
-
-    set.add(WTFMove(token));
-    return true;
-}
-
-template<class HashType = DefaultHash<String>>
-std::optional<HashSet<String, HashType>> parseAccessControlAllowList(const String& string)
-{
-    HashSet<String, HashType> set;
-    unsigned start = 0;
-    size_t end;
-    while ((end = string.find(',', start)) != notFound) {
-        if (start != end) {
-            if (!addToAccessControlAllowList(string, start, end - 1, set))
-                return {};
-        }
-        start = end + 1;
-    }
-    if (start != string.length()) {
-        if (!addToAccessControlAllowList(string, start, string.length() - 1, set))
-            return {};
-    }
-    return set;
-}
+// template<class HashType = DefaultHash<String>>
+// std::optional<HashSet<String, HashType>> parseAccessControlAllowList(const String& string)
+// {
+//     HashSet<String, HashType> set;
+//     unsigned start = 0;
+//     size_t end;
+//     while ((end = string.find(',', start)) != notFound) {
+//         if (start != end) {
+//             if (!addToAccessControlAllowList(string, start, end - 1, set))
+//                 return {};
+//         }
+//         start = end + 1;
+//     }
+//     if (start != string.length()) {
+//         if (!addToAccessControlAllowList(string, start, string.length() - 1, set))
+//             return {};
+//     }
+//     return set;
+// }
 
 }

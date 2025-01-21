@@ -1,65 +1,36 @@
-const Lock = @import("../lock.zig").Lock;
+const Lock = bun.Mutex;
 const std = @import("std");
-const MutableString = @import("../global.zig").MutableString;
-const getAllocator = @import("../http_client_async.zig").getAllocator;
+const MutableString = bun.MutableString;
+const getAllocator = @import("../http.zig").getAllocator;
 const ZlibPool = @This();
 const Zlib = @import("../zlib.zig");
+const bun = @import("root").bun;
 
-lock: Lock = Lock.init(),
-items: std.ArrayList(*MutableString),
-allocator: std.mem.Allocator,
-
-pub var instance: ZlibPool = undefined;
-pub var loaded: bool = false;
-
-pub fn init(allocator: std.mem.Allocator) ZlibPool {
-    return ZlibPool{
-        .allocator = allocator,
-        .items = std.ArrayList(*MutableString).init(allocator),
-    };
+fn initMutableString(allocator: std.mem.Allocator) anyerror!MutableString {
+    return MutableString.initEmpty(allocator);
 }
 
-pub fn get(this: *ZlibPool) !*MutableString {
-    switch (this.items.items.len) {
-        0 => {
-            var mutable = try getAllocator().create(MutableString);
-            mutable.* = try MutableString.init(getAllocator(), 0);
-            return mutable;
-        },
-        else => {
-            return this.items.pop();
-        },
-    }
-
-    unreachable;
+const BufferPool = bun.ObjectPool(MutableString, initMutableString, false, 4);
+pub fn get(allocator: std.mem.Allocator) *MutableString {
+    return &BufferPool.get(allocator).data;
 }
 
-pub fn put(this: *ZlibPool, mutable: *MutableString) !void {
+pub fn put(mutable: *MutableString) void {
     mutable.reset();
-    try this.items.append(mutable);
+    var node: BufferPool.Node = @fieldParentPtr("data", mutable);
+    node.release();
 }
 
-pub fn decompress(compressed_data: []const u8, output: *MutableString) Zlib.ZlibError!void {
-    // Heuristic: if we have more than 128 KB of data to decompress
-    // it may take 1ms or so
-    // We must keep the network thread unblocked as often as possible
-    // So if we have more than 50 KB of data to decompress, we do it off the network thread
-    // if (compressed_data.len < 50_000) {
-    var reader = try Zlib.ZlibReaderArrayList.init(compressed_data, &output.list, getAllocator());
+pub fn decompress(compressed_data: []const u8, output: *MutableString, allocator: std.mem.Allocator) Zlib.ZlibError!void {
+    var reader = try Zlib.ZlibReaderArrayList.initWithOptionsAndListAllocator(
+        compressed_data,
+        &output.list,
+        output.allocator,
+        allocator,
+        .{
+            .windowBits = 15 + 32,
+        },
+    );
     try reader.readAll();
-    return;
-    // }
-
-    // var task = try DecompressionTask.get(default_allocator);
-    // defer task.release();
-    // task.* = DecompressionTask{
-    //     .data = compressed_data,
-    //     .output = output,
-    //     .event_fd = AsyncIO.global.eventfd(),
-    // };
-    // task.scheduleAndWait();
-
-    // if (task.err) |err| {
-    //     return @errSetCast(Zlib.ZlibError, err);
-    // }
+    reader.deinit();
 }

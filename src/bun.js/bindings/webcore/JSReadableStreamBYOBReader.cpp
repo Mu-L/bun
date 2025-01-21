@@ -30,7 +30,6 @@
 #include "JSDOMGlobalObjectInlines.h"
 #include "JSDOMOperation.h"
 #include "JSDOMWrapperCache.h"
-#include "ReadableStreamBYOBReaderBuiltins.h"
 #include "WebCoreJSClientData.h"
 #include <JavaScriptCore/FunctionPrototype.h>
 #include <JavaScriptCore/JSCInlines.h>
@@ -40,12 +39,10 @@
 #include <wtf/GetPtr.h>
 #include <wtf/PointerPreparations.h>
 
-
 namespace WebCore {
 using namespace JSC;
 
 // Functions
-
 
 // Attributes
 
@@ -109,13 +106,12 @@ template<> FunctionExecutable* JSReadableStreamBYOBReaderDOMConstructor::initial
 
 /* Hash table for prototype */
 
-static const HashTableValue JSReadableStreamBYOBReaderPrototypeTableValues[] =
-{
-    { "constructor"_s, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum), NoIntrinsic, { (intptr_t)static_cast<PropertySlot::GetValueFunc>(jsReadableStreamBYOBReaderConstructor), (intptr_t) static_cast<PutPropertySlot::PutValueFunc>(0) } },
-    { "closed"_s, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum | JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::Accessor | JSC::PropertyAttribute::Builtin), NoIntrinsic, { (intptr_t)static_cast<BuiltinGenerator>(readableStreamBYOBReaderClosedCodeGenerator), (intptr_t) (0) } },
-    { "read"_s, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum | JSC::PropertyAttribute::Builtin), NoIntrinsic, { (intptr_t)static_cast<BuiltinGenerator>(readableStreamBYOBReaderReadCodeGenerator), (intptr_t) (0) } },
-    { "cancel"_s, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum | JSC::PropertyAttribute::Builtin), NoIntrinsic, { (intptr_t)static_cast<BuiltinGenerator>(readableStreamBYOBReaderCancelCodeGenerator), (intptr_t) (0) } },
-    { "releaseLock"_s, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum | JSC::PropertyAttribute::Builtin), NoIntrinsic, { (intptr_t)static_cast<BuiltinGenerator>(readableStreamBYOBReaderReleaseLockCodeGenerator), (intptr_t) (0) } },
+static const HashTableValue JSReadableStreamBYOBReaderPrototypeTableValues[] = {
+    { "constructor"_s, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum), NoIntrinsic, { HashTableValue::GetterSetterType, jsReadableStreamBYOBReaderConstructor, 0 } },
+    { "closed"_s, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum | JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::Accessor | JSC::PropertyAttribute::Builtin), NoIntrinsic, { HashTableValue::BuiltinAccessorType, readableStreamBYOBReaderClosedCodeGenerator, 0 } },
+    { "read"_s, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum | JSC::PropertyAttribute::Builtin), NoIntrinsic, { HashTableValue::BuiltinGeneratorType, readableStreamBYOBReaderReadCodeGenerator, 0 } },
+    { "cancel"_s, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum | JSC::PropertyAttribute::Builtin), NoIntrinsic, { HashTableValue::BuiltinGeneratorType, readableStreamBYOBReaderCancelCodeGenerator, 0 } },
+    { "releaseLock"_s, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum | JSC::PropertyAttribute::Builtin), NoIntrinsic, { HashTableValue::BuiltinGeneratorType, readableStreamBYOBReaderReleaseLockCodeGenerator, 0 } },
 };
 
 const ClassInfo JSReadableStreamBYOBReaderPrototype::s_info = { "ReadableStreamBYOBReader"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(JSReadableStreamBYOBReaderPrototype) };
@@ -130,18 +126,21 @@ void JSReadableStreamBYOBReaderPrototype::finishCreation(VM& vm)
 const ClassInfo JSReadableStreamBYOBReader::s_info = { "ReadableStreamBYOBReader"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(JSReadableStreamBYOBReader) };
 
 JSReadableStreamBYOBReader::JSReadableStreamBYOBReader(Structure* structure, JSDOMGlobalObject& globalObject)
-    : JSDOMObject(structure, globalObject) { }
+    : JSDOMObject(structure, globalObject)
+{
+}
 
 void JSReadableStreamBYOBReader::finishCreation(VM& vm)
 {
     Base::finishCreation(vm);
     ASSERT(inherits(info()));
-
 }
 
 JSObject* JSReadableStreamBYOBReader::createPrototype(VM& vm, JSDOMGlobalObject& globalObject)
 {
-    return JSReadableStreamBYOBReaderPrototype::create(vm, &globalObject, JSReadableStreamBYOBReaderPrototype::createStructure(vm, &globalObject, globalObject.objectPrototype()));
+    auto* structure = JSReadableStreamBYOBReaderPrototype::createStructure(vm, &globalObject, globalObject.objectPrototype());
+    structure->setMayBePrototype(true);
+    return JSReadableStreamBYOBReaderPrototype::create(vm, &globalObject, structure);
 }
 
 JSObject* JSReadableStreamBYOBReader::prototype(VM& vm, JSDOMGlobalObject& globalObject)
@@ -160,7 +159,7 @@ void JSReadableStreamBYOBReader::destroy(JSC::JSCell* cell)
     thisObject->JSReadableStreamBYOBReader::~JSReadableStreamBYOBReader();
 }
 
-JSC_DEFINE_CUSTOM_GETTER(jsReadableStreamBYOBReaderConstructor, (JSGlobalObject* lexicalGlobalObject, EncodedJSValue thisValue, PropertyName))
+JSC_DEFINE_CUSTOM_GETTER(jsReadableStreamBYOBReaderConstructor, (JSGlobalObject * lexicalGlobalObject, JSC::EncodedJSValue thisValue, PropertyName))
 {
     VM& vm = JSC::getVM(lexicalGlobalObject);
     auto throwScope = DECLARE_THROW_SCOPE(vm);
@@ -172,13 +171,11 @@ JSC_DEFINE_CUSTOM_GETTER(jsReadableStreamBYOBReaderConstructor, (JSGlobalObject*
 
 JSC::GCClient::IsoSubspace* JSReadableStreamBYOBReader::subspaceForImpl(JSC::VM& vm)
 {
-    return WebCore::subspaceForImpl<JSReadableStreamBYOBReader, UseCustomHeapCellType::No>(vm,
-        [] (auto& spaces) { return spaces.m_clientSubspaceForReadableStreamBYOBReader.get(); },
-        [] (auto& spaces, auto&& space) { spaces.m_clientSubspaceForReadableStreamBYOBReader = WTFMove(space); },
-        [] (auto& spaces) { return spaces.m_subspaceForReadableStreamBYOBReader.get(); },
-        [] (auto& spaces, auto&& space) { spaces.m_subspaceForReadableStreamBYOBReader = WTFMove(space); }
-    );
+    return WebCore::subspaceForImpl<JSReadableStreamBYOBReader, UseCustomHeapCellType::No>(
+        vm,
+        [](auto& spaces) { return spaces.m_clientSubspaceForReadableStreamBYOBReader.get(); },
+        [](auto& spaces, auto&& space) { spaces.m_clientSubspaceForReadableStreamBYOBReader = std::forward<decltype(space)>(space); },
+        [](auto& spaces) { return spaces.m_subspaceForReadableStreamBYOBReader.get(); },
+        [](auto& spaces, auto&& space) { spaces.m_subspaceForReadableStreamBYOBReader = std::forward<decltype(space)>(space); });
 }
-
-
 }

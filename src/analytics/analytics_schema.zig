@@ -17,12 +17,12 @@ pub const Reader = struct {
     }
 
     pub fn read(this: *Self, count: usize) ![]u8 {
-        const read_count = @minimum(count, this.remain.len);
+        const read_count = @min(count, this.remain.len);
         if (read_count < count) {
             return error.EOF;
         }
 
-        var slice = this.remain[0..read_count];
+        const slice = this.remain[0..read_count];
 
         this.remain = this.remain[read_count..];
 
@@ -30,7 +30,7 @@ pub const Reader = struct {
     }
 
     pub inline fn readAs(this: *Self, comptime T: type) !T {
-        if (!std.meta.trait.hasUniqueRepresentation(T)) {
+        if (!std.meta.hasUniqueRepresentation(T)) {
             @compileError(@typeName(T) ++ " must have unique representation.");
         }
 
@@ -58,13 +58,13 @@ pub const Reader = struct {
         return E.InvalidValue;
     }
 
-    pub inline fn readArray(this: *Self, comptime T: type) ![]const T {
+    pub fn readArray(this: *Self, comptime T: type) ![]const T {
         const length = try this.readInt(u32);
         if (length == 0) {
             return &([_]T{});
         }
 
-        switch (comptime T) {
+        switch (T) {
             u8 => {
                 return try this.read(length);
             },
@@ -72,11 +72,8 @@ pub const Reader = struct {
                 return std.mem.readIntSliceNative(T, this.read(length * @sizeOf(T)));
             },
             [:0]const u8, []const u8 => {
-                var i: u32 = 0;
-                var array = try this.allocator.alloc(T, length);
-                while (i < length) : (i += 1) {
-                    array[i] = try this.readArray(u8);
-                }
+                const array = try this.allocator.alloc(T, length);
+                for (array) |*a| a.* = try this.readArray(u8);
                 return array;
             },
             else => {
@@ -85,7 +82,7 @@ pub const Reader = struct {
                         switch (Struct.layout) {
                             .Packed => {
                                 const sizeof = @sizeOf(T);
-                                var slice = try this.read(sizeof * length);
+                                const slice = try this.read(sizeof * length);
                                 return std.mem.bytesAsSlice(T, slice);
                             },
                             else => {},
@@ -93,17 +90,13 @@ pub const Reader = struct {
                     },
                     .Enum => |type_info| {
                         const enum_values = try this.read(length * @sizeOf(type_info.tag_type));
-                        return @ptrCast([*]T, enum_values.ptr)[0..length];
+                        return @as([*]T, @ptrCast(enum_values.ptr))[0..length];
                     },
                     else => {},
                 }
 
-                var i: u32 = 0;
-                var array = try this.allocator.alloc(T, length);
-                while (i < length) : (i += 1) {
-                    array[i] = try this.readValue(T);
-                }
-
+                const array = try this.allocator.alloc(T, length);
+                for (array) |*v| v.* = try this.readValue(T);
                 return array;
             },
         }
@@ -119,7 +112,7 @@ pub const Reader = struct {
     }
 
     pub inline fn readInt(this: *Self, comptime T: type) !T {
-        var slice = try this.read(@sizeOf(T));
+        const slice = try this.read(@sizeOf(T));
 
         return std.mem.readIntSliceNative(T, slice);
     }
@@ -156,7 +149,7 @@ pub const Reader = struct {
                             .Packed => {
                                 const sizeof = @sizeOf(T);
                                 var slice = try this.read(sizeof);
-                                return @ptrCast(*T, slice[0..sizeof]).*;
+                                return @as(*align(1) T, @ptrCast(slice[0..sizeof])).*;
                             },
                             else => {},
                         }
@@ -201,7 +194,7 @@ pub fn Writer(comptime WritableStream: type) type {
         }
 
         pub inline fn writeEnum(this: *Self, val: anytype) !void {
-            try this.writeInt(@enumToInt(val));
+            try this.writeInt(@intFromEnum(val));
         }
 
         pub fn writeValue(this: *Self, comptime SliceType: type, slice: SliceType) !void {
@@ -263,8 +256,8 @@ pub fn Writer(comptime WritableStream: type) type {
             }
         }
 
-        pub inline fn writeArray(this: *Self, comptime T: type, slice: anytype) !void {
-            try this.writeInt(@truncate(u32, slice.len));
+        pub fn writeArray(this: *Self, comptime T: type, slice: anytype) !void {
+            try this.writeInt(@as(u32, @truncate(slice.len)));
 
             switch (T) {
                 u8 => {
@@ -346,8 +339,8 @@ pub const analytics = struct {
 
         _,
 
-        pub fn jsonStringify(self: *const @This(), opts: anytype, o: anytype) !void {
-            return try std.json.stringify(@tagName(self), opts, o);
+        pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            return try writer.write(@tagName(self));
         }
     };
 
@@ -361,8 +354,8 @@ pub const analytics = struct {
 
         _,
 
-        pub fn jsonStringify(self: *const @This(), opts: anytype, o: anytype) !void {
-            return try std.json.stringify(@tagName(self), opts, o);
+        pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            return try writer.write(@tagName(self));
         }
     };
 
@@ -411,8 +404,8 @@ pub const analytics = struct {
 
         _,
 
-        pub fn jsonStringify(self: *const @This(), opts: anytype, o: anytype) !void {
-            return try std.json.stringify(@tagName(self), opts, o);
+        pub fn jsonStringify(self: @This(), writer: anytype) !void {
+            return try writer.write(@tagName(self));
         }
     };
 

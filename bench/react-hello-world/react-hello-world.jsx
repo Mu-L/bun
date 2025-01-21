@@ -1,12 +1,12 @@
-// import { renderToReadableStream } from "react-dom/server.browser";
-var { renderToReadableStream } = import.meta.require(
-  "../../test/bun.js/reactdom-bun.js"
-);
+// to run this:
+//  NODE_ENV=production bun react-hello-world.jsx
 
+// Make sure you're using react-dom@18.3.0 or later.
+// Currently that is available at react-dom@next (which is installed in this repository)
+import { renderToReadableStream } from "react-dom/server";
 const headers = {
   headers: {
     "Content-Type": "text/html",
-    "Cache-Control": "no-transform", // set to match the Deno benchmark, which requires this for an apples to apples comparison
   },
 };
 
@@ -14,12 +14,17 @@ const App = () => (
   <html>
     <body>
       <h1>Hello World</h1>
+      <p>This is an example.</p>
     </body>
   </html>
 );
 
-export default {
+const port = Number(process.env.PORT || 3001);
+Bun.serve({
+  port,
   async fetch(req) {
     return new Response(await renderToReadableStream(<App />), headers);
   },
-};
+});
+
+console.log(`Server running on\n  http://localhost:${port}`);

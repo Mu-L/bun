@@ -13,17 +13,20 @@ class DOMWrapperWorld;
 #include "ExtendedDOMClientIsoSubspaces.h"
 #include "ExtendedDOMIsoSubspaces.h"
 #include "DOMIsoSubspaces.h"
-// #include "DOMWrapperWorld.h"
 #include "BunBuiltinNames.h"
 // #include "WebCoreJSBuiltins.h"
 // #include "WorkerThreadType.h"
-#include "wtf/Function.h"
-#include "wtf/HashSet.h"
-#include "wtf/RefPtr.h"
-#include "JavaScriptCore/WeakInlines.h"
-#include "JavaScriptCore/IsoSubspacePerVM.h"
-
+#include <wtf/Function.h>
+#include <wtf/HashSet.h>
+#include <wtf/RefPtr.h>
+#include <JavaScriptCore/WeakInlines.h>
+#include <JavaScriptCore/IsoSubspacePerVM.h>
+#include <wtf/StdLibExtras.h>
 #include "WebCoreJSBuiltins.h"
+#include "JSCTaskScheduler.h"
+
+namespace Zig {
+}
 
 namespace WebCore {
 using namespace JSC;
@@ -55,6 +58,8 @@ public:
     }
 
     JSC::IsoHeapCellType m_heapCellTypeForJSWorkerGlobalScope;
+    JSC::IsoHeapCellType m_heapCellTypeForNodeVMGlobalObject;
+    JSC::IsoHeapCellType m_heapCellTypeForBakeGlobalObject;
 
 private:
     Lock m_lock;
@@ -73,15 +78,20 @@ class JSVMClientData : public JSC::VM::ClientData {
     WTF_MAKE_FAST_ALLOCATED;
 
 public:
-    explicit JSVMClientData(JSC::VM&);
+    explicit JSVMClientData(JSC::VM&, RefPtr<JSC::SourceProvider>);
 
     virtual ~JSVMClientData();
 
-    static void create(JSC::VM*);
+    static void create(JSC::VM*, void*);
 
     JSHeapData& heapData() { return *m_heapData; }
     BunBuiltinNames& builtinNames() { return m_builtinNames; }
     JSBuiltinFunctions& builtinFunctions() { return m_builtinFunctions; }
+
+    String overrideSourceURL(const StackFrame&, const String& originalSourceURL) const
+    {
+        return originalSourceURL;
+    }
 
     WebCore::DOMWrapperWorld& normalWorld() { return *m_normalWorld; }
 
@@ -98,6 +108,9 @@ public:
         for (auto* space : m_outputConstraintSpaces)
             func(*space);
     }
+
+    void* bunVM;
+    Bun::JSCTaskScheduler deferredWorkTimer;
 
 private:
     BunBuiltinNames m_builtinNames;
@@ -140,7 +153,7 @@ ALWAYS_INLINE JSC::GCClient::IsoSubspace* subspaceForImpl(JSC::VM& vm, GetClient
                 uniqueSubspace = makeUnique<JSC::IsoSubspace> ISO_SUBSPACE_INIT(heap, heap.cellHeapCellType, T);
         }
         space = uniqueSubspace.get();
-        setServer(subspaces, uniqueSubspace);
+        setServer(subspaces, WTFMove(uniqueSubspace));
 
         IGNORE_WARNINGS_BEGIN("unreachable-code")
         IGNORE_WARNINGS_BEGIN("tautological-compare")
@@ -154,7 +167,7 @@ ALWAYS_INLINE JSC::GCClient::IsoSubspace* subspaceForImpl(JSC::VM& vm, GetClient
 
     auto uniqueClientSubspace = makeUnique<JSC::GCClient::IsoSubspace>(*space);
     auto* clientSpace = uniqueClientSubspace.get();
-    setClient(clientSubspaces, uniqueClientSubspace);
+    setClient(clientSubspaces, WTFMove(uniqueClientSubspace));
     return clientSpace;
 }
 
@@ -178,6 +191,11 @@ static inline BunBuiltinNames& builtinNames(JSC::VM& vm)
 }
 
 } // namespace WebCore
+
+inline void* bunVM(JSC::VM& vm)
+{
+    return WebCore::clientData(vm)->bunVM;
+}
 
 namespace WebCore {
 using JSVMClientData = WebCore::JSVMClientData;

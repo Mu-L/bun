@@ -1,17 +1,28 @@
 const std = @import("std");
+const bun = @import("root").bun;
 const StaticExport = @import("./static_export.zig");
 const Sizes = @import("./sizes.zig");
-pub const is_bindgen: bool = std.meta.globalOption("bindgen", bool) orelse false;
+pub const is_bindgen: bool = false;
 const headers = @import("./headers.zig");
 
 fn isNullableType(comptime Type: type) bool {
-    return @typeInfo(Type) == .Optional;
+    return @typeInfo(Type) == .Optional or
+        (@typeInfo(Type) == .Pointer and @typeInfo(Type).Pointer.is_allowzero);
 }
 
+const log = @import("../../output.zig").scoped(.CPP, true);
 pub fn Shimmer(comptime _namespace: []const u8, comptime _name: []const u8, comptime Parent: type) type {
     return struct {
         pub const namespace = _namespace;
         pub const name = _name;
+
+        pub fn assertJSFunction(comptime funcs: anytype) void {
+            inline for (funcs) |func| {
+                if (@typeInfo(@TypeOf(func)) != .Fn) {
+                    @compileError("Expected " ++ @typeName(Parent) ++ "." ++ @typeName(func) ++ " to be a function but received " ++ @tagName(@typeInfo(@TypeOf(func))));
+                }
+            }
+        }
 
         pub fn ref() void {
             if (comptime @hasDecl(Parent, "Export")) {
@@ -34,7 +45,7 @@ pub fn Shimmer(comptime _namespace: []const u8, comptime _name: []const u8, comp
         //         return FromType;
         //     }
 
-        //     var ReturnTypeInfo: std.builtin.TypeInfo = @typeInfo(FromType);
+        //     var ReturnTypeInfo: std.builtin.Type = @typeInfo(FromType);
 
         //     if (ReturnTypeInfo == .Pointer and NewReturnType != *anyopaque) {
         //         NewReturnType = ReturnTypeInfo.Pointer.child;
@@ -103,13 +114,19 @@ pub fn Shimmer(comptime _namespace: []const u8, comptime _name: []const u8, comp
             const FunctionsType = @TypeOf(Functions);
             return comptime brk: {
                 var functions: [std.meta.fieldNames(FunctionsType).len]StaticExport = undefined;
-                for (std.meta.fieldNames(FunctionsType)) |fn_name, i| {
+                for (std.meta.fieldNames(FunctionsType), 0..) |fn_name, i| {
                     const Function = @TypeOf(@field(Functions, fn_name));
                     if (@typeInfo(Function) != .Fn) {
                         @compileError("Expected " ++ @typeName(Parent) ++ "." ++ @typeName(Function) ++ " to be a function but received " ++ @tagName(@typeInfo(Function)));
                     }
-                    var Fn: std.builtin.TypeInfo.Fn = @typeInfo(Function).Fn;
-                    if (Fn.calling_convention != .C) {
+                    const Fn: std.builtin.Type.Fn = @typeInfo(Function).Fn;
+                    if (Function == bun.JSC.JSHostFunctionTypeWithCCallConvForAssertions and bun.JSC.conv != .C) {
+                        @compileError("Expected " ++ bun.meta.typeName(Function) ++ " to have a JSC.conv Calling Convention.");
+                    } else if (Function == bun.JSC.JSHostFunctionType) {
+                        //
+                    } else if (Function == bun.JSC.JSHostZigFunction) {
+                        //
+                    } else if (Fn.calling_convention != .C) {
                         @compileError("Expected " ++ @typeName(Parent) ++ "." ++ @typeName(Function) ++ " to have a C Calling Convention.");
                     }
 
@@ -131,13 +148,13 @@ pub fn Shimmer(comptime _namespace: []const u8, comptime _name: []const u8, comp
             return comptime brk: {
                 var functions: [std.meta.fieldNames(FunctionsType).len * 2]StaticExport = undefined;
                 var j: usize = 0;
-                inline for (Functions) |thenable| {
-                    inline for ([_][]const u8{ "resolve", "reject" }) |fn_name| {
+                for (Functions) |thenable| {
+                    for ([_][]const u8{ "resolve", "reject" }) |fn_name| {
                         const Function = @TypeOf(@field(thenable, fn_name));
                         if (@typeInfo(Function) != .Fn) {
                             @compileError("Expected " ++ @typeName(Parent) ++ "." ++ @typeName(Function) ++ " to be a function but received " ++ @tagName(@typeInfo(Function)));
                         }
-                        var Fn: std.builtin.TypeInfo.Fn = @typeInfo(Function).Fn;
+                        const Fn: std.builtin.Type.Fn = @typeInfo(Function).Fn;
                         if (Fn.calling_convention != .C) {
                             @compileError("Expected " ++ @typeName(Parent) ++ "." ++ @typeName(Function) ++ " to have a C Calling Convention.");
                         }
@@ -161,7 +178,7 @@ pub fn Shimmer(comptime _namespace: []const u8, comptime _name: []const u8, comp
             if (comptime isNullableType(ExpectedReturnType) != isNullableType(ExternReturnType)) {
                 return value.?;
             } else if (comptime (@typeInfo(ExpectedReturnType) == .Enum) and (@typeInfo(ExternReturnType) != .Enum)) {
-                return @intToEnum(ExpectedReturnType, value);
+                return @as(ExpectedReturnType, @enumFromInt(value));
             } else {
                 return value;
             }
@@ -174,15 +191,23 @@ pub fn Shimmer(comptime _namespace: []const u8, comptime _name: []const u8, comp
             }
             break :ret @typeInfo(@TypeOf(@field(Parent, typeName))).Fn.return_type.?;
         }) {
+            log(comptime name ++ "__" ++ typeName, .{});
             @setEvalBranchQuota(99999);
             if (comptime is_bindgen) {
                 unreachable;
             } else {
                 const Fn = comptime @field(headers, symbolName(typeName));
+                if (@typeInfo(@TypeOf(Fn)).Fn.params.len > 0)
+                    return matchNullable(
+                        comptime @typeInfo(@TypeOf(@field(Parent, typeName))).Fn.return_type.?,
+                        comptime @typeInfo(@TypeOf(Fn)).Fn.return_type.?,
+                        @call(.auto, Fn, args),
+                    );
+
                 return matchNullable(
                     comptime @typeInfo(@TypeOf(@field(Parent, typeName))).Fn.return_type.?,
                     comptime @typeInfo(@TypeOf(Fn)).Fn.return_type.?,
-                    @call(.{}, Fn, args),
+                    Fn(),
                 );
             }
         }

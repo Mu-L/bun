@@ -92,10 +92,10 @@ STATIC_ASSERT_ISO_SUBSPACE_SHARABLE(JSReadableStreamSourcePrototype, JSReadableS
 /* Hash table for prototype */
 
 static const HashTableValue JSReadableStreamSourcePrototypeTableValues[] = {
-    { "controller"_s, static_cast<unsigned>(JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::CustomAccessor | JSC::PropertyAttribute::DOMAttribute), NoIntrinsic, { (intptr_t) static_cast<PropertySlot::GetValueFunc>(jsReadableStreamSource_controller), (intptr_t) static_cast<PutPropertySlot::PutValueFunc>(0) } },
-    { "start"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { (intptr_t) static_cast<RawNativeFunction>(jsReadableStreamSourcePrototypeFunction_start), (intptr_t)(1) } },
-    { "pull"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { (intptr_t) static_cast<RawNativeFunction>(jsReadableStreamSourcePrototypeFunction_pull), (intptr_t)(1) } },
-    { "cancel"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { (intptr_t) static_cast<RawNativeFunction>(jsReadableStreamSourcePrototypeFunction_cancel), (intptr_t)(1) } },
+    { "controller"_s, static_cast<unsigned>(JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::CustomAccessor | JSC::PropertyAttribute::DOMAttribute), NoIntrinsic, { HashTableValue::GetterSetterType, jsReadableStreamSource_controller, 0 } },
+    { "start"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { HashTableValue::NativeFunctionType, jsReadableStreamSourcePrototypeFunction_start, 1 } },
+    { "pull"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { HashTableValue::NativeFunctionType, jsReadableStreamSourcePrototypeFunction_pull, 1 } },
+    { "cancel"_s, static_cast<unsigned>(JSC::PropertyAttribute::Function), NoIntrinsic, { HashTableValue::NativeFunctionType, jsReadableStreamSourcePrototypeFunction_cancel, 1 } },
 };
 
 const ClassInfo JSReadableStreamSourcePrototype::s_info = { "ReadableStreamSource"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(JSReadableStreamSourcePrototype) };
@@ -130,7 +130,9 @@ void JSReadableStreamSource::finishCreation(VM& vm)
 
 JSObject* JSReadableStreamSource::createPrototype(VM& vm, JSDOMGlobalObject& globalObject)
 {
-    return JSReadableStreamSourcePrototype::create(vm, &globalObject, JSReadableStreamSourcePrototype::createStructure(vm, &globalObject, globalObject.objectPrototype()));
+    auto* structure = JSReadableStreamSourcePrototype::createStructure(vm, &globalObject, globalObject.objectPrototype());
+    structure->setMayBePrototype(true);
+    return JSReadableStreamSourcePrototype::create(vm, &globalObject, structure);
 }
 
 JSObject* JSReadableStreamSource::prototype(VM& vm, JSDOMGlobalObject& globalObject)
@@ -150,7 +152,7 @@ static inline JSValue jsReadableStreamSource_controllerGetter(JSGlobalObject& le
     return thisObject.controller(lexicalGlobalObject);
 }
 
-JSC_DEFINE_CUSTOM_GETTER(jsReadableStreamSource_controller, (JSGlobalObject * lexicalGlobalObject, EncodedJSValue thisValue, PropertyName attributeName))
+JSC_DEFINE_CUSTOM_GETTER(jsReadableStreamSource_controller, (JSGlobalObject * lexicalGlobalObject, JSC::EncodedJSValue thisValue, PropertyName attributeName))
 {
     return IDLAttribute<JSReadableStreamSource>::get<jsReadableStreamSource_controllerGetter, CastedThisErrorBehavior::Assert>(*lexicalGlobalObject, thisValue, attributeName);
 }
@@ -194,7 +196,7 @@ static inline JSC::EncodedJSValue jsReadableStreamSourcePrototypeFunction_cancel
         return throwVMError(lexicalGlobalObject, throwScope, createNotEnoughArgumentsError(lexicalGlobalObject));
     EnsureStillAliveScope argument0 = callFrame->uncheckedArgument(0);
     auto reason = convert<IDLAny>(*lexicalGlobalObject, argument0.value());
-    RETURN_IF_EXCEPTION(throwScope, encodedJSValue());
+    RETURN_IF_EXCEPTION(throwScope, {});
     RELEASE_AND_RETURN(throwScope, JSValue::encode(toJS<IDLUndefined>(*lexicalGlobalObject, throwScope, [&]() -> decltype(auto) { return impl.cancel(WTFMove(reason)); })));
 }
 
@@ -208,9 +210,9 @@ JSC::GCClient::IsoSubspace* JSReadableStreamSource::subspaceForImpl(JSC::VM& vm)
     return WebCore::subspaceForImpl<JSReadableStreamSource, UseCustomHeapCellType::No>(
         vm,
         [](auto& spaces) { return spaces.m_clientSubspaceForReadableStreamSource.get(); },
-        [](auto& spaces, auto&& space) { spaces.m_clientSubspaceForReadableStreamSource = WTFMove(space); },
+        [](auto& spaces, auto&& space) { spaces.m_clientSubspaceForReadableStreamSource = std::forward<decltype(space)>(space); },
         [](auto& spaces) { return spaces.m_subspaceForReadableStreamSource.get(); },
-        [](auto& spaces, auto&& space) { spaces.m_subspaceForReadableStreamSource = WTFMove(space); });
+        [](auto& spaces, auto&& space) { spaces.m_subspaceForReadableStreamSource = std::forward<decltype(space)>(space); });
 }
 
 template<typename Visitor>
@@ -229,11 +231,11 @@ void JSReadableStreamSource::analyzeHeap(JSCell* cell, HeapAnalyzer& analyzer)
     auto* thisObject = jsCast<JSReadableStreamSource*>(cell);
     analyzer.setWrappedObjectForCell(cell, &thisObject->wrapped());
     if (thisObject->scriptExecutionContext())
-        analyzer.setLabelForCell(cell, "url " + thisObject->scriptExecutionContext()->url().string());
+        analyzer.setLabelForCell(cell, makeString("url "_s, thisObject->scriptExecutionContext()->url().string()));
     Base::analyzeHeap(cell, analyzer);
 }
 
-bool JSReadableStreamSourceOwner::isReachableFromOpaqueRoots(JSC::Handle<JSC::Unknown> handle, void*, AbstractSlotVisitor& visitor, const char** reason)
+bool JSReadableStreamSourceOwner::isReachableFromOpaqueRoots(JSC::Handle<JSC::Unknown> handle, void*, AbstractSlotVisitor& visitor, ASCIILiteral* reason)
 {
     UNUSED_PARAM(handle);
     UNUSED_PARAM(visitor);

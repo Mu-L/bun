@@ -22,7 +22,7 @@
 
 #include "DOMURL.h"
 #include "JSDOMWrapper.h"
-#include "wtf/NeverDestroyed.h"
+#include <wtf/NeverDestroyed.h>
 
 namespace WebCore {
 
@@ -45,7 +45,7 @@ public:
 
     static JSC::Structure* createStructure(JSC::VM& vm, JSC::JSGlobalObject* globalObject, JSC::JSValue prototype)
     {
-        return JSC::Structure::create(vm, globalObject, prototype, JSC::TypeInfo(JSC::ObjectType, StructureFlags), info(), JSC::NonArray);
+        return JSC::Structure::create(vm, globalObject, prototype, JSC::TypeInfo(static_cast<JSC::JSType>(0b11101110), StructureFlags), info(), JSC::NonArray);
     }
 
     static JSC::JSValue getConstructor(JSC::VM&, const JSC::JSGlobalObject*);
@@ -59,6 +59,8 @@ public:
     static JSC::GCClient::IsoSubspace* subspaceForImpl(JSC::VM& vm);
     DECLARE_VISIT_CHILDREN;
 
+    static size_t estimatedSize(JSC::JSCell* cell, JSC::VM& vm);
+
     static void analyzeHeap(JSCell*, JSC::HeapAnalyzer&);
 
 protected:
@@ -70,7 +72,7 @@ protected:
 class JSDOMURLOwner final : public JSC::WeakHandleOwner {
 public:
     ~JSDOMURLOwner() final;
-    bool isReachableFromOpaqueRoots(JSC::Handle<JSC::Unknown>, void* context, JSC::AbstractSlotVisitor&, const char**) final;
+    bool isReachableFromOpaqueRoots(JSC::Handle<JSC::Unknown>, void* context, JSC::AbstractSlotVisitor&, ASCIILiteral*) final;
     void finalize(JSC::Handle<JSC::Unknown>, void* context) final;
 };
 

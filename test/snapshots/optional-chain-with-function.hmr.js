@@ -8,13 +8,12 @@ __FastRefreshModule as FastHMR
 import {
 __FastRefreshRuntime as FastRefresh
 } from "http://localhost:8080/bun:wrap";
-var hmr = new FastHMR(2063149784, "optional-chain-with-function.js", FastRefresh), exports = hmr.exports;
+var hmr = new FastHMR(2145684817, "optional-chain-with-function.js", FastRefresh), exports = hmr.exports;
 (hmr._load = function() {
   function test() {
     try {
-      const multipleSecondaryValues = undefined;
       const ratings = ["123"];
-      var bar = multipleSecondaryValues?.map((value) => false);
+      var bar = undefined?.map((value) => false);
       bar = bar?.multipleSecondaryValues?.map((value) => false);
       bar = bar?.bar?.multipleSecondaryValues?.map((value) => false);
       bar = {}?.bar?.multipleSecondaryValues?.map((value) => false);

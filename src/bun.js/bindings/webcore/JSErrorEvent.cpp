@@ -114,7 +114,7 @@ template<> ErrorEvent::Init convertDictionary<ErrorEvent::Init>(JSGlobalObject& 
     if (isNullOrUndefined)
         errorValue = jsUndefined();
     else {
-        errorValue = object->get(&lexicalGlobalObject, Identifier::fromString(vm, "error"_s));
+        errorValue = object->get(&lexicalGlobalObject, vm.propertyNames->error);
         RETURN_IF_EXCEPTION(throwScope, {});
     }
     if (!errorValue.isUndefined()) {
@@ -150,7 +150,7 @@ template<> ErrorEvent::Init convertDictionary<ErrorEvent::Init>(JSGlobalObject& 
     if (isNullOrUndefined)
         messageValue = jsUndefined();
     else {
-        messageValue = object->get(&lexicalGlobalObject, Identifier::fromString(vm, "message"_s));
+        messageValue = object->get(&lexicalGlobalObject, vm.propertyNames->message);
         RETURN_IF_EXCEPTION(throwScope, {});
     }
     if (!messageValue.isUndefined()) {
@@ -204,7 +204,7 @@ STATIC_ASSERT_ISO_SUBSPACE_SHARABLE(JSErrorEventPrototype, JSErrorEventPrototype
 
 using JSErrorEventDOMConstructor = JSDOMConstructor<JSErrorEvent>;
 
-template<> EncodedJSValue JSC_HOST_CALL_ATTRIBUTES JSErrorEventDOMConstructor::construct(JSGlobalObject* lexicalGlobalObject, CallFrame* callFrame)
+template<> JSC::EncodedJSValue JSC_HOST_CALL_ATTRIBUTES JSErrorEventDOMConstructor::construct(JSGlobalObject* lexicalGlobalObject, CallFrame* callFrame)
 {
     VM& vm = lexicalGlobalObject->vm();
     auto throwScope = DECLARE_THROW_SCOPE(vm);
@@ -214,10 +214,10 @@ template<> EncodedJSValue JSC_HOST_CALL_ATTRIBUTES JSErrorEventDOMConstructor::c
         return throwVMError(lexicalGlobalObject, throwScope, createNotEnoughArgumentsError(lexicalGlobalObject));
     EnsureStillAliveScope argument0 = callFrame->uncheckedArgument(0);
     auto type = convert<IDLAtomStringAdaptor<IDLDOMString>>(*lexicalGlobalObject, argument0.value());
-    RETURN_IF_EXCEPTION(throwScope, encodedJSValue());
+    RETURN_IF_EXCEPTION(throwScope, {});
     EnsureStillAliveScope argument1 = callFrame->argument(1);
     auto eventInitDict = convert<IDLDictionary<ErrorEvent::Init>>(*lexicalGlobalObject, argument1.value());
-    RETURN_IF_EXCEPTION(throwScope, encodedJSValue());
+    RETURN_IF_EXCEPTION(throwScope, {});
     auto object = ErrorEvent::create(type, WTFMove(eventInitDict));
     if constexpr (IsExceptionOr<decltype(object)>)
         RETURN_IF_EXCEPTION(throwScope, {});
@@ -250,12 +250,12 @@ template<> void JSErrorEventDOMConstructor::initializeProperties(VM& vm, JSDOMGl
 /* Hash table for prototype */
 
 static const HashTableValue JSErrorEventPrototypeTableValues[] = {
-    { "constructor"_s, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum), NoIntrinsic, { (intptr_t) static_cast<PropertySlot::GetValueFunc>(jsErrorEventConstructor), (intptr_t) static_cast<PutPropertySlot::PutValueFunc>(0) } },
-    { "message"_s, static_cast<unsigned>(JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::CustomAccessor | JSC::PropertyAttribute::DOMAttribute), NoIntrinsic, { (intptr_t) static_cast<PropertySlot::GetValueFunc>(jsErrorEvent_message), (intptr_t) static_cast<PutPropertySlot::PutValueFunc>(0) } },
-    { "filename"_s, static_cast<unsigned>(JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::CustomAccessor | JSC::PropertyAttribute::DOMAttribute), NoIntrinsic, { (intptr_t) static_cast<PropertySlot::GetValueFunc>(jsErrorEvent_filename), (intptr_t) static_cast<PutPropertySlot::PutValueFunc>(0) } },
-    { "lineno"_s, static_cast<unsigned>(JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::CustomAccessor | JSC::PropertyAttribute::DOMAttribute), NoIntrinsic, { (intptr_t) static_cast<PropertySlot::GetValueFunc>(jsErrorEvent_lineno), (intptr_t) static_cast<PutPropertySlot::PutValueFunc>(0) } },
-    { "colno"_s, static_cast<unsigned>(JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::CustomAccessor | JSC::PropertyAttribute::DOMAttribute), NoIntrinsic, { (intptr_t) static_cast<PropertySlot::GetValueFunc>(jsErrorEvent_colno), (intptr_t) static_cast<PutPropertySlot::PutValueFunc>(0) } },
-    { "error"_s, static_cast<unsigned>(JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::CustomAccessor | JSC::PropertyAttribute::DOMAttribute), NoIntrinsic, { (intptr_t) static_cast<PropertySlot::GetValueFunc>(jsErrorEvent_error), (intptr_t) static_cast<PutPropertySlot::PutValueFunc>(0) } },
+    { "constructor"_s, static_cast<unsigned>(JSC::PropertyAttribute::DontEnum), NoIntrinsic, { HashTableValue::GetterSetterType, jsErrorEventConstructor, 0 } },
+    { "message"_s, static_cast<unsigned>(JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::CustomAccessor | JSC::PropertyAttribute::DOMAttribute), NoIntrinsic, { HashTableValue::GetterSetterType, jsErrorEvent_message, 0 } },
+    { "filename"_s, static_cast<unsigned>(JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::CustomAccessor | JSC::PropertyAttribute::DOMAttribute), NoIntrinsic, { HashTableValue::GetterSetterType, jsErrorEvent_filename, 0 } },
+    { "lineno"_s, static_cast<unsigned>(JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::CustomAccessor | JSC::PropertyAttribute::DOMAttribute), NoIntrinsic, { HashTableValue::GetterSetterType, jsErrorEvent_lineno, 0 } },
+    { "colno"_s, static_cast<unsigned>(JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::CustomAccessor | JSC::PropertyAttribute::DOMAttribute), NoIntrinsic, { HashTableValue::GetterSetterType, jsErrorEvent_colno, 0 } },
+    { "error"_s, static_cast<unsigned>(JSC::PropertyAttribute::ReadOnly | JSC::PropertyAttribute::CustomAccessor | JSC::PropertyAttribute::DOMAttribute), NoIntrinsic, { HashTableValue::GetterSetterType, jsErrorEvent_error, 0 } },
 };
 
 const ClassInfo JSErrorEventPrototype::s_info = { "ErrorEvent"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(JSErrorEventPrototype) };
@@ -297,7 +297,7 @@ JSValue JSErrorEvent::getConstructor(VM& vm, const JSGlobalObject* globalObject)
     return getDOMConstructor<JSErrorEventDOMConstructor, DOMConstructorID::ErrorEvent>(vm, *jsCast<const JSDOMGlobalObject*>(globalObject));
 }
 
-JSC_DEFINE_CUSTOM_GETTER(jsErrorEventConstructor, (JSGlobalObject * lexicalGlobalObject, EncodedJSValue thisValue, PropertyName))
+JSC_DEFINE_CUSTOM_GETTER(jsErrorEventConstructor, (JSGlobalObject * lexicalGlobalObject, JSC::EncodedJSValue thisValue, PropertyName))
 {
     VM& vm = JSC::getVM(lexicalGlobalObject);
     auto throwScope = DECLARE_THROW_SCOPE(vm);
@@ -315,7 +315,7 @@ static inline JSValue jsErrorEvent_messageGetter(JSGlobalObject& lexicalGlobalOb
     RELEASE_AND_RETURN(throwScope, (toJS<IDLDOMString>(lexicalGlobalObject, throwScope, impl.message())));
 }
 
-JSC_DEFINE_CUSTOM_GETTER(jsErrorEvent_message, (JSGlobalObject * lexicalGlobalObject, EncodedJSValue thisValue, PropertyName attributeName))
+JSC_DEFINE_CUSTOM_GETTER(jsErrorEvent_message, (JSGlobalObject * lexicalGlobalObject, JSC::EncodedJSValue thisValue, PropertyName attributeName))
 {
     return IDLAttribute<JSErrorEvent>::get<jsErrorEvent_messageGetter, CastedThisErrorBehavior::Assert>(*lexicalGlobalObject, thisValue, attributeName);
 }
@@ -328,7 +328,7 @@ static inline JSValue jsErrorEvent_filenameGetter(JSGlobalObject& lexicalGlobalO
     RELEASE_AND_RETURN(throwScope, (toJS<IDLUSVString>(lexicalGlobalObject, throwScope, impl.filename())));
 }
 
-JSC_DEFINE_CUSTOM_GETTER(jsErrorEvent_filename, (JSGlobalObject * lexicalGlobalObject, EncodedJSValue thisValue, PropertyName attributeName))
+JSC_DEFINE_CUSTOM_GETTER(jsErrorEvent_filename, (JSGlobalObject * lexicalGlobalObject, JSC::EncodedJSValue thisValue, PropertyName attributeName))
 {
     return IDLAttribute<JSErrorEvent>::get<jsErrorEvent_filenameGetter, CastedThisErrorBehavior::Assert>(*lexicalGlobalObject, thisValue, attributeName);
 }
@@ -341,7 +341,7 @@ static inline JSValue jsErrorEvent_linenoGetter(JSGlobalObject& lexicalGlobalObj
     RELEASE_AND_RETURN(throwScope, (toJS<IDLUnsignedLong>(lexicalGlobalObject, throwScope, impl.lineno())));
 }
 
-JSC_DEFINE_CUSTOM_GETTER(jsErrorEvent_lineno, (JSGlobalObject * lexicalGlobalObject, EncodedJSValue thisValue, PropertyName attributeName))
+JSC_DEFINE_CUSTOM_GETTER(jsErrorEvent_lineno, (JSGlobalObject * lexicalGlobalObject, JSC::EncodedJSValue thisValue, PropertyName attributeName))
 {
     return IDLAttribute<JSErrorEvent>::get<jsErrorEvent_linenoGetter, CastedThisErrorBehavior::Assert>(*lexicalGlobalObject, thisValue, attributeName);
 }
@@ -354,7 +354,7 @@ static inline JSValue jsErrorEvent_colnoGetter(JSGlobalObject& lexicalGlobalObje
     RELEASE_AND_RETURN(throwScope, (toJS<IDLUnsignedLong>(lexicalGlobalObject, throwScope, impl.colno())));
 }
 
-JSC_DEFINE_CUSTOM_GETTER(jsErrorEvent_colno, (JSGlobalObject * lexicalGlobalObject, EncodedJSValue thisValue, PropertyName attributeName))
+JSC_DEFINE_CUSTOM_GETTER(jsErrorEvent_colno, (JSGlobalObject * lexicalGlobalObject, JSC::EncodedJSValue thisValue, PropertyName attributeName))
 {
     return IDLAttribute<JSErrorEvent>::get<jsErrorEvent_colnoGetter, CastedThisErrorBehavior::Assert>(*lexicalGlobalObject, thisValue, attributeName);
 }
@@ -367,7 +367,7 @@ static inline JSValue jsErrorEvent_errorGetter(JSGlobalObject& lexicalGlobalObje
     RELEASE_AND_RETURN(throwScope, (toJS<IDLAny>(lexicalGlobalObject, throwScope, impl.error(*jsCast<JSDOMGlobalObject*>(&lexicalGlobalObject)))));
 }
 
-JSC_DEFINE_CUSTOM_GETTER(jsErrorEvent_error, (JSGlobalObject * lexicalGlobalObject, EncodedJSValue thisValue, PropertyName attributeName))
+JSC_DEFINE_CUSTOM_GETTER(jsErrorEvent_error, (JSGlobalObject * lexicalGlobalObject, JSC::EncodedJSValue thisValue, PropertyName attributeName))
 {
     return IDLAttribute<JSErrorEvent>::get<jsErrorEvent_errorGetter, CastedThisErrorBehavior::Assert>(*lexicalGlobalObject, thisValue, attributeName);
 }
@@ -377,9 +377,9 @@ JSC::GCClient::IsoSubspace* JSErrorEvent::subspaceForImpl(JSC::VM& vm)
     return WebCore::subspaceForImpl<JSErrorEvent, UseCustomHeapCellType::No>(
         vm,
         [](auto& spaces) { return spaces.m_clientSubspaceForErrorEvent.get(); },
-        [](auto& spaces, auto&& space) { spaces.m_clientSubspaceForErrorEvent = WTFMove(space); },
+        [](auto& spaces, auto&& space) { spaces.m_clientSubspaceForErrorEvent = std::forward<decltype(space)>(space); },
         [](auto& spaces) { return spaces.m_subspaceForErrorEvent.get(); },
-        [](auto& spaces, auto&& space) { spaces.m_subspaceForErrorEvent = WTFMove(space); });
+        [](auto& spaces, auto&& space) { spaces.m_subspaceForErrorEvent = std::forward<decltype(space)>(space); });
 }
 
 template<typename Visitor>
@@ -409,7 +409,7 @@ void JSErrorEvent::analyzeHeap(JSCell* cell, HeapAnalyzer& analyzer)
     auto* thisObject = jsCast<JSErrorEvent*>(cell);
     analyzer.setWrappedObjectForCell(cell, &thisObject->wrapped());
     if (thisObject->scriptExecutionContext())
-        analyzer.setLabelForCell(cell, "url " + thisObject->scriptExecutionContext()->url().string());
+        analyzer.setLabelForCell(cell, makeString("url "_s, thisObject->scriptExecutionContext()->url().string()));
     Base::analyzeHeap(cell, analyzer);
 }
 
@@ -431,18 +431,18 @@ JSC::JSValue toJSNewlyCreated(JSC::JSGlobalObject*, JSDOMGlobalObject* globalObj
 
     //     if constexpr (std::is_polymorphic_v<ErrorEvent>) {
     // #if ENABLE(BINDING_INTEGRITY)
-    //         const void* actualVTablePointer = getVTablePointer(impl.ptr());
+    //         // const void* actualVTablePointer = getVTablePointer(impl.ptr());
     // #if PLATFORM(WIN)
     //         void* expectedVTablePointer = __identifier("??_7ErrorEvent@WebCore@@6B@");
     // #else
-    //         void* expectedVTablePointer = &_ZTVN7WebCore10ErrorEventE[2];
+    //         // void* expectedVTablePointer = &_ZTVN7WebCore10ErrorEventE[2];
     // #endif
 
     //         // If you hit this assertion you either have a use after free bug, or
     //         // ErrorEvent has subclasses. If ErrorEvent has subclasses that get passed
     //         // to toJS() we currently require ErrorEvent you to opt out of binding hardening
     //         // by adding the SkipVTableValidation attribute to the interface IDL definition
-    //         RELEASE_ASSERT(actualVTablePointer == expectedVTablePointer);
+    //         // RELEASE_ASSERT(actualVTablePointer == expectedVTablePointer);
     // #endif
     return createWrapper<ErrorEvent>(globalObject, WTFMove(impl));
 }

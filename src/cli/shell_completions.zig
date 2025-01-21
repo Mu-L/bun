@@ -1,5 +1,5 @@
 const std = @import("std");
-const bun = @import("../global.zig");
+const bun = @import("root").bun;
 const string = bun.string;
 const Output = bun.Output;
 const Global = bun.Global;
@@ -15,16 +15,17 @@ pub const Shell = enum {
     bash,
     zsh,
     fish,
+    pwsh,
 
-    const bash_completions = @embedFile("../../completions/bun.bash");
-    const zsh_completions = @embedFile("../../completions/bun.zsh");
-    const fish_completions = @embedFile("../../completions/bun.fish");
+    const bash_completions = @import("root").completions.bash;
+    const zsh_completions = @import("root").completions.zsh;
+    const fish_completions = @import("root").completions.fish;
 
     pub fn completions(this: Shell) []const u8 {
         return switch (this) {
-            .bash => std.mem.span(bash_completions),
-            .zsh => std.mem.span(zsh_completions),
-            .fish => std.mem.span(fish_completions),
+            .bash => bun.asByteSlice(bash_completions),
+            .zsh => bun.asByteSlice(zsh_completions),
+            .fish => bun.asByteSlice(fish_completions),
             else => "",
         };
     }
@@ -32,13 +33,17 @@ pub const Shell = enum {
     pub fn fromEnv(comptime Type: type, SHELL: Type) Shell {
         const basename = std.fs.path.basename(SHELL);
         if (strings.eqlComptime(basename, "bash")) {
-            return Shell.bash;
+            return .bash;
         } else if (strings.eqlComptime(basename, "zsh")) {
-            return Shell.zsh;
+            return .zsh;
         } else if (strings.eqlComptime(basename, "fish")) {
-            return Shell.fish;
+            return .fish;
+        } else if (strings.eqlComptime(basename, "pwsh") or
+            strings.eqlComptime(basename, "powershell"))
+        {
+            return .pwsh;
         } else {
-            return Shell.unknown;
+            return .unknown;
         }
     }
 };
@@ -63,7 +68,7 @@ pub fn print(this: @This()) void {
     }
 
     if (this.commands.len > 1) {
-        for (this.commands[1..]) |cmd, i| {
+        for (this.commands[1..], 0..) |cmd, i| {
             writer.writeAll(delimiter) catch return;
 
             writer.writeAll(cmd) catch return;

@@ -1,4 +1,5 @@
-const bun = @import("../global.zig");
+const bun = @import("root").bun;
+const std = @import("std");
 const string = bun.string;
 const Output = bun.Output;
 const Global = bun.Global;
@@ -35,36 +36,63 @@ enclosing_tsconfig_json: ?*const TSConfigJSON = null,
 /// https://github.com/oven-sh/bun/issues/229
 enclosing_package_json: ?*PackageJSON = null,
 
+package_json_for_dependencies: ?*PackageJSON = null,
+
 abs_path: string = "",
 entries: Index = undefined,
-has_node_modules: bool = false, // Is there a "node_modules" subdirectory?
-is_node_modules: bool = false, // Is this a "node_modules" directory?
 package_json: ?*PackageJSON = null, // Is there a "package.json" file?
 tsconfig_json: ?*TSConfigJSON = null, // Is there a "tsconfig.json" file in this directory or a parent directory?
 abs_real_path: string = "", // If non-empty, this is the real absolute path resolving any symlinks
 
+flags: Flags.Set = Flags.Set{},
+
+/// Is there a "node_modules" subdirectory?
+pub inline fn hasNodeModules(this: *const DirInfo) bool {
+    return this.flags.contains(.has_node_modules);
+}
+/// Is this a "node_modules" directory?
+pub inline fn isNodeModules(this: *const DirInfo) bool {
+    return this.flags.contains(.is_node_modules);
+}
+
+/// Is this inside a "node_modules" directory?
+pub inline fn isInsideNodeModules(this: *const DirInfo) bool {
+    return this.flags.contains(.inside_node_modules);
+}
+
+pub const Flags = enum {
+    /// This directory is a node_modules directory
+    is_node_modules,
+    /// This directory has a node_modules subdirectory
+    has_node_modules,
+
+    inside_node_modules,
+
+    pub const Set = std.enums.EnumSet(Flags);
+};
+
 pub fn hasParentPackage(this: *const DirInfo) bool {
     const parent = this.getParent() orelse return false;
-    return !parent.is_node_modules;
+    return !parent.isNodeModules();
 }
 
 pub fn getFileDescriptor(dirinfo: *const DirInfo) StoredFileDescriptorType {
     if (!FeatureFlags.store_file_descriptors) {
-        return 0;
+        return .zero;
     }
 
-    if (dirinfo.getEntries()) |entries| {
+    if (dirinfo.getEntries(0)) |entries| {
         return entries.fd;
     } else {
-        return 0;
+        return .zero;
     }
 }
 
-pub fn getEntries(dirinfo: *const DirInfo) ?*Fs.FileSystem.DirEntry {
-    var entries_ptr = Fs.FileSystem.instance.fs.entries.atIndex(dirinfo.entries) orelse return null;
+pub fn getEntries(dirinfo: *const DirInfo, generation: bun.Generation) ?*Fs.FileSystem.DirEntry {
+    const entries_ptr = Fs.FileSystem.instance.fs.entriesAt(dirinfo.entries, generation) orelse return null;
     switch (entries_ptr.*) {
         .entries => {
-            return &entries_ptr.entries;
+            return entries_ptr.entries;
         },
         .err => {
             return null;
@@ -76,7 +104,7 @@ pub fn getEntriesConst(dirinfo: *const DirInfo) ?*const Fs.FileSystem.DirEntry {
     const entries_ptr = Fs.FileSystem.instance.fs.entries.atIndex(dirinfo.entries) orelse return null;
     switch (entries_ptr.*) {
         .entries => {
-            return &entries_ptr.entries;
+            return entries_ptr.entries;
         },
         .err => {
             return null;

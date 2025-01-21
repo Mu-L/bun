@@ -27,6 +27,10 @@
 
 namespace WebCore {
 
+JSC_DECLARE_HOST_FUNCTION(jsEventTargetPrototypeFunction_addEventListener);
+JSC_DECLARE_HOST_FUNCTION(jsEventTargetPrototypeFunction_removeEventListener);
+JSC_DECLARE_HOST_FUNCTION(jsEventTargetPrototypeFunction_dispatchEvent);
+
 class JSEventTarget : public JSDOMWrapper<EventTarget> {
 public:
     using Base = JSDOMWrapper<EventTarget>;
@@ -71,7 +75,7 @@ protected:
 
 class JSEventTargetOwner final : public JSC::WeakHandleOwner {
 public:
-    bool isReachableFromOpaqueRoots(JSC::Handle<JSC::Unknown>, void* context, JSC::AbstractSlotVisitor&, const char**) final;
+    bool isReachableFromOpaqueRoots(JSC::Handle<JSC::Unknown>, void* context, JSC::AbstractSlotVisitor&, ASCIILiteral*) final;
     void finalize(JSC::Handle<JSC::Unknown>, void* context) final;
 };
 
@@ -97,4 +101,7 @@ template<> struct JSDOMWrapperConverterTraits<EventTarget> {
 };
 
 } // namespace WebCore
+
+JSC_DECLARE_HOST_FUNCTION(jsEventTargetGetEventListenersCount);
+
 #include "JSEventTargetCustom.h"

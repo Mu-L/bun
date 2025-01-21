@@ -1,8 +1,8 @@
 const std = @import("std");
 const Api = @import("./api/schema.zig").Api;
-const js = @import("javascript_core");
+const js = bun.JSC;
 const ImportKind = @import("./import_record.zig").ImportKind;
-const bun = @import("./global.zig");
+const bun = @import("root").bun;
 const string = bun.string;
 const Output = bun.Output;
 const Global = bun.Global;
@@ -12,21 +12,23 @@ const MutableString = bun.MutableString;
 const stringZ = bun.stringZ;
 const default_allocator = bun.default_allocator;
 const C = bun.C;
-const JSC = @import("javascript_core");
+const JSC = bun.JSC;
 const fs = @import("fs.zig");
 const unicode = std.unicode;
-
+const Ref = @import("./ast/base.zig").Ref;
 const expect = std.testing.expect;
-const assert = std.debug.assert;
-const ArrayList = std.ArrayList;
+const assert = bun.assert;
 const StringBuilder = @import("./string_builder.zig");
+const Index = @import("./ast/base.zig").Index;
+const OOM = bun.OOM;
+const JSError = bun.JSError;
 
-pub const Kind = enum(i8) {
-    err,
-    warn,
-    note,
-    debug,
-    verbose,
+pub const Kind = enum(u8) {
+    err = 0,
+    warn = 1,
+    note = 2,
+    debug = 3,
+    verbose = 4,
 
     pub inline fn shouldPrint(this: Kind, other: Log.Level) bool {
         return switch (other) {
@@ -63,7 +65,9 @@ pub const Kind = enum(i8) {
     }
 };
 
-pub const Loc = packed struct {
+// Do not mark these as packed
+// https://github.com/ziglang/zig/issues/15715
+pub const Loc = struct {
     start: i32 = -1,
 
     pub inline fn toNullable(loc: *Loc) ?Loc {
@@ -73,7 +77,7 @@ pub const Loc = packed struct {
     pub const toUsize = i;
 
     pub inline fn i(self: *const Loc) usize {
-        return @intCast(usize, @maximum(self.start, 0));
+        return @as(usize, @intCast(@max(self.start, 0)));
     }
 
     pub const Empty = Loc{ .start = -1 };
@@ -82,33 +86,53 @@ pub const Loc = packed struct {
         return loc.start == other.start;
     }
 
-    pub fn jsonStringify(self: *const Loc, options: anytype, writer: anytype) !void {
-        return try std.json.stringify(self.start, options, writer);
+    pub inline fn isEmpty(this: Loc) bool {
+        return eql(this, Empty);
+    }
+
+    pub fn jsonStringify(self: *const Loc, writer: anytype) !void {
+        return try writer.write(self.start);
     }
 };
 
 pub const Location = struct {
-    file: string = "",
+    file: string,
     namespace: string = "file",
-    line: i32 = 1, // 1-based
-    column: i32 = 0, // 0-based, in bytes
-    length: usize = 0, // in bytes
+    /// 1-based line number.
+    /// Line <= 0 means there is no line and column information.
+    // TODO: move to `bun.Ordinal`
+    line: i32,
+    // TODO: figure out how this is interpreted, convert to `bun.Ordinal`
+    // original docs: 0-based, in bytes.
+    // but there is a place where this is emitted in output, implying one based character offset
+    column: i32,
+    /// Number of bytes this location should highlight.
+    /// 0 to just point at a single character
+    length: usize = 0,
+    /// Text on the line, avoiding the need to refetch the source code
     line_text: ?string = null,
+    // TODO: remove this unused field
     suggestion: ?string = null,
+    // TODO: document or remove
     offset: usize = 0,
+
+    pub fn memoryCost(this: *const Location) usize {
+        var cost: usize = 0;
+        cost += this.file.len;
+        cost += this.namespace.len;
+        if (this.line_text) |text| cost += text.len;
+        if (this.suggestion) |text| cost += text.len;
+        return cost;
+    }
 
     pub fn count(this: Location, builder: *StringBuilder) void {
         builder.count(this.file);
         builder.count(this.namespace);
-        if (this.line_text) |text| builder.count(text[0..@minimum(text.len, 690)]);
+        if (this.line_text) |text| builder.count(text);
         if (this.suggestion) |text| builder.count(text);
     }
 
     pub fn clone(this: Location, allocator: std.mem.Allocator) !Location {
-        // mostly to catch undefined memory
-        bun.assertDefined(this.namespace);
-        bun.assertDefined(this.file);
-
         return Location{
             .file = try allocator.dupe(u8, this.file),
             .namespace = this.namespace,
@@ -122,10 +146,6 @@ pub const Location = struct {
     }
 
     pub fn cloneWithBuilder(this: Location, string_builder: *StringBuilder) Location {
-        // mostly to catch undefined memory
-        bun.assertDefined(this.namespace);
-        bun.assertDefined(this.file);
-
         return Location{
             .file = string_builder.append(this.file),
             .namespace = this.namespace,
@@ -139,9 +159,6 @@ pub const Location = struct {
     }
 
     pub fn toAPI(this: *const Location) Api.Location {
-        bun.assertDefined(this.file);
-        bun.assertDefined(this.namespace);
-
         return Api.Location{
             .file = this.file,
             .namespace = this.namespace,
@@ -149,7 +166,7 @@ pub const Location = struct {
             .column = this.column,
             .line_text = this.line_text orelse "",
             .suggestion = this.suggestion orelse "",
-            .offset = @truncate(u32, this.offset),
+            .offset = @as(u32, @truncate(this.offset)),
         };
     }
 
@@ -157,10 +174,6 @@ pub const Location = struct {
     pub fn deinit(_: *Location, _: std.mem.Allocator) void {}
 
     pub fn init(file: string, namespace: string, line: i32, column: i32, length: u32, line_text: ?string, suggestion: ?string) Location {
-        // mostly to catch undefined memory
-        bun.assertDefined(file);
-        bun.assertDefined(namespace);
-
         return Location{
             .file = file,
             .namespace = namespace,
@@ -173,45 +186,74 @@ pub const Location = struct {
         };
     }
 
-    pub fn init_or_nil(_source: ?*const Source, r: Range) ?Location {
+    pub fn initOrNull(_source: ?*const Source, r: Range) ?Location {
         if (_source) |source| {
-            var data = source.initErrorPosition(r.loc);
+            if (r.isEmpty()) {
+                return Location{
+                    .file = source.path.text,
+                    .namespace = source.path.namespace,
+                    .line = -1,
+                    .column = -1,
+                    .length = 0,
+                    .line_text = "",
+                    .offset = 0,
+                };
+            }
+            const data = source.initErrorPosition(r.loc);
             var full_line = source.contents[data.line_start..data.line_end];
             if (full_line.len > 80 + data.column_count) {
-                full_line = full_line[std.math.max(data.column_count, 40) - 40 .. std.math.min(data.column_count + 40, full_line.len - 40) + 40];
+                full_line = full_line[@max(data.column_count, 40) - 40 .. @min(data.column_count + 40, full_line.len - 40) + 40];
             }
-
-            bun.assertDefined(source.path.text);
-            bun.assertDefined(source.path.namespace);
-            bun.assertDefined(full_line);
 
             return Location{
                 .file = source.path.text,
                 .namespace = source.path.namespace,
                 .line = usize2Loc(data.line_count).start,
                 .column = usize2Loc(data.column_count).start,
-                .length = full_line.len,
-                .line_text = full_line,
-                .offset = @intCast(usize, std.math.max(r.loc.start, 0)),
+                .length = if (r.len > -1) @as(u32, @intCast(r.len)) else 1,
+                .line_text = std.mem.trimLeft(u8, full_line, "\n\r"),
+                .offset = @as(usize, @intCast(@max(r.loc.start, 0))),
             };
-        } else {
-            return null;
         }
+        return null;
     }
 };
 
 pub const Data = struct {
     text: string,
     location: ?Location = null,
+
+    pub fn memoryCost(this: *const Data) usize {
+        var cost: usize = 0;
+        cost += this.text.len;
+        if (this.location) |*loc| {
+            cost += loc.memoryCost();
+        }
+        return cost;
+    }
+
     pub fn deinit(d: *Data, allocator: std.mem.Allocator) void {
-        if (d.location) |loc| {
+        if (d.location) |*loc| {
             loc.deinit(allocator);
         }
 
         allocator.free(d.text);
     }
 
-    pub fn clone(this: Data, allocator: std.mem.Allocator) !Data {
+    pub fn cloneLineText(this: Data, should: bool, allocator: std.mem.Allocator) OOM!Data {
+        if (!should or this.location == null or this.location.?.line_text == null)
+            return this;
+
+        const new_line_text = try allocator.dupe(u8, this.location.?.line_text.?);
+        var new_location = this.location.?;
+        new_location.line_text = new_line_text;
+        return Data{
+            .text = this.text,
+            .location = new_location,
+        };
+    }
+
+    pub fn clone(this: Data, allocator: std.mem.Allocator) OOM!Data {
         return Data{
             .text = if (this.text.len > 0) try allocator.dupe(u8, this.text) else "",
             .location = if (this.location != null) try this.location.?.clone(allocator) else null,
@@ -241,24 +283,68 @@ pub const Data = struct {
         this: *const Data,
         to: anytype,
         kind: Kind,
+        redact_sensitive_information: bool,
         comptime enable_ansi_colors: bool,
-        comptime is_note: bool,
     ) !void {
         if (this.text.len == 0) return;
 
         const message_color = switch (kind) {
             .err => comptime Output.color_map.get("b").?,
-            .note => comptime Output.color_map.get("cyan").? ++ Output.color_map.get("d").?,
+            .note => comptime Output.color_map.get("blue").?,
             else => comptime Output.color_map.get("d").? ++ Output.color_map.get("b").?,
         };
 
         const color_name: string = switch (kind) {
             .err => comptime Output.color_map.get("red").?,
-            .note => comptime Output.color_map.get("cyan").?,
+            .note => comptime Output.color_map.get("blue").?,
             else => comptime Output.color_map.get("d").?,
         };
 
-        try to.writeAll("\n\n");
+        if (this.location) |*location| {
+            if (location.line_text) |line_text_| {
+                const line_text_right_trimmed = std.mem.trimRight(u8, line_text_, " \r\n\t");
+                const line_text = std.mem.trimLeft(u8, line_text_right_trimmed, "\n\r");
+                if (location.column > -1 and line_text.len > 0) {
+                    var line_offset_for_second_line: usize = @intCast(location.column - 1);
+
+                    if (location.line > -1) {
+                        switch (kind == .err or kind == .warn) {
+                            inline else => |bold| try to.print(
+                                // bold the line number for error but dim for the attached note
+                                if (bold)
+                                    comptime Output.prettyFmt("<b>{d} | <r>", enable_ansi_colors)
+                                else
+                                    comptime Output.prettyFmt("<d>{d} | <r>", enable_ansi_colors),
+                                .{
+                                    location.line,
+                                },
+                            ),
+                        }
+
+                        line_offset_for_second_line += std.fmt.count("{d} | ", .{location.line});
+                    }
+
+                    try to.print("{}\n", .{bun.fmt.fmtJavaScript(line_text, .{
+                        .enable_colors = enable_ansi_colors,
+                        .redact_sensitive_information = redact_sensitive_information,
+                    })});
+
+                    try to.writeByteNTimes(' ', line_offset_for_second_line);
+                    if ((comptime enable_ansi_colors) and message_color.len > 0) {
+                        try to.writeAll(message_color);
+                        try to.writeAll(color_name);
+                        // always bold the ^
+                        try to.writeAll(comptime Output.color_map.get("b").?);
+
+                        try to.writeByte('^');
+
+                        try to.writeAll("\x1b[0m\n");
+                    } else {
+                        try to.writeAll("^\n");
+                    }
+                }
+            }
+        }
 
         if (comptime enable_ansi_colors) {
             try to.writeAll(color_name);
@@ -266,113 +352,42 @@ pub const Data = struct {
 
         try to.writeAll(kind.string());
 
-        try std.fmt.format(to, comptime Output.prettyFmt("<r><d>: <r>", enable_ansi_colors), .{});
+        try to.print(comptime Output.prettyFmt("<r><d>: <r>", enable_ansi_colors), .{});
 
         if (comptime enable_ansi_colors) {
             try to.writeAll(message_color);
         }
 
-        try std.fmt.format(to, comptime Output.prettyFmt("{s}<r>\n", enable_ansi_colors), .{this.text});
+        try to.print(comptime Output.prettyFmt("{s}<r>", enable_ansi_colors), .{this.text});
 
-        if (this.location) |location| {
-            if (location.line_text) |line_text_| {
-                const line_text = std.mem.trimRight(u8, line_text_, "\r\n\t");
-
-                const location_in_line_text = @intCast(u32, std.math.max(location.column, 1) - 1);
-                const has_position = location.column > -1 and line_text.len > 0 and location_in_line_text < line_text.len;
-
-                if (has_position) {
-                    if (comptime enable_ansi_colors) {
-                        const is_colored = message_color.len > 0;
-
-                        const before_segment = line_text[0..location_in_line_text];
-
-                        try to.writeAll(before_segment);
-                        if (is_colored) {
-                            try to.writeAll(color_name);
-                        }
-
-                        const rest_of_line = line_text[location_in_line_text..];
-
-                        if (rest_of_line.len > 0) {
-                            var end_of_segment: usize = 1;
-                            var iter = strings.CodepointIterator.initOffset(rest_of_line, 1);
-                            // extremely naive: we should really use IsIdentifierContinue || isIdentifierStart here
-
-                            // highlight until we reach the next matching
-                            switch (line_text[location_in_line_text]) {
-                                '\'' => {
-                                    end_of_segment = iter.scanUntilQuotedValueOrEOF('\'');
-                                },
-                                '"' => {
-                                    end_of_segment = iter.scanUntilQuotedValueOrEOF('"');
-                                },
-                                '<' => {
-                                    end_of_segment = iter.scanUntilQuotedValueOrEOF('>');
-                                },
-                                '`' => {
-                                    end_of_segment = iter.scanUntilQuotedValueOrEOF('`');
-                                },
-                                else => {},
-                            }
-                            try to.writeAll(rest_of_line[0..end_of_segment]);
-                            if (is_colored) {
-                                try to.writeAll("\x1b[0m");
-                            }
-
-                            try to.writeAll(rest_of_line[end_of_segment..]);
-                        } else if (is_colored) {
-                            try to.writeAll("\x1b[0m");
-                        }
-                    } else {
-                        try to.writeAll(line_text);
-                    }
-
-                    try to.writeAll("\n");
-
-                    try to.writeByteNTimes(' ', location_in_line_text);
-                    if (comptime enable_ansi_colors) {
-                        const is_colored = message_color.len > 0;
-                        if (is_colored) {
-                            try to.writeAll(message_color);
-                            try to.writeAll(color_name);
-                            // always bold the ^
-                            try to.writeAll(comptime Output.color_map.get("b").?);
-                        }
-
-                        try to.writeByte('^');
-
-                        if (is_colored) {
-                            try to.writeAll("\x1b[0m\n");
-                        }
-                    } else {
-                        try to.writeAll("^\n");
-                    }
-                }
-            }
-
+        if (this.location) |*location| {
             if (location.file.len > 0) {
-                if (comptime enable_ansi_colors) {
-                    if (!is_note and kind == .err) {
-                        try to.writeAll(comptime Output.color_map.get("b").?);
-                    } else {}
-                }
+                try to.writeAll("\n");
+                try to.writeByteNTimes(' ', (kind.string().len + ": ".len) - "at ".len);
 
-                try std.fmt.format(to, comptime Output.prettyFmt("{s}<r>", enable_ansi_colors), .{
+                try to.print(comptime Output.prettyFmt("<d>at <r><cyan>{s}<r>", enable_ansi_colors), .{
                     location.file,
                 });
 
-                if (location.line > -1 and location.column > -1) {
-                    try std.fmt.format(to, comptime Output.prettyFmt("<d>:<r><yellow>{d}<r><d>:<r><yellow>{d}<r> <d>{d}<r>", enable_ansi_colors), .{
+                if (location.line > 0 and location.column > -1) {
+                    try to.print(comptime Output.prettyFmt("<d>:<r><yellow>{d}<r><d>:<r><yellow>{d}<r>", enable_ansi_colors), .{
                         location.line,
                         location.column,
-                        location.offset,
                     });
                 } else if (location.line > -1) {
-                    try std.fmt.format(to, comptime Output.prettyFmt("<d>:<r><yellow>{d}<r> <d>{d}<r>", enable_ansi_colors), .{
+                    try to.print(comptime Output.prettyFmt("<d>:<r><yellow>{d}<r>", enable_ansi_colors), .{
                         location.line,
-                        location.offset,
                     });
+                }
+
+                if (Environment.isDebug) {
+                    // comptime magic: do not print byte when using Bun.inspect, but only print
+                    // when you the writer is to a file (like standard out)
+                    if ((comptime std.mem.indexOf(u8, @typeName(@TypeOf(to)), "fs.file") != null) and Output.enable_ansi_colors_stderr) {
+                        try to.print(comptime Output.prettyFmt(" <d>byte={d}<r>", enable_ansi_colors), .{
+                            location.offset,
+                        });
+                    }
                 }
             }
         }
@@ -385,8 +400,8 @@ pub const BabyString = packed struct {
 
     pub fn in(parent: string, text: string) BabyString {
         return BabyString{
-            .offset = @truncate(u16, std.mem.indexOf(u8, parent, text) orelse unreachable),
-            .len = @truncate(u16, text.len),
+            .offset = @as(u16, @truncate(std.mem.indexOf(u8, parent, text) orelse unreachable)),
+            .len = @as(u16, @truncate(text.len)),
         };
     }
 
@@ -398,27 +413,59 @@ pub const BabyString = packed struct {
 pub const Msg = struct {
     kind: Kind = Kind.err,
     data: Data,
-    metadata: Metadata = .{ .build = 0 },
-    notes: ?[]Data = null,
+    metadata: Metadata = .build,
+    notes: []Data = &.{},
+    redact_sensitive_information: bool = false,
+
+    pub fn memoryCost(this: *const Msg) usize {
+        var cost: usize = 0;
+        cost += this.data.memoryCost();
+        for (this.notes) |*note| {
+            cost += note.memoryCost();
+        }
+        return cost;
+    }
+
+    pub fn fromJS(allocator: std.mem.Allocator, globalObject: *bun.JSC.JSGlobalObject, file: string, err: bun.JSC.JSValue) OOM!Msg {
+        var zig_exception_holder: bun.JSC.ZigException.Holder = bun.JSC.ZigException.Holder.init();
+        if (err.toError()) |value| {
+            value.toZigException(globalObject, zig_exception_holder.zigException());
+        } else {
+            zig_exception_holder.zig_exception.message = err.toBunString(globalObject);
+        }
+
+        return Msg{
+            .data = .{
+                .text = try zig_exception_holder.zigException().message.toOwnedSlice(allocator),
+                .location = Location{
+                    .file = file,
+                    .line = 0,
+                    .column = 0,
+                },
+            },
+        };
+    }
+
+    pub fn toJS(this: Msg, globalObject: *bun.JSC.JSGlobalObject, allocator: std.mem.Allocator) JSC.JSValue {
+        return switch (this.metadata) {
+            .build => JSC.BuildMessage.create(globalObject, allocator, this),
+            .resolve => JSC.ResolveMessage.create(globalObject, allocator, this, ""),
+        };
+    }
 
     pub fn count(this: *const Msg, builder: *StringBuilder) void {
         this.data.count(builder);
-        if (this.notes) |notes| {
-            for (notes) |note| {
-                note.count(builder);
-            }
+        for (this.notes) |note| {
+            note.count(builder);
         }
     }
 
-    pub fn clone(this: *const Msg, allocator: std.mem.Allocator) !Msg {
+    pub fn clone(this: *const Msg, allocator: std.mem.Allocator) OOM!Msg {
         return Msg{
             .kind = this.kind,
             .data = try this.data.clone(allocator),
             .metadata = this.metadata,
-            .notes = if (this.notes != null and this.notes.?.len > 0)
-                try bun.clone(this.notes.?, allocator)
-            else
-                null,
+            .notes = try bun.clone(this.notes, allocator),
         };
     }
 
@@ -427,59 +474,51 @@ pub const Msg = struct {
             .kind = this.kind,
             .data = this.data.cloneWithBuilder(builder),
             .metadata = this.metadata,
-            .notes = if (this.notes != null and this.notes.?.len > 0) brk: {
-                for (this.notes.?) |note, i| {
+            .notes = if (this.notes.len > 0) brk: {
+                for (this.notes, 0..) |note, i| {
                     notes[i] = note.cloneWithBuilder(builder);
                 }
-                break :brk notes[0..this.notes.?.len];
-            } else null,
+                break :brk notes[0..this.notes.len];
+            } else &.{},
         };
     }
 
-    pub const Metadata = union(Tag) {
-        build: u0,
+    pub const Metadata = union(enum) {
+        build,
         resolve: Resolve,
-        pub const Tag = enum(u8) {
-            build = 1,
-            resolve = 2,
-        };
 
         pub const Resolve = struct {
             specifier: BabyString,
             import_kind: ImportKind,
+            err: anyerror = error.ModuleNotFound,
         };
     };
 
-    pub fn toAPI(this: *const Msg, allocator: std.mem.Allocator) !Api.Message {
-        const notes_len = if (this.notes != null) this.notes.?.len else 0;
-        var _notes = try allocator.alloc(
+    pub fn toAPI(this: *const Msg, allocator: std.mem.Allocator) OOM!Api.Message {
+        var notes = try allocator.alloc(
             Api.MessageData,
-            notes_len,
+            this.notes.len,
         );
-        var msg = Api.Message{
+        const msg = Api.Message{
             .level = this.kind.toAPI(),
             .data = this.data.toAPI(),
-            .notes = _notes,
+            .notes = notes,
             .on = Api.MessageMeta{
                 .resolve = if (this.metadata == .resolve) this.metadata.resolve.specifier.slice(this.data.text) else "",
                 .build = this.metadata == .build,
             },
         };
 
-        if (this.notes) |notes| {
-            if (notes.len > 0) {
-                for (notes) |note, i| {
-                    _notes[i] = note.toAPI();
-                }
-            }
+        for (this.notes, 0..) |note, i| {
+            notes[i] = note.toAPI();
         }
 
         return msg;
     }
 
-    pub fn toAPIFromList(comptime ListType: type, list: ListType, allocator: std.mem.Allocator) ![]Api.Message {
+    pub fn toAPIFromList(comptime ListType: type, list: ListType, allocator: std.mem.Allocator) OOM![]Api.Message {
         var out_list = try allocator.alloc(Api.Message, list.items.len);
-        for (list.items) |item, i| {
+        for (list.items, 0..) |item, i| {
             out_list[i] = try item.toAPI(allocator);
         }
 
@@ -488,12 +527,13 @@ pub const Msg = struct {
 
     pub fn deinit(msg: *Msg, allocator: std.mem.Allocator) void {
         msg.data.deinit(allocator);
-        if (msg.notes) |notes| {
-            for (notes) |note| {
-                note.deinit(allocator);
-            }
+        for (msg.notes) |*note| {
+            note.deinit(allocator);
         }
-        msg.notes = null;
+
+        allocator.free(msg.notes);
+
+        msg.notes = &.{};
     }
 
     pub fn writeFormat(
@@ -501,12 +541,16 @@ pub const Msg = struct {
         to: anytype,
         comptime enable_ansi_colors: bool,
     ) !void {
-        try msg.data.writeFormat(to, msg.kind, enable_ansi_colors, false);
+        try msg.data.writeFormat(to, msg.kind, msg.redact_sensitive_information, enable_ansi_colors);
 
-        if (msg.notes) |notes| {
-            for (notes) |note| {
-                try note.writeFormat(to, .note, enable_ansi_colors, true);
-            }
+        if (msg.notes.len > 0) {
+            try to.writeAll("\n");
+        }
+
+        for (msg.notes) |note| {
+            try to.writeAll("\n");
+
+            try note.writeFormat(to, .note, msg.redact_sensitive_information, enable_ansi_colors);
         }
     }
 
@@ -520,7 +564,7 @@ pub const Msg = struct {
             try writer.print("{s}: {s}\n{s}\n{s}:{}:{} ({d})", .{
                 msg.kind.string(),
                 msg.data.text,
-                location.line_text,
+                location.line_text orelse "",
                 location.file,
                 location.line,
                 location.column,
@@ -534,7 +578,7 @@ pub const Msg = struct {
         }
     }
 
-    pub fn formatNoWriter(msg: *const Msg, comptime formatterFunc: @TypeOf(Global.panic)) void {
+    pub fn formatNoWriter(msg: *const Msg, comptime formatterFunc: @TypeOf(Output.panic)) void {
         formatterFunc("\n\n{s}: {s}\n{s}\n{s}:{}:{} ({d})", .{
             msg.kind.string(),
             msg.data.text,
@@ -547,15 +591,24 @@ pub const Msg = struct {
     }
 };
 
-pub const Range = packed struct {
+// Do not mark these as packed
+// https://github.com/ziglang/zig/issues/15715
+pub const Range = struct {
     loc: Loc = Loc.Empty,
     len: i32 = 0,
-    pub const None = Range{ .loc = Loc.Empty, .len = 0 };
+
+    /// Deprecated: use .none
+    pub const None = none;
+    pub const none = Range{ .loc = Loc.Empty, .len = 0 };
 
     pub fn in(this: Range, buf: []const u8) []const u8 {
         if (this.loc.start < 0 or this.len <= 0) return "";
-        const slice = buf[@intCast(usize, this.loc.start)..];
-        return slice[0..@minimum(@intCast(usize, this.len), buf.len)];
+        const slice = buf[@as(usize, @intCast(this.loc.start))..];
+        return slice[0..@min(@as(usize, @intCast(this.len)), buf.len)];
+    }
+
+    pub fn contains(this: Range, k: i32) bool {
+        return k >= this.loc.start and k < this.loc.start + this.len;
     }
 
     pub fn isEmpty(r: *const Range) bool {
@@ -569,17 +622,30 @@ pub const Range = packed struct {
         return std.math.lossyCast(usize, self.loc.start + self.len);
     }
 
-    pub fn jsonStringify(self: *const Range, options: anytype, writer: anytype) !void {
-        return try std.json.stringify([2]i32{ self.loc.start, self.len + self.loc.start }, options, writer);
+    pub fn jsonStringify(self: *const Range, writer: anytype) !void {
+        return try writer.write([2]i32{ self.loc.start, self.len + self.loc.start });
     }
 };
 
 pub const Log = struct {
-    debug: bool = false,
-    warnings: usize = 0,
-    errors: usize = 0,
-    msgs: ArrayList(Msg),
+    warnings: u32 = 0,
+    errors: u32 = 0,
+    msgs: std.ArrayList(Msg),
     level: Level = if (Environment.isDebug) Level.info else Level.warn,
+
+    clone_line_text: bool = false,
+
+    pub fn memoryCost(this: *const Log) usize {
+        var cost: usize = 0;
+        for (this.msgs.items) |msg| {
+            cost += msg.memoryCost();
+        }
+        return cost;
+    }
+
+    pub inline fn hasErrors(this: *const Log) bool {
+        return this.errors > 0;
+    }
 
     pub fn reset(this: *Log) void {
         this.msgs.clearRetainingCapacity();
@@ -587,7 +653,7 @@ pub const Log = struct {
         this.errors = 0;
     }
 
-    pub var default_log_level = if (Environment.isDebug) Level.info else Level.warn;
+    pub var default_log_level = Level.warn;
 
     pub fn hasAny(this: *const Log) bool {
         return (this.warnings + this.errors) > 0;
@@ -597,8 +663,8 @@ pub const Log = struct {
         var warnings: u32 = 0;
         var errors: u32 = 0;
         for (this.msgs.items) |msg| {
-            errors += @intCast(u32, @boolToInt(msg.kind == .err));
-            warnings += @intCast(u32, @boolToInt(msg.kind == .warn));
+            errors += @as(u32, @intCast(@intFromBool(msg.kind == .err)));
+            warnings += @as(u32, @intCast(@intFromBool(msg.kind == .warn)));
         }
 
         return Api.Log{
@@ -609,14 +675,14 @@ pub const Log = struct {
     }
 
     pub const Level = enum(i8) {
-        verbose,
-        debug,
-        info,
-        warn,
-        err,
+        verbose, // 0
+        debug, // 1
+        info, // 2
+        warn, //  3
+        err, // 4
 
         pub fn atLeast(this: Level, other: Level) bool {
-            return @enumToInt(this) >= @enumToInt(other);
+            return @intFromEnum(this) <= @intFromEnum(other);
         }
 
         pub const label: std.EnumArray(Level, string) = brk: {
@@ -628,67 +694,111 @@ pub const Log = struct {
             map.set(Level.err, "error");
             break :brk map;
         };
+        pub const Map = bun.ComptimeStringMap(Level, .{
+            .{ "verbose", Level.verbose },
+            .{ "debug", Level.debug },
+            .{ "info", Level.info },
+            .{ "warn", Level.warn },
+            .{ "error", Level.err },
+        });
+
+        pub fn fromJS(globalThis: *JSC.JSGlobalObject, value: JSC.JSValue) JSError!?Level {
+            if (value == .zero or value == .undefined) {
+                return null;
+            }
+
+            if (!value.isString()) {
+                return globalThis.throwInvalidArguments("Expected logLevel to be a string", .{});
+            }
+
+            return Map.fromJS(globalThis, value);
+        }
     };
 
     pub fn init(allocator: std.mem.Allocator) Log {
         return Log{
-            .msgs = ArrayList(Msg).init(allocator),
+            .msgs = std.ArrayList(Msg).init(allocator),
             .level = default_log_level,
         };
     }
 
     pub fn initComptime(allocator: std.mem.Allocator) Log {
         return Log{
-            .msgs = ArrayList(Msg).init(allocator),
+            .msgs = std.ArrayList(Msg).init(allocator),
         };
     }
 
-    pub fn addVerbose(log: *Log, source: ?*const Source, loc: Loc, text: string) !void {
+    pub fn addDebugFmt(log: *Log, source: ?*const Source, l: Loc, allocator: std.mem.Allocator, comptime text: string, args: anytype) OOM!void {
+        if (!Kind.shouldPrint(.debug, log.level)) return;
+
         @setCold(true);
-        try log.addMsg(Msg{
+        try log.addMsg(.{
+            .kind = .debug,
+            .data = try rangeData(source, Range{ .loc = l }, try allocPrint(allocator, text, args)).cloneLineText(log.clone_line_text, log.msgs.allocator),
+        });
+    }
+
+    pub fn addVerbose(log: *Log, source: ?*const Source, loc: Loc, text: string) OOM!void {
+        if (!Kind.shouldPrint(.verbose, log.level)) return;
+
+        @setCold(true);
+        try log.addMsg(.{
             .kind = .verbose,
             .data = rangeData(source, Range{ .loc = loc }, text),
         });
     }
 
-    pub fn toJS(this: Log, global: *JSC.JSGlobalObject, allocator: std.mem.Allocator, fmt: string) JSC.JSValue {
+    pub fn toJS(this: Log, global: *JSC.JSGlobalObject, allocator: std.mem.Allocator, message: string) JSC.JSValue {
         const msgs: []const Msg = this.msgs.items;
-        var errors_stack: [256]*anyopaque = undefined;
+        var errors_stack: [256]JSC.JSValue = undefined;
 
-        const count = @intCast(u16, @minimum(msgs.len, errors_stack.len));
+        const count = @as(u16, @intCast(@min(msgs.len, errors_stack.len)));
         switch (count) {
-            0 => return JSC.JSValue.jsUndefined(),
+            0 => return .undefined,
             1 => {
                 const msg = msgs[0];
-                return JSC.JSValue.fromRef(JSC.BuildError.create(global, allocator, msg));
+                return switch (msg.metadata) {
+                    .build => JSC.BuildMessage.create(global, allocator, msg),
+                    .resolve => JSC.ResolveMessage.create(global, allocator, msg, ""),
+                };
             },
             else => {
-                for (msgs[0..count]) |msg, i| {
-                    switch (msg.metadata) {
-                        .build => {
-                            errors_stack[i] = JSC.BuildError.create(global, allocator, msg).?;
-                        },
-                        .resolve => {
-                            errors_stack[i] = JSC.ResolveError.create(global, allocator, msg, "").?;
-                        },
-                    }
+                for (msgs[0..count], 0..) |msg, i| {
+                    errors_stack[i] = switch (msg.metadata) {
+                        .build => JSC.BuildMessage.create(global, allocator, msg),
+                        .resolve => JSC.ResolveMessage.create(global, allocator, msg, ""),
+                    };
                 }
-                const out = JSC.ZigString.init(fmt);
-                const agg = global.createAggregateError(errors_stack[0..count].ptr, count, &out);
+                const out = JSC.ZigString.init(message);
+                const agg = global.createAggregateError(errors_stack[0..count], &out);
                 return agg;
             },
         }
     }
 
-    pub fn appendTo(self: *Log, other: *Log) !void {
+    /// unlike toJS, this always produces an AggregateError object
+    pub fn toJSAggregateError(this: Log, global: *JSC.JSGlobalObject, message: bun.String) JSC.JSValue {
+        return global.createAggregateErrorWithArray(message, this.toJSArray(global, bun.default_allocator));
+    }
+
+    pub fn toJSArray(this: Log, global: *JSC.JSGlobalObject, allocator: std.mem.Allocator) JSC.JSValue {
+        const msgs: []const Msg = this.msgs.items;
+
+        const arr = JSC.JSValue.createEmptyArray(global, msgs.len);
+        for (msgs, 0..) |msg, i| {
+            arr.putIndex(global, @as(u32, @intCast(i)), msg.toJS(global, allocator));
+        }
+
+        return arr;
+    }
+
+    pub fn cloneTo(self: *Log, other: *Log) OOM!void {
         var notes_count: usize = 0;
 
         for (self.msgs.items) |msg_| {
             const msg: Msg = msg_;
-            if (msg.notes) |notes| {
-                for (notes) |note| {
-                    notes_count += @intCast(usize, @boolToInt(note.text.len > 0));
-                }
+            for (msg.notes) |note| {
+                notes_count += @as(usize, @intCast(@intFromBool(note.text.len > 0)));
             }
         }
 
@@ -696,45 +806,38 @@ pub const Log = struct {
             var notes = try other.msgs.allocator.alloc(Data, notes_count);
             var note_i: usize = 0;
             for (self.msgs.items) |*msg| {
-                if (msg.notes) |current_notes| {
-                    var start_note_i: usize = note_i;
-                    for (current_notes) |note| {
-                        notes[note_i] = note;
-                        note_i += 1;
-                    }
-                    msg.notes = notes[start_note_i..note_i];
+                const start_note_i: usize = note_i;
+                for (msg.notes) |note| {
+                    notes[note_i] = note;
+                    note_i += 1;
                 }
+                msg.notes = notes[start_note_i..note_i];
             }
         }
 
         try other.msgs.appendSlice(self.msgs.items);
         other.warnings += self.warnings;
         other.errors += self.errors;
-        self.msgs.deinit();
     }
 
-    pub fn appendToMaybeRecycled(self: *Log, other: *Log, source: *const Source) !void {
+    pub fn appendTo(self: *Log, other: *Log) OOM!void {
+        try self.cloneTo(other);
+        self.msgs.clearAndFree();
+    }
+
+    pub fn cloneToWithRecycled(self: *Log, other: *Log, recycled: bool) OOM!void {
         try other.msgs.appendSlice(self.msgs.items);
         other.warnings += self.warnings;
         other.errors += self.errors;
 
-        if (source.contents_is_recycled) {
+        if (recycled) {
             var string_builder = StringBuilder{};
             var notes_count: usize = 0;
             {
-                var i: usize = 0;
-                var j: usize = other.msgs.items.len - self.msgs.items.len;
-
-                while (i < self.msgs.items.len) : ({
-                    i += 1;
-                    j += 1;
-                }) {
-                    const msg: Msg = self.msgs.items[i];
+                for (self.msgs.items) |msg| {
                     msg.count(&string_builder);
 
-                    if (msg.notes) |notes| {
-                        notes_count += notes.len;
-                    }
+                    notes_count += msg.notes.len;
                 }
             }
 
@@ -743,43 +846,63 @@ pub const Log = struct {
             var note_i: usize = 0;
 
             {
-                var i: usize = 0;
-                var j: usize = other.msgs.items.len - self.msgs.items.len;
-
-                while (i < self.msgs.items.len) : ({
-                    i += 1;
-                    j += 1;
-                }) {
-                    const msg: Msg = self.msgs.items[i];
+                for (self.msgs.items, (other.msgs.items.len - self.msgs.items.len)..) |msg, j| {
                     other.msgs.items[j] = msg.cloneWithBuilder(notes_buf[note_i..], &string_builder);
-                    note_i += (msg.notes orelse &[_]Data{}).len;
+                    note_i += msg.notes.len;
                 }
             }
         }
+    }
 
-        self.msgs.deinit();
+    pub fn appendToWithRecycled(self: *Log, other: *Log, recycled: bool) OOM!void {
+        try self.cloneToWithRecycled(other, recycled);
+        self.msgs.clearAndFree();
+    }
+
+    pub fn appendToMaybeRecycled(self: *Log, other: *Log, source: *const Source) OOM!void {
+        return self.appendToWithRecycled(other, source.contents_is_recycled);
     }
 
     pub fn deinit(self: *Log) void {
-        self.msgs.deinit();
+        self.msgs.clearAndFree();
     }
 
-    pub fn addVerboseWithNotes(log: *Log, source: ?*const Source, loc: Loc, text: string, notes: []Data) !void {
+    // TODO: remove `deinit` because it does not de-initialize the log; it clears it
+    pub const clearAndFree = deinit;
+
+    pub fn addVerboseWithNotes(log: *Log, source: ?*const Source, loc: Loc, text: string, notes: []Data) OOM!void {
         @setCold(true);
         if (!Kind.shouldPrint(.verbose, log.level)) return;
 
-        try log.addMsg(Msg{
+        try log.addMsg(.{
             .kind = .verbose,
             .data = rangeData(source, Range{ .loc = loc }, text),
             .notes = notes,
         });
     }
 
-    inline fn _addResolveErrorWithLevel(log: *Log, source: *const Source, r: Range, allocator: std.mem.Allocator, comptime fmt: string, args: anytype, import_kind: ImportKind, comptime dupe_text: bool, comptime is_error: bool) !void {
-        const text = try std.fmt.allocPrint(allocator, fmt, args);
+    inline fn allocPrint(allocator: std.mem.Allocator, comptime fmt: string, args: anytype) OOM!string {
+        return try switch (Output.enable_ansi_colors) {
+            inline else => |enable_ansi_colors| std.fmt.allocPrint(allocator, Output.prettyFmt(fmt, enable_ansi_colors), args),
+        };
+    }
+
+    inline fn addResolveErrorWithLevel(
+        log: *Log,
+        source: ?*const Source,
+        r: Range,
+        allocator: std.mem.Allocator,
+        comptime fmt: string,
+        args: anytype,
+        import_kind: ImportKind,
+        comptime dupe_text: bool,
+        comptime kind: enum { err, warn },
+        err: anyerror,
+    ) OOM!void {
+        const text = try allocPrint(allocator, fmt, args);
         // TODO: fix this. this is stupid, it should be returned in allocPrint.
         const specifier = BabyString.in(text, args.@"0");
-        if (comptime is_error) {
+        if (comptime kind == .err) {
             log.errors += 1;
         } else {
             log.warnings += 1;
@@ -793,7 +916,7 @@ pub const Log = struct {
             );
             if (_data.location != null) {
                 if (_data.location.?.line_text) |line| {
-                    _data.location.?.line_text = allocator.dupe(u8, line) catch unreachable;
+                    _data.location.?.line_text = try allocator.dupe(u8, line);
                 }
             }
             break :brk _data;
@@ -804,130 +927,174 @@ pub const Log = struct {
         );
 
         const msg = Msg{
-            .kind = if (comptime is_error) Kind.err else Kind.warn,
+            // .kind = if (comptime error_type == .err) Kind.err else Kind.warn,
+            .kind = @field(Kind, @tagName(kind)),
             .data = data,
-            .metadata = .{ .resolve = Msg.Metadata.Resolve{ .specifier = specifier, .import_kind = import_kind } },
+            .metadata = .{ .resolve = Msg.Metadata.Resolve{
+                .specifier = specifier,
+                .import_kind = import_kind,
+                .err = err,
+            } },
         };
 
         try log.addMsg(msg);
     }
 
-    inline fn _addResolveError(log: *Log, source: *const Source, r: Range, allocator: std.mem.Allocator, comptime fmt: string, args: anytype, import_kind: ImportKind, comptime dupe_text: bool) !void {
-        return _addResolveErrorWithLevel(log, source, r, allocator, fmt, args, import_kind, dupe_text, true);
-    }
-
-    inline fn _addResolveWarn(log: *Log, source: *const Source, r: Range, allocator: std.mem.Allocator, comptime fmt: string, args: anytype, import_kind: ImportKind, comptime dupe_text: bool) !void {
-        return _addResolveErrorWithLevel(log, source, r, allocator, fmt, args, import_kind, dupe_text, false);
-    }
-
     pub fn addResolveError(
         log: *Log,
-        source: *const Source,
+        source: ?*const Source,
         r: Range,
         allocator: std.mem.Allocator,
         comptime fmt: string,
         args: anytype,
         import_kind: ImportKind,
-    ) !void {
+        err: anyerror,
+    ) OOM!void {
         @setCold(true);
-        return try _addResolveError(log, source, r, allocator, fmt, args, import_kind, false);
+        return try addResolveErrorWithLevel(log, source, r, allocator, fmt, args, import_kind, false, .err, err);
     }
 
     pub fn addResolveErrorWithTextDupe(
         log: *Log,
-        source: *const Source,
+        source: ?*const Source,
         r: Range,
         allocator: std.mem.Allocator,
         comptime fmt: string,
         args: anytype,
         import_kind: ImportKind,
-    ) !void {
+    ) OOM!void {
         @setCold(true);
-        return try _addResolveError(log, source, r, allocator, fmt, args, import_kind, true);
+        return try addResolveErrorWithLevel(log, source, r, allocator, fmt, args, import_kind, true, .err, error.ModuleNotFound);
     }
 
-    pub fn addResolveErrorWithTextDupeMaybeWarn(
-        log: *Log,
-        source: *const Source,
-        r: Range,
-        allocator: std.mem.Allocator,
-        comptime fmt: string,
-        args: anytype,
-        import_kind: ImportKind,
-        warn: bool,
-    ) !void {
-        @setCold(true);
-        if (warn) {
-            return try _addResolveError(log, source, r, allocator, fmt, args, import_kind, true);
-        } else {
-            return try _addResolveWarn(log, source, r, allocator, fmt, args, import_kind, true);
-        }
-    }
-
-    pub fn addRangeError(log: *Log, source: ?*const Source, r: Range, text: string) !void {
+    pub fn addRangeError(log: *Log, source: ?*const Source, r: Range, text: string) OOM!void {
         @setCold(true);
         log.errors += 1;
-        try log.addMsg(Msg{
+        try log.addMsg(.{
             .kind = .err,
             .data = rangeData(source, r, text),
         });
     }
 
-    pub fn addRangeErrorFmt(log: *Log, source: ?*const Source, r: Range, allocator: std.mem.Allocator, comptime text: string, args: anytype) !void {
+    pub fn addRangeErrorFmt(log: *Log, source: ?*const Source, r: Range, allocator: std.mem.Allocator, comptime text: string, args: anytype) OOM!void {
         @setCold(true);
         log.errors += 1;
-        try log.addMsg(Msg{
+        try log.addMsg(.{
             .kind = .err,
-            .data = rangeData(source, r, std.fmt.allocPrint(allocator, text, args) catch unreachable),
+            .data = try rangeData(source, r, try allocPrint(allocator, text, args)).cloneLineText(log.clone_line_text, log.msgs.allocator),
         });
     }
 
-    pub fn addRangeErrorFmtWithNotes(log: *Log, source: ?*const Source, r: Range, allocator: std.mem.Allocator, notes: []Data, comptime text: string, args: anytype) !void {
+    pub fn addRangeErrorFmtWithNotes(log: *Log, source: ?*const Source, r: Range, allocator: std.mem.Allocator, notes: []Data, comptime fmt: string, args: anytype) OOM!void {
         @setCold(true);
         log.errors += 1;
-        try log.addMsg(Msg{
+        try log.addMsg(.{
             .kind = .err,
-            .data = rangeData(source, r, std.fmt.allocPrint(allocator, text, args) catch unreachable),
+            .data = try rangeData(source, r, try allocPrint(allocator, fmt, args)).cloneLineText(log.clone_line_text, log.msgs.allocator),
             .notes = notes,
         });
     }
 
-    pub fn addErrorFmt(log: *Log, source: ?*const Source, l: Loc, allocator: std.mem.Allocator, comptime text: string, args: anytype) !void {
+    pub fn addErrorFmt(log: *Log, source: ?*const Source, l: Loc, allocator: std.mem.Allocator, comptime text: string, args: anytype) OOM!void {
         @setCold(true);
         log.errors += 1;
-        try log.addMsg(Msg{
+        try log.addMsg(.{
             .kind = .err,
-            .data = rangeData(source, Range{ .loc = l }, std.fmt.allocPrint(allocator, text, args) catch unreachable),
+            .data = try rangeData(source, .{ .loc = l }, try allocPrint(allocator, text, args)).cloneLineText(log.clone_line_text, log.msgs.allocator),
         });
     }
 
-    pub fn addRangeWarning(log: *Log, source: ?*const Source, r: Range, text: string) !void {
+    // TODO(dylan-conway): rename and replace `addErrorFmt`
+    pub fn addErrorFmtOpts(log: *Log, allocator: std.mem.Allocator, comptime fmt: string, args: anytype, opts: AddErrorOptions) OOM!void {
         @setCold(true);
-        if (!Kind.shouldPrint(.warn, log.level)) return;
-        log.warnings += 1;
-        try log.addMsg(Msg{
-            .kind = .warn,
-            .data = rangeData(source, r, text),
+        log.errors += 1;
+        try log.addMsg(.{
+            .kind = .err,
+            .data = try rangeData(
+                opts.source,
+                .{ .loc = opts.loc, .len = opts.len },
+                try allocPrint(allocator, fmt, args),
+            ).cloneLineText(log.clone_line_text, log.msgs.allocator),
+            .redact_sensitive_information = opts.redact_sensitive_information,
         });
     }
 
-    pub fn addWarningFmt(log: *Log, source: ?*const Source, l: Loc, allocator: std.mem.Allocator, comptime text: string, args: anytype) !void {
+    // Use a bun.sys.Error's message in addition to some extra context.
+    pub fn addSysError(log: *Log, alloc: std.mem.Allocator, e: bun.sys.Error, comptime fmt: string, args: anytype) OOM!void {
+        const tag_name, const sys_errno = e.getErrorCodeTagName() orelse {
+            try log.addErrorFmt(null, Loc.Empty, alloc, fmt, args);
+            return;
+        };
+        try log.addErrorFmt(
+            null,
+            Loc.Empty,
+            alloc,
+            "{s}: " ++ fmt,
+            .{bun.sys.coreutils_error_map.get(sys_errno) orelse tag_name} ++ args,
+        );
+    }
+
+    pub fn addZigErrorWithNote(log: *Log, allocator: std.mem.Allocator, err: anyerror, comptime noteFmt: string, args: anytype) OOM!void {
         @setCold(true);
-        if (!Kind.shouldPrint(.warn, log.level)) return;
-        log.warnings += 1;
-        try log.addMsg(Msg{
-            .kind = .warn,
-            .data = rangeData(source, Range{ .loc = l }, std.fmt.allocPrint(allocator, text, args) catch unreachable),
+        log.errors += 1;
+
+        var notes = try allocator.alloc(Data, 1);
+        notes[0] = rangeData(null, Range.None, try allocPrint(allocator, noteFmt, args));
+
+        try log.addMsg(.{
+            .kind = .err,
+            .data = rangeData(null, Range.None, @errorName(err)),
+            .notes = notes,
         });
     }
 
-    pub fn addRangeWarningFmt(log: *Log, source: ?*const Source, r: Range, allocator: std.mem.Allocator, comptime text: string, args: anytype) !void {
+    pub fn addRangeWarning(log: *Log, source: ?*const Source, r: Range, text: string) OOM!void {
         @setCold(true);
         if (!Kind.shouldPrint(.warn, log.level)) return;
         log.warnings += 1;
-        try log.addMsg(Msg{
+        try log.addMsg(.{
             .kind = .warn,
-            .data = rangeData(source, r, std.fmt.allocPrint(allocator, text, args) catch unreachable),
+            .data = try rangeData(source, r, text).cloneLineText(log.clone_line_text, log.msgs.allocator),
+        });
+    }
+
+    pub fn addWarningFmt(log: *Log, source: ?*const Source, l: Loc, allocator: std.mem.Allocator, comptime text: string, args: anytype) OOM!void {
+        @setCold(true);
+        if (!Kind.shouldPrint(.warn, log.level)) return;
+        log.warnings += 1;
+        try log.addMsg(.{
+            .kind = .warn,
+            .data = try rangeData(source, Range{ .loc = l }, try allocPrint(allocator, text, args)).cloneLineText(log.clone_line_text, log.msgs.allocator),
+        });
+    }
+
+    pub fn addWarningFmtLineCol(log: *Log, filepath: []const u8, line: u32, col: u32, allocator: std.mem.Allocator, comptime text: string, args: anytype) OOM!void {
+        @setCold(true);
+        if (!Kind.shouldPrint(.warn, log.level)) return;
+        log.warnings += 1;
+
+        // TODO: do this properly
+
+        try log.addMsg(.{
+            .kind = .warn,
+            .data = try Data.cloneLineText(Data{
+                .text = try allocPrint(allocator, text, args),
+                .location = Location{
+                    .file = filepath,
+                    .line = @intCast(line),
+                    .column = @intCast(col),
+                },
+            }, log.clone_line_text, allocator),
+        });
+    }
+
+    pub fn addRangeWarningFmt(log: *Log, source: ?*const Source, r: Range, allocator: std.mem.Allocator, comptime text: string, args: anytype) OOM!void {
+        @setCold(true);
+        if (!Kind.shouldPrint(.warn, log.level)) return;
+        log.warnings += 1;
+        try log.addMsg(.{
+            .kind = .warn,
+            .data = try rangeData(source, r, try allocPrint(allocator, text, args)).cloneLineText(log.clone_line_text, log.msgs.allocator),
         });
     }
 
@@ -941,138 +1108,212 @@ pub const Log = struct {
         comptime note_fmt: string,
         note_args: anytype,
         note_range: Range,
-    ) !void {
+    ) OOM!void {
         @setCold(true);
         if (!Kind.shouldPrint(.warn, log.level)) return;
         log.warnings += 1;
 
         var notes = try allocator.alloc(Data, 1);
-        notes[0] = rangeData(source, note_range, std.fmt.allocPrint(allocator, note_fmt, note_args) catch unreachable);
+        notes[0] = rangeData(source, note_range, try allocPrint(allocator, note_fmt, note_args));
 
-        try log.addMsg(Msg{
+        try log.addMsg(.{
             .kind = .warn,
-            .data = rangeData(source, r, std.fmt.allocPrint(allocator, fmt, args) catch unreachable),
+            .data = rangeData(source, r, try allocPrint(allocator, fmt, args)),
             .notes = notes,
         });
     }
 
-    pub fn addWarning(log: *Log, source: ?*const Source, l: Loc, text: string) !void {
+    pub fn addRangeWarningFmtWithNotes(log: *Log, source: ?*const Source, r: Range, allocator: std.mem.Allocator, notes: []Data, comptime fmt: string, args: anytype) OOM!void {
+        @setCold(true);
+        log.warnings += 1;
+        try log.addMsg(.{
+            .kind = .warn,
+            .data = try rangeData(source, r, try allocPrint(allocator, fmt, args)).cloneLineText(log.clone_line_text, log.msgs.allocator),
+            .notes = notes,
+        });
+    }
+
+    pub fn addRangeErrorFmtWithNote(
+        log: *Log,
+        source: ?*const Source,
+        r: Range,
+        allocator: std.mem.Allocator,
+        comptime fmt: string,
+        args: anytype,
+        comptime note_fmt: string,
+        note_args: anytype,
+        note_range: Range,
+    ) OOM!void {
+        @setCold(true);
+        if (!Kind.shouldPrint(.err, log.level)) return;
+        log.errors += 1;
+
+        var notes = try allocator.alloc(Data, 1);
+        notes[0] = rangeData(source, note_range, try allocPrint(allocator, note_fmt, note_args));
+
+        try log.addMsg(.{
+            .kind = .err,
+            .data = rangeData(source, r, try allocPrint(allocator, fmt, args)),
+            .notes = notes,
+        });
+    }
+
+    pub fn addWarning(log: *Log, source: ?*const Source, l: Loc, text: string) OOM!void {
         @setCold(true);
         if (!Kind.shouldPrint(.warn, log.level)) return;
         log.warnings += 1;
-        try log.addMsg(Msg{
+        try log.addMsg(.{
             .kind = .warn,
             .data = rangeData(source, Range{ .loc = l }, text),
         });
     }
 
-    pub fn addRangeDebug(log: *Log, source: ?*const Source, r: Range, text: string) !void {
+    pub fn addWarningWithNote(log: *Log, source: ?*const Source, l: Loc, allocator: std.mem.Allocator, warn: string, comptime note_fmt: string, note_args: anytype) OOM!void {
+        @setCold(true);
+        if (!Kind.shouldPrint(.warn, log.level)) return;
+        log.warnings += 1;
+
+        var notes = try allocator.alloc(Data, 1);
+        notes[0] = rangeData(source, Range{ .loc = l }, try allocPrint(allocator, note_fmt, note_args));
+
+        try log.addMsg(.{
+            .kind = .warn,
+            .data = rangeData(null, Range.None, warn),
+            .notes = notes,
+        });
+    }
+
+    pub fn addRangeDebug(log: *Log, source: ?*const Source, r: Range, text: string) OOM!void {
         @setCold(true);
         if (!Kind.shouldPrint(.debug, log.level)) return;
-        try log.addMsg(Msg{
+        try log.addMsg(.{
             .kind = .debug,
             .data = rangeData(source, r, text),
         });
     }
 
-    pub fn addRangeDebugWithNotes(log: *Log, source: ?*const Source, r: Range, text: string, notes: []Data) !void {
+    pub fn addRangeDebugWithNotes(log: *Log, source: ?*const Source, r: Range, text: string, notes: []Data) OOM!void {
         @setCold(true);
         if (!Kind.shouldPrint(.debug, log.level)) return;
         // log.de += 1;
-        try log.addMsg(Msg{
+        try log.addMsg(.{
             .kind = Kind.debug,
             .data = rangeData(source, r, text),
             .notes = notes,
         });
     }
 
-    pub fn addRangeErrorWithNotes(log: *Log, source: ?*const Source, r: Range, text: string, notes: []Data) !void {
+    pub fn addRangeErrorWithNotes(log: *Log, source: ?*const Source, r: Range, text: string, notes: []Data) OOM!void {
         @setCold(true);
         log.errors += 1;
-        try log.addMsg(Msg{
+        try log.addMsg(.{
             .kind = Kind.err,
             .data = rangeData(source, r, text),
             .notes = notes,
         });
     }
 
-    pub fn addRangeWarningWithNotes(log: *Log, source: ?*const Source, r: Range, text: string, notes: []Data) !void {
+    pub fn addRangeWarningWithNotes(log: *Log, source: ?*const Source, r: Range, text: string, notes: []Data) OOM!void {
         @setCold(true);
         if (!Kind.shouldPrint(.warn, log.level)) return;
         log.warnings += 1;
-        try log.addMsg(Msg{
+        try log.addMsg(.{
             .kind = .warning,
             .data = rangeData(source, r, text),
             .notes = notes,
         });
     }
 
-    pub inline fn addMsg(self: *Log, msg: Msg) !void {
-        if (comptime Environment.allow_assert) {
-            if (msg.notes) |notes| {
-                bun.assertDefined(notes);
-                for (notes) |note| {
-                    bun.assertDefined(note.text);
-                    if (note.location) |loc| {
-                        bun.assertDefined(loc);
-                    }
-                }
-            }
-        }
+    pub fn addMsg(self: *Log, msg: Msg) OOM!void {
         try self.msgs.append(msg);
     }
 
-    pub fn addError(self: *Log, _source: ?*const Source, loc: Loc, text: string) !void {
+    pub fn addError(self: *Log, _source: ?*const Source, loc: Loc, text: string) OOM!void {
         @setCold(true);
         self.errors += 1;
-        try self.addMsg(Msg{ .kind = .err, .data = rangeData(_source, Range{ .loc = loc }, text) });
+        try self.addMsg(.{ .kind = .err, .data = rangeData(_source, Range{ .loc = loc }, text) });
     }
 
-    pub fn printForLogLevel(self: *Log, to: anytype) !void {
-        if (Output.enable_ansi_colors) {
-            return self.printForLogLevelWithEnableAnsiColors(to, true);
-        } else {
-            return self.printForLogLevelWithEnableAnsiColors(to, false);
-        }
+    const AddErrorOptions = struct {
+        source: ?*const Source = null,
+        loc: Loc = Loc.Empty,
+        len: i32 = 0,
+        redact_sensitive_information: bool = false,
+    };
+
+    // TODO(dylan-conway): rename and replace `addError`
+    pub fn addErrorOpts(self: *Log, text: string, opts: AddErrorOptions) OOM!void {
+        @setCold(true);
+        self.errors += 1;
+        try self.addMsg(.{
+            .kind = .err,
+            .data = rangeData(opts.source, .{ .loc = opts.loc, .len = opts.len }, text),
+            .redact_sensitive_information = opts.redact_sensitive_information,
+        });
     }
 
-    pub fn printForLogLevelWithEnableAnsiColors(self: *Log, to: anytype, comptime enable_ansi_colors: bool) !void {
-        var printed = false;
+    pub fn addSymbolAlreadyDeclaredError(self: *Log, allocator: std.mem.Allocator, source: *const Source, name: string, new_loc: Loc, old_loc: Loc) OOM!void {
+        var notes = try allocator.alloc(Data, 1);
+        notes[0] = rangeData(
+            source,
+            source.rangeOfIdentifier(old_loc),
+            try std.fmt.allocPrint(allocator, "\"{s}\" was originally declared here", .{name}),
+        );
 
+        try self.addRangeErrorFmtWithNotes(
+            source,
+            source.rangeOfIdentifier(new_loc),
+            allocator,
+            notes,
+            "\"{s}\" has already been declared",
+            .{name},
+        );
+    }
+
+    pub fn print(self: *const Log, to: anytype) !void {
+        return switch (Output.enable_ansi_colors) {
+            inline else => |enable_ansi_colors| self.printWithEnableAnsiColors(to, enable_ansi_colors),
+        };
+    }
+
+    pub fn printWithEnableAnsiColors(self: *const Log, to: anytype, comptime enable_ansi_colors: bool) !void {
+        var needs_newline = false;
         if (self.warnings > 0 and self.errors > 0) {
             // Print warnings at the top
             // errors at the bottom
             // This is so if you're reading from a terminal
             // and there are a bunch of warnings
             // You can more easily see where the errors are
-
-            for (self.msgs.items) |msg| {
+            for (self.msgs.items) |*msg| {
                 if (msg.kind != .err) {
                     if (msg.kind.shouldPrint(self.level)) {
+                        if (needs_newline) try to.writeAll("\n\n");
                         try msg.writeFormat(to, enable_ansi_colors);
-                        printed = true;
+                        needs_newline = true;
                     }
                 }
             }
 
-            for (self.msgs.items) |msg| {
+            for (self.msgs.items) |*msg| {
                 if (msg.kind == .err) {
                     if (msg.kind.shouldPrint(self.level)) {
+                        if (needs_newline) try to.writeAll("\n\n");
                         try msg.writeFormat(to, enable_ansi_colors);
-                        printed = true;
+                        needs_newline = true;
                     }
                 }
             }
         } else {
-            for (self.msgs.items) |msg| {
+            for (self.msgs.items) |*msg| {
                 if (msg.kind.shouldPrint(self.level)) {
+                    if (needs_newline) try to.writeAll("\n\n");
                     try msg.writeFormat(to, enable_ansi_colors);
-                    printed = true;
+                    needs_newline = true;
                 }
             }
         }
 
-        if (printed) _ = try to.write("\n");
+        if (needs_newline) _ = try to.write("\n");
     }
 
     pub fn toZigException(this: *const Log, allocator: std.mem.Allocator) *js.ZigException.Holder {
@@ -1086,15 +1327,47 @@ pub const Log = struct {
 };
 
 pub inline fn usize2Loc(loc: usize) Loc {
-    return Loc{ .start = @intCast(i32, loc) };
+    return Loc{ .start = @as(i32, @intCast(loc)) };
 }
 
 pub const Source = struct {
     path: fs.Path,
-    key_path: fs.Path,
-    index: u32 = 0,
+
     contents: string,
     contents_is_recycled: bool = false,
+
+    /// Lazily-generated human-readable identifier name that is non-unique
+    /// Avoid accessing this directly most of the  time
+    identifier_name: string = "",
+
+    index: Index = Index.source(0),
+
+    pub fn fmtIdentifier(this: *const Source) bun.fmt.FormatValidIdentifier {
+        return this.path.name.fmtIdentifier();
+    }
+
+    pub fn identifierName(this: *Source, allocator: std.mem.Allocator) !string {
+        if (this.identifier_name.len > 0) {
+            return this.identifier_name;
+        }
+
+        bun.assert(this.path.text.len > 0);
+        const name = try this.path.name.nonUniqueNameString(allocator);
+        this.identifier_name = name;
+        return name;
+    }
+
+    pub fn rangeOfIdentifier(this: *const Source, loc: Loc) Range {
+        const js_lexer = @import("./js_lexer.zig");
+        return js_lexer.rangeOfIdentifier(this, loc);
+    }
+
+    pub fn isWebAssembly(this: *const Source) bool {
+        if (this.contents.len < 4) return false;
+
+        const bytes = @as(u32, @bitCast(this.contents[0..4].*));
+        return bytes == 0x6d736100; // "\0asm"
+    }
 
     pub const ErrorPosition = struct {
         line_start: usize,
@@ -1105,23 +1378,21 @@ pub const Source = struct {
 
     pub fn initEmptyFile(filepath: string) Source {
         const path = fs.Path.init(filepath);
-        return Source{ .path = path, .key_path = path, .index = 0, .contents = "" };
+        return Source{ .path = path, .contents = "" };
     }
 
-    pub fn initFile(file: fs.File, _: std.mem.Allocator) !Source {
+    pub fn initFile(file: fs.PathContentsPair, _: std.mem.Allocator) !Source {
         var source = Source{
             .path = file.path,
-            .key_path = fs.Path.init(file.path.text),
             .contents = file.contents,
         };
         source.path.namespace = "file";
         return source;
     }
 
-    pub fn initRecycledFile(file: fs.File, _: std.mem.Allocator) !Source {
+    pub fn initRecycledFile(file: fs.PathContentsPair, _: std.mem.Allocator) !Source {
         var source = Source{
             .path = file.path,
-            .key_path = fs.Path.init(file.path.text),
             .contents = file.contents,
             .contents_is_recycled = true,
         };
@@ -1131,8 +1402,8 @@ pub const Source = struct {
     }
 
     pub fn initPathString(pathString: string, contents: string) Source {
-        var path = fs.Path.init(pathString);
-        return Source{ .key_path = path, .path = path, .contents = contents };
+        const path = fs.Path.init(pathString);
+        return Source{ .path = path, .contents = contents };
     }
 
     pub fn textForRange(self: *const Source, r: Range) string {
@@ -1145,7 +1416,7 @@ pub const Source = struct {
         if (index >= 0) {
             return Range{ .loc = Loc{
                 .start = loc.start + index,
-            }, .len = @intCast(i32, op.len) };
+            }, .len = @as(i32, @intCast(op.len)) };
         }
 
         return Range{ .loc = loc };
@@ -1164,12 +1435,12 @@ pub const Source = struct {
 
         if (quote == '"' or quote == '\'') {
             var i: usize = 1;
-            var c: u8 = undefined;
+            var c: u8 = 0;
             while (i < text.len) {
                 c = text[i];
 
                 if (c == quote) {
-                    return Range{ .loc = loc, .len = @intCast(i32, i + 1) };
+                    return Range{ .loc = loc, .len = @as(i32, @intCast(i + 1)) };
                 } else if (c == '\\') {
                     i += 1;
                 }
@@ -1192,9 +1463,10 @@ pub const Source = struct {
         return Range{ .loc = loc };
     }
 
-    pub fn initErrorPosition(self: *const Source, _offset: Loc) ErrorPosition {
+    pub fn initErrorPosition(self: *const Source, offset_loc: Loc) ErrorPosition {
+        bun.assert(!offset_loc.isEmpty());
         var prev_code_point: i32 = 0;
-        var offset: usize = std.math.min(if (_offset.start < 0) 0 else @intCast(usize, _offset.start), @maximum(self.contents.len, 1) - 1);
+        const offset: usize = @min(@as(usize, @intCast(offset_loc.start)), @max(self.contents.len, 1) - 1);
 
         const contents = self.contents;
 
@@ -1263,8 +1535,50 @@ pub const Source = struct {
             .column_count = column_number,
         };
     }
+    pub fn lineColToByteOffset(source_contents: []const u8, start_line: usize, start_col: usize, line: usize, col: usize) ?usize {
+        var iter_ = strings.CodepointIterator{
+            .bytes = source_contents,
+            .i = 0,
+        };
+        var iter = strings.CodepointIterator.Cursor{};
+
+        var line_count: usize = start_line;
+        var column_number: usize = start_col;
+
+        _ = iter_.next(&iter);
+        while (true) {
+            const c = iter.c;
+            if (!iter_.next(&iter)) break;
+            switch (c) {
+                '\n' => {
+                    column_number = 1;
+                    line_count += 1;
+                },
+
+                '\r' => {
+                    column_number = 1;
+                    line_count += 1;
+                    if (iter.c == '\n') {
+                        _ = iter_.next(&iter);
+                    }
+                },
+
+                0x2028, 0x2029 => {
+                    line_count += 1;
+                    column_number = 1;
+                },
+                else => {
+                    column_number += 1;
+                },
+            }
+
+            if (line_count == line and column_number == col) return iter.i;
+            if (line_count > line) return null;
+        }
+        return null;
+    }
 };
 
 pub fn rangeData(source: ?*const Source, r: Range, text: string) Data {
-    return Data{ .text = text, .location = Location.init_or_nil(source, r) };
+    return Data{ .text = text, .location = Location.initOrNull(source, r) };
 }

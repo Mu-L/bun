@@ -1,133 +1,89 @@
-var $$mod$ = Symbol.for;
+// Since runtime.js loads first in the bundler, Ref.none will point at this
+// value. And since it isnt exported, it will always be tree-shaken away.
+var __INVALID__REF__;
+
+// This ordering is deliberate so that the printer optimizes
+// them into a single destructuring assignment.
 var __create = Object.create;
 var __descs = Object.getOwnPropertyDescriptors;
-var __defProp = Object.defineProperty;
 var __getProtoOf = Object.getPrototypeOf;
-var __hasOwnProp = Object.prototype.hasOwnProperty;
+var __defProp = Object.defineProperty;
 var __getOwnPropNames = Object.getOwnPropertyNames;
 var __getOwnPropDesc = Object.getOwnPropertyDescriptor;
+var __hasOwnProp = Object.prototype.hasOwnProperty;
 
-// We're disabling Object.freeze because it breaks CJS => ESM and can cause
-// issues with Suspense and other things that expect the CJS module namespace
-// to be mutable when the ESM module namespace is NOT mutable
-// var __objectFreezePolyfill = new WeakSet();
-
-// globalThis.Object.freeze = function freeze(obj) {
-//   __objectFreezePolyfill.add(obj);
-//   return obj;
-// };
-
-// globalThis.Object.isFrozen = function isFrozen(obj) {
-//   return __objectFreezePolyfill.has(obj);
-// };
-
-export var __markAsModule = (target) =>
-  __defProp(target, "__esModule", { value: true, configurable: true });
-
-// lazy require to prevent loading one icon from a design system
-export var $$lzy = (target, module, props) => {
-  for (let key in props) {
-    if (!__hasOwnProp.call(target, key))
+// This is used to implement "export * from" statements. It copies properties
+// from the imported module to the current module's ESM export object. If the
+// current module is an entry point and the target format is CommonJS, we
+// also copy the properties to "module.exports" in addition to our module's
+// internal ESM export object.
+export var __reExport = (target, mod, secondTarget) => {
+  for (let key of __getOwnPropNames(mod))
+    if (!__hasOwnProp.call(target, key) && key !== "default")
       __defProp(target, key, {
-        get: () => module()[props[key]],
+        get: () => mod[key],
         enumerable: true,
-        configurable: true,
-      });
-  }
-  return target;
-};
-
-export var __toModule = (module) => {
-  return __reExport(
-    __markAsModule(
-      __defProp(
-        module != null ? __create(__getProtoOf(module)) : {},
-        "default",
-        module && module.__esModule && "default" in module
-          ? { get: () => module.default, enumerable: true, configurable: true }
-          : { value: module, enumerable: true, configurable: true }
-      )
-    ),
-    module
-  );
-};
-
-var tagSymbol = Symbol.for("CommonJSTransformed");
-var cjsRequireSymbol = Symbol.for("CommonJS");
-export var __commonJS = (cb, name) => {
-  var mod;
-  var has_run = false;
-
-  const requireFunction = function load() {
-    if (has_run) {
-      return mod.exports;
-    }
-
-    has_run = true;
-    cb(((mod = { exports: {} }), mod), mod.exports);
-
-    const kind = typeof mod.exports;
-
-    if (
-      (kind === "object" || kind === "function") &&
-      !mod.exports[tagSymbol] &&
-      Object.isExtensible(mod.exports)
-    ) {
-      Object.defineProperty(mod.exports, tagSymbol, {
-        value: true,
-        enumerable: false,
-        configurable: false,
       });
 
-      if (!("default" in mod.exports)) {
-        Object.defineProperty(mod.exports, "default", {
-          get() {
-            return mod.exports;
-          },
-          set(v) {
-            if (v === mod.exports) return;
-            mod.exports = v;
-            return true;
-          },
-          // enumerable: false is important here
-          enumerable: false,
-          configurable: true,
+  if (secondTarget) {
+    for (let key of __getOwnPropNames(mod))
+      if (!__hasOwnProp.call(secondTarget, key) && key !== "default")
+        __defProp(secondTarget, key, {
+          get: () => mod[key],
+          enumerable: true,
         });
-      }
-    }
 
-    return mod.exports;
-  };
-
-  requireFunction[cjsRequireSymbol] = true;
-  return requireFunction;
-};
-
-export var __cJS2eSM = __commonJS;
-
-export var __internalIsCommonJSNamespace = (namespace) =>
-  namespace != null &&
-  typeof namespace === "object" &&
-  ((namespace.default && namespace.default[cjsRequireSymbol]) ||
-    namespace[cjsRequireSymbol]);
-
-// require()
-export var __require = (namespace) => {
-  if (__internalIsCommonJSNamespace(namespace)) {
-    return namespace.default();
+    return secondTarget;
   }
-
-  return namespace;
 };
 
-// require().default
-// this currently does nothing
-// get rid of this wrapper once we're more confident we do not need special handling for default
-__require.d = (namespace) => {
-  return namespace;
+// Converts the module from CommonJS to ESM. When in node mode (i.e. in an
+// ".mjs" file, package.json has "type: module", or the "__esModule" export
+// in the CommonJS file is falsy or missing), the "default" property is
+// overridden to point to the original CommonJS exports object instead.
+export var __toESM = (mod, isNodeMode, target) => {
+  target = mod != null ? __create(__getProtoOf(mod)) : {};
+  const to =
+    isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target;
+
+  // If the importer is in node compatibility mode or this is not an ESM
+  // file that has been converted to a CommonJS file using a Babel-
+  // compatible transform (i.e. "__esModule" has not been set), then set
+  // "default" to the CommonJS "module.exports" for node compatibility.
+  for (let key of __getOwnPropNames(mod))
+    if (!__hasOwnProp.call(to, key))
+      __defProp(to, key, {
+        get: () => mod[key],
+        enumerable: true,
+      });
+
+  return to;
 };
 
-export var $$m = __commonJS;
+// Converts the module from ESM to CommonJS. This clones the input module
+// object with the addition of a non-enumerable "__esModule" property set
+// to "true", which overwrites any existing export named "__esModule".
+var __moduleCache = /* @__PURE__ */ new WeakMap();
+export var __toCommonJS = /* @__PURE__ */ from => {
+  var entry = __moduleCache.get(from),
+    desc;
+  if (entry) return entry;
+  entry = __defProp({}, "__esModule", { value: true });
+  if ((from && typeof from === "object") || typeof from === "function")
+    __getOwnPropNames(from).map(
+      key =>
+        !__hasOwnProp.call(entry, key) &&
+        __defProp(entry, key, {
+          get: () => from[key],
+          enumerable: !(desc = __getOwnPropDesc(from, key)) || desc.enumerable,
+        }),
+    );
+  __moduleCache.set(from, entry);
+  return entry;
+};
+
+// When you do know the module is CJS
+export var __commonJS = (cb, mod) => () => (mod || cb((mod = { exports: {} }).exports, mod), mod.exports);
 
 export var __name = (target, name) => {
   Object.defineProperty(target, "name", {
@@ -141,13 +97,14 @@ export var __name = (target, name) => {
 
 // ESM export -> CJS export
 // except, writable incase something re-exports
-export var __export = (target, all) => {
+
+export var __export = /* @__PURE__ */ (target, all) => {
   for (var name in all)
     __defProp(target, name, {
       get: all[name],
       enumerable: true,
       configurable: true,
-      set: (newValue) => (all[name] = () => newValue),
+      set: newValue => (all[name] = () => newValue),
     });
 };
 
@@ -155,7 +112,7 @@ export var __exportValue = (target, all) => {
   for (var name in all) {
     __defProp(target, name, {
       get: () => all[name],
-      set: (newValue) => (all[name] = newValue),
+      set: newValue => (all[name] = newValue),
       enumerable: true,
       configurable: true,
     });
@@ -165,31 +122,18 @@ export var __exportValue = (target, all) => {
 export var __exportDefault = (target, value) => {
   __defProp(target, "default", {
     get: () => value,
-    set: (newValue) => (value = newValue),
+    set: newValue => (value = newValue),
     enumerable: true,
     configurable: true,
   });
 };
 
-export var __reExport = (target, module, desc) => {
-  if ((module && typeof module === "object") || typeof module === "function")
-    for (let key of __getOwnPropNames(module))
-      if (!__hasOwnProp.call(target, key) && key !== "default")
-        __defProp(target, key, {
-          get: () => module[key],
-          configurable: true,
-          enumerable:
-            !(desc = __getOwnPropDesc(module, key)) || desc.enumerable,
-        });
-  return target;
-};
-
-function hasAnyProps(obj) {
+function __hasAnyProps(obj) {
   for (let key in obj) return true;
   return false;
 }
 
-function mergeDefaultProps(props, defaultProps) {
+function __mergeDefaultProps(props, defaultProps) {
   var result = __create(defaultProps, __descs(props));
 
   for (let key in defaultProps) {
@@ -200,9 +144,32 @@ function mergeDefaultProps(props, defaultProps) {
   return result;
 }
 export var __merge = (props, defaultProps) => {
-  return !hasAnyProps(defaultProps)
+  return !__hasAnyProps(defaultProps)
     ? props
-    : !hasAnyProps(props)
-    ? defaultProps
-    : mergeDefaultProps(props, defaultProps);
+    : !__hasAnyProps(props)
+      ? defaultProps
+      : __mergeDefaultProps(props, defaultProps);
 };
+
+export var __legacyDecorateClassTS = function (decorators, target, key, desc) {
+  var c = arguments.length,
+    r = c < 3 ? target : desc === null ? (desc = Object.getOwnPropertyDescriptor(target, key)) : desc,
+    d;
+  if (typeof Reflect === "object" && typeof Reflect.decorate === "function")
+    r = Reflect.decorate(decorators, target, key, desc);
+  else
+    for (var i = decorators.length - 1; i >= 0; i--)
+      if ((d = decorators[i])) r = (c < 3 ? d(r) : c > 3 ? d(target, key, r) : d(target, key)) || r;
+  return c > 3 && r && Object.defineProperty(target, key, r), r;
+};
+
+export var __legacyDecorateParamTS = (index, decorator) => (target, key) => decorator(target, key, index);
+
+export var __legacyMetadataTS = (k, v) => {
+  if (typeof Reflect === "object" && typeof Reflect.metadata === "function") return Reflect.metadata(k, v);
+};
+
+export var __esm = (fn, res) => () => (fn && (res = fn((fn = 0))), res);
+
+// This is used for JSX inlining with React.
+export var $$typeof = /* @__PURE__ */ Symbol.for("react.element");

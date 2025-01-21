@@ -1,4 +1,6 @@
-const bun = @import("../global.zig");
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+const bun = @import("root").bun;
 const string = bun.string;
 const Output = bun.Output;
 const Global = bun.Global;
@@ -8,7 +10,11 @@ const MutableString = bun.MutableString;
 const stringZ = bun.stringZ;
 const default_allocator = bun.default_allocator;
 const C = bun.C;
-const std = @import("std");
+const JSC = bun.JSC;
+const IdentityContext = @import("../identity_context.zig").IdentityContext;
+const OOM = bun.OOM;
+const TruncatedPackageNameHash = bun.install.TruncatedPackageNameHash;
+const Lockfile = bun.install.Lockfile;
 
 /// String type that stores either an offset/length into an external buffer or a string inline directly
 pub const String = extern struct {
@@ -18,6 +24,116 @@ pub const String = extern struct {
     /// 2. If the final bit is set, then it's a string that is stored inline.
     /// 3. If the final bit is not set, then it's a string that is stored in an external buffer.
     bytes: [max_inline_len]u8 = [8]u8{ 0, 0, 0, 0, 0, 0, 0, 0 },
+
+    /// Create an inline string
+    pub fn from(comptime inlinable_buffer: []const u8) String {
+        comptime {
+            if (inlinable_buffer.len > max_inline_len or
+                inlinable_buffer.len == max_inline_len and
+                inlinable_buffer[max_inline_len - 1] >= 0x80)
+            {
+                @compileError("string constant too long to be inlined");
+            }
+        }
+        return String.init(inlinable_buffer, inlinable_buffer);
+    }
+
+    pub const Buf = struct {
+        bytes: *std.ArrayListUnmanaged(u8),
+        allocator: std.mem.Allocator,
+        pool: *Builder.StringPool,
+
+        pub fn init(lockfile: *const Lockfile) Buf {
+            return .{
+                .bytes = &lockfile.buffers.string_bytes,
+                .allocator = lockfile.allocator,
+                .pool = &lockfile.string_pool,
+            };
+        }
+
+        pub fn append(this: *Buf, str: string) OOM!String {
+            if (canInline(str)) {
+                return String.initInline(str);
+            }
+
+            const hash = Builder.stringHash(str);
+            const entry = try this.pool.getOrPut(hash);
+            if (entry.found_existing) {
+                return entry.value_ptr.*;
+            }
+
+            // new entry
+            const new = try String.initAppend(this.allocator, this.bytes, str);
+            entry.value_ptr.* = new;
+            return new;
+        }
+
+        pub fn appendWithHash(this: *Buf, str: string, hash: u64) OOM!String {
+            if (canInline(str)) {
+                return initInline(str);
+            }
+
+            const entry = try this.pool.getOrPut(hash);
+            if (entry.found_existing) {
+                return entry.value_ptr.*;
+            }
+
+            // new entry
+            const new = try String.initAppend(this.allocator, this.bytes, str);
+            entry.value_ptr.* = new;
+            return new;
+        }
+
+        pub fn appendExternal(this: *Buf, str: string) OOM!ExternalString {
+            const hash = Builder.stringHash(str);
+
+            if (canInline(str)) {
+                return .{
+                    .value = String.initInline(str),
+                    .hash = hash,
+                };
+            }
+
+            const entry = try this.pool.getOrPut(hash);
+            if (entry.found_existing) {
+                return .{
+                    .value = entry.value_ptr.*,
+                    .hash = hash,
+                };
+            }
+
+            const new = try String.initAppend(this.allocator, this.bytes, str);
+            entry.value_ptr.* = new;
+            return .{
+                .value = new,
+                .hash = hash,
+            };
+        }
+
+        pub fn appendExternalWithHash(this: *Buf, str: string, hash: u64) OOM!ExternalString {
+            if (canInline(str)) {
+                return .{
+                    .value = initInline(str),
+                    .hash = hash,
+                };
+            }
+
+            const entry = try this.pool.getOrPut(hash);
+            if (entry.found_existing) {
+                return .{
+                    .value = entry.value_ptr.*,
+                    .hash = hash,
+                };
+            }
+
+            const new = try String.initAppend(this.allocator, this.bytes, str);
+            entry.value_ptr.* = new;
+            return .{
+                .value = new,
+                .hash = hash,
+            };
+        }
+    };
 
     pub const Tag = enum {
         small,
@@ -41,13 +157,46 @@ pub const String = extern struct {
         }
     };
 
+    /// Escapes for json. Expects string to be prequoted
+    pub inline fn fmtJson(self: *const String, buf: []const u8, opts: JsonFormatter.Options) JsonFormatter {
+        return .{
+            .buf = buf,
+            .str = self,
+            .opts = opts,
+        };
+    }
+
+    pub const JsonFormatter = struct {
+        str: *const String,
+        buf: string,
+        opts: Options,
+
+        pub const Options = struct {
+            quote: bool = true,
+        };
+
+        pub fn format(formatter: JsonFormatter, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+            try writer.print("{}", .{bun.fmt.formatJSONStringUTF8(formatter.str.slice(formatter.buf), .{ .quote = formatter.opts.quote })});
+        }
+    };
+
+    pub fn Sorter(comptime direction: enum { asc, desc }) type {
+        return struct {
+            lhs_buf: []const u8,
+            rhs_buf: []const u8,
+            pub fn lessThan(this: @This(), lhs: String, rhs: String) bool {
+                return lhs.order(&rhs, this.lhs_buf, this.rhs_buf) == if (comptime direction == .asc) .lt else .gt;
+            }
+        };
+    }
+
     pub inline fn order(
         lhs: *const String,
         rhs: *const String,
         lhs_buf: []const u8,
         rhs_buf: []const u8,
     ) std.math.Order {
-        return std.mem.order(u8, lhs.slice(lhs_buf), rhs.slice(rhs_buf));
+        return strings.order(lhs.slice(lhs_buf), rhs.slice(rhs_buf));
     }
 
     pub inline fn canInline(buf: []const u8) bool {
@@ -80,6 +229,34 @@ pub const String = extern struct {
         }
     }
 
+    pub const HashContext = struct {
+        a_buf: []const u8,
+        b_buf: []const u8,
+
+        pub fn eql(ctx: HashContext, a: String, b: String) bool {
+            return a.eql(b, ctx.a_buf, ctx.b_buf);
+        }
+
+        pub fn hash(ctx: HashContext, a: String) u64 {
+            const str = a.slice(ctx.a_buf);
+            return bun.hash(str);
+        }
+    };
+
+    pub const ArrayHashContext = struct {
+        a_buf: []const u8,
+        b_buf: []const u8,
+
+        pub fn eql(ctx: ArrayHashContext, a: String, b: String, _: usize) bool {
+            return a.eql(b, ctx.a_buf, ctx.b_buf);
+        }
+
+        pub fn hash(ctx: ArrayHashContext, a: String) u32 {
+            const str = a.slice(ctx.a_buf);
+            return @as(u32, @truncate(bun.hash(str)));
+        }
+    };
+
     pub fn init(
         buf: string,
         in: string,
@@ -98,55 +275,111 @@ pub const String = extern struct {
             // This should only happen for non-ascii strings that are exactly 8 bytes.
             // so that's an edge-case
             if ((in[max_inline_len - 1]) >= 128)
-                @bitCast(String, (@as(
+                @as(String, @bitCast((@as(
                     u64,
                     0,
                 ) | @as(
                     u64,
-                    @truncate(
+                    @as(
                         max_addressable_space,
-                        @bitCast(
+                        @truncate(@as(
                             u64,
-                            Pointer.init(buf, in),
-                        ),
+                            @bitCast(Pointer.init(buf, in)),
+                        )),
                     ),
-                )) | 1 << 63)
+                )) | 1 << 63))
             else
                 String{ .bytes = .{ in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7] } },
 
-            else => @bitCast(
+            else => @as(
                 String,
-                (@as(
+                @bitCast((@as(
                     u64,
                     0,
                 ) | @as(
                     u64,
-                    @truncate(
+                    @as(
                         max_addressable_space,
-                        @bitCast(
+                        @truncate(@as(
                             u64,
-                            Pointer.init(buf, in),
-                        ),
+                            @bitCast(Pointer.init(buf, in)),
+                        )),
                     ),
-                )) | 1 << 63,
+                )) | 1 << 63),
             ),
         };
     }
 
+    pub fn initInline(
+        in: string,
+    ) String {
+        bun.assertWithLocation(canInline(in), @src());
+        return switch (in.len) {
+            0 => .{},
+            1 => .{ .bytes = .{ in[0], 0, 0, 0, 0, 0, 0, 0 } },
+            2 => .{ .bytes = .{ in[0], in[1], 0, 0, 0, 0, 0, 0 } },
+            3 => .{ .bytes = .{ in[0], in[1], in[2], 0, 0, 0, 0, 0 } },
+            4 => .{ .bytes = .{ in[0], in[1], in[2], in[3], 0, 0, 0, 0 } },
+            5 => .{ .bytes = .{ in[0], in[1], in[2], in[3], in[4], 0, 0, 0 } },
+            6 => .{ .bytes = .{ in[0], in[1], in[2], in[3], in[4], in[5], 0, 0 } },
+            7 => .{ .bytes = .{ in[0], in[1], in[2], in[3], in[4], in[5], in[6], 0 } },
+            8 => .{ .bytes = .{ in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7] } },
+            else => unreachable,
+        };
+    }
+
+    pub fn initAppendIfNeeded(
+        allocator: std.mem.Allocator,
+        buf: *std.ArrayListUnmanaged(u8),
+        in: string,
+    ) OOM!String {
+        return switch (in.len) {
+            0 => .{},
+            1 => .{ .bytes = .{ in[0], 0, 0, 0, 0, 0, 0, 0 } },
+            2 => .{ .bytes = .{ in[0], in[1], 0, 0, 0, 0, 0, 0 } },
+            3 => .{ .bytes = .{ in[0], in[1], in[2], 0, 0, 0, 0, 0 } },
+            4 => .{ .bytes = .{ in[0], in[1], in[2], in[3], 0, 0, 0, 0 } },
+            5 => .{ .bytes = .{ in[0], in[1], in[2], in[3], in[4], 0, 0, 0 } },
+            6 => .{ .bytes = .{ in[0], in[1], in[2], in[3], in[4], in[5], 0, 0 } },
+            7 => .{ .bytes = .{ in[0], in[1], in[2], in[3], in[4], in[5], in[6], 0 } },
+
+            max_inline_len =>
+            // If they use the final bit, then it's a big string.
+            // This should only happen for non-ascii strings that are exactly 8 bytes.
+            // so that's an edge-case
+            if ((in[max_inline_len - 1]) >= 128)
+                try initAppend(allocator, buf, in)
+            else
+                .{ .bytes = .{ in[0], in[1], in[2], in[3], in[4], in[5], in[6], in[7] } },
+
+            else => try initAppend(allocator, buf, in),
+        };
+    }
+
+    pub fn initAppend(
+        allocator: std.mem.Allocator,
+        buf: *std.ArrayListUnmanaged(u8),
+        in: string,
+    ) OOM!String {
+        try buf.appendSlice(allocator, in);
+        const in_buf = buf.items[buf.items.len - in.len ..];
+        return @bitCast((@as(u64, 0) | @as(u64, @as(max_addressable_space, @truncate(@as(u64, @bitCast(Pointer.init(buf.items, in_buf))))))) | 1 << 63);
+    }
+
     pub fn eql(this: String, that: String, this_buf: []const u8, that_buf: []const u8) bool {
         if (this.isInline() and that.isInline()) {
-            return @bitCast(u64, this.bytes) == @bitCast(u64, that.bytes);
+            return @as(u64, @bitCast(this.bytes)) == @as(u64, @bitCast(that.bytes));
         } else if (this.isInline() != that.isInline()) {
             return false;
         } else {
             const a = this.ptr();
             const b = that.ptr();
-            return strings.eql(this_buf[0..a.len], that_buf[0..b.len]);
+            return strings.eql(this_buf[a.off..][0..a.len], that_buf[b.off..][0..b.len]);
         }
     }
 
     pub inline fn isEmpty(this: String) bool {
-        return @bitCast(u64, this.bytes) == @as(u64, 0);
+        return @as(u64, @bitCast(this.bytes)) == @as(u64, 0);
     }
 
     pub fn len(this: String) usize {
@@ -183,17 +416,24 @@ pub const String = extern struct {
             buf: string,
             in: string,
         ) Pointer {
-            std.debug.assert(@ptrToInt(buf.ptr) <= @ptrToInt(in.ptr) and ((@ptrToInt(in.ptr) + in.len) <= (@ptrToInt(buf.ptr) + buf.len)));
+            if (Environment.allow_assert) {
+                assert(bun.isSliceInBuffer(in, buf));
+            }
 
             return Pointer{
-                .off = @truncate(u32, @ptrToInt(in.ptr) - @ptrToInt(buf.ptr)),
-                .len = @truncate(u32, in.len),
+                .off = @as(u32, @truncate(@intFromPtr(in.ptr) - @intFromPtr(buf.ptr))),
+                .len = @as(u32, @truncate(in.len)),
             };
         }
     };
 
     pub inline fn ptr(this: String) Pointer {
-        return @bitCast(Pointer, @as(u64, @truncate(u63, @bitCast(u64, this))));
+        return @as(Pointer, @bitCast(@as(u64, @as(u63, @truncate(@as(u64, @bitCast(this)))))));
+    }
+
+    pub fn toJS(this: *const String, buffer: []const u8, globalThis: *JSC.JSGlobalObject) JSC.JSValue {
+        var str = bun.String.init(this.slice(buffer));
+        return str.transferToJS(globalThis);
     }
 
     // String must be a pointer because we reference it as a slice. It will become a dead pointer if it is copied.
@@ -224,11 +464,6 @@ pub const String = extern struct {
     }
 
     pub const Builder = struct {
-        const Allocator = @import("std").mem.Allocator;
-        const assert = @import("std").debug.assert;
-        const copy = @import("std").mem.copy;
-        const IdentityContext = @import("../identity_context.zig").IdentityContext;
-
         len: usize = 0,
         cap: usize = 0,
         ptr: ?[*]u8 = null,
@@ -237,7 +472,7 @@ pub const String = extern struct {
         pub const StringPool = std.HashMap(u64, String, IdentityContext(u64), 80);
 
         pub inline fn stringHash(buf: []const u8) u64 {
-            return std.hash.Wyhash.hash(0, buf);
+            return bun.Wyhash11.hash(0, buf);
         }
 
         pub inline fn count(this: *Builder, slice_: string) void {
@@ -258,18 +493,55 @@ pub const String = extern struct {
             else
                 &[_]u8{};
         }
-        pub fn allocate(this: *Builder, allocator: std.mem.Allocator) !void {
-            var ptr_ = try allocator.alloc(u8, this.cap);
+        pub fn allocate(this: *Builder, allocator: Allocator) !void {
+            const ptr_ = try allocator.alloc(u8, this.cap);
             this.ptr = ptr_.ptr;
         }
 
         pub fn append(this: *Builder, comptime Type: type, slice_: string) Type {
-            return @call(.{ .modifier = .always_inline }, appendWithHash, .{ this, Type, slice_, stringHash(slice_) });
+            return @call(bun.callmod_inline, appendWithHash, .{ this, Type, slice_, stringHash(slice_) });
+        }
+
+        pub fn appendUTF8WithoutPool(this: *Builder, comptime Type: type, slice_: string, hash: u64) Type {
+            if (slice_.len <= String.max_inline_len) {
+                if (strings.isAllASCII(slice_)) {
+                    switch (Type) {
+                        String => {
+                            return String.init(this.allocatedSlice(), slice_);
+                        },
+                        ExternalString => {
+                            return ExternalString.init(this.allocatedSlice(), slice_, hash);
+                        },
+                        else => @compileError("Invalid type passed to StringBuilder"),
+                    }
+                }
+            }
+
+            if (comptime Environment.allow_assert) {
+                assert(this.len <= this.cap); // didn't count everything
+                assert(this.ptr != null); // must call allocate first
+            }
+
+            bun.copy(u8, this.ptr.?[this.len..this.cap], slice_);
+            const final_slice = this.ptr.?[this.len..this.cap][0..slice_.len];
+            this.len += slice_.len;
+
+            if (comptime Environment.allow_assert) assert(this.len <= this.cap);
+
+            switch (Type) {
+                String => {
+                    return String.init(this.allocatedSlice(), final_slice);
+                },
+                ExternalString => {
+                    return ExternalString.init(this.allocatedSlice(), final_slice, hash);
+                },
+                else => @compileError("Invalid type passed to StringBuilder"),
+            }
         }
 
         // SlicedString is not supported due to inline strings.
         pub fn appendWithoutPool(this: *Builder, comptime Type: type, slice_: string, hash: u64) Type {
-            if (slice_.len < String.max_inline_len) {
+            if (slice_.len <= String.max_inline_len) {
                 switch (Type) {
                     String => {
                         return String.init(this.allocatedSlice(), slice_);
@@ -280,14 +552,16 @@ pub const String = extern struct {
                     else => @compileError("Invalid type passed to StringBuilder"),
                 }
             }
-            assert(this.len <= this.cap); // didn't count everything
-            assert(this.ptr != null); // must call allocate first
+            if (comptime Environment.allow_assert) {
+                assert(this.len <= this.cap); // didn't count everything
+                assert(this.ptr != null); // must call allocate first
+            }
 
-            copy(u8, this.ptr.?[this.len..this.cap], slice_);
+            bun.copy(u8, this.ptr.?[this.len..this.cap], slice_);
             const final_slice = this.ptr.?[this.len..this.cap][0..slice_.len];
             this.len += slice_.len;
 
-            assert(this.len <= this.cap);
+            if (comptime Environment.allow_assert) assert(this.len <= this.cap);
 
             switch (Type) {
                 String => {
@@ -301,7 +575,7 @@ pub const String = extern struct {
         }
 
         pub fn appendWithHash(this: *Builder, comptime Type: type, slice_: string, hash: u64) Type {
-            if (slice_.len < String.max_inline_len) {
+            if (slice_.len <= String.max_inline_len) {
                 switch (Type) {
                     String => {
                         return String.init(this.allocatedSlice(), slice_);
@@ -313,19 +587,21 @@ pub const String = extern struct {
                 }
             }
 
-            assert(this.len <= this.cap); // didn't count everything
-            assert(this.ptr != null); // must call allocate first
+            if (comptime Environment.allow_assert) {
+                assert(this.len <= this.cap); // didn't count everything
+                assert(this.ptr != null); // must call allocate first
+            }
 
-            var string_entry = this.string_pool.getOrPut(hash) catch unreachable;
+            const string_entry = this.string_pool.getOrPut(hash) catch unreachable;
             if (!string_entry.found_existing) {
-                copy(u8, this.ptr.?[this.len..this.cap], slice_);
+                bun.copy(u8, this.ptr.?[this.len..this.cap], slice_);
                 const final_slice = this.ptr.?[this.len..this.cap][0..slice_.len];
                 this.len += slice_.len;
 
                 string_entry.value_ptr.* = String.init(this.allocatedSlice(), final_slice);
             }
 
-            assert(this.len <= this.cap);
+            if (comptime Environment.allow_assert) assert(this.len <= this.cap);
 
             switch (Type) {
                 String => {
@@ -352,7 +628,7 @@ pub const String = extern struct {
 test "String works" {
     {
         var buf: string = "hello world";
-        var world: string = buf[6..];
+        const world: string = buf[6..];
         var str = String.init(
             buf,
             world,
@@ -361,19 +637,19 @@ test "String works" {
     }
 
     {
-        var buf: string = "hello";
-        var world: string = buf;
+        const buf: string = "hello";
+        const world: string = buf;
         var str = String.init(
             buf,
             world,
         );
         try std.testing.expectEqualStrings("hello", str.slice(buf));
-        try std.testing.expectEqual(@bitCast(u64, str), @bitCast(u64, [8]u8{ 'h', 'e', 'l', 'l', 'o', 0, 0, 0 }));
+        try std.testing.expectEqual(@as(u64, @bitCast(str)), @as(u64, @bitCast([8]u8{ 'h', 'e', 'l', 'l', 'o', 0, 0, 0 })));
     }
 
     {
-        var buf: string = &[8]u8{ 'h', 'e', 'l', 'l', 'o', 'k', 'k', 129 };
-        var world: string = buf;
+        const buf: string = &[8]u8{ 'h', 'e', 'l', 'l', 'o', 'k', 'k', 129 };
+        const world: string = buf;
         var str = String.init(
             buf,
             world,
@@ -400,7 +676,7 @@ pub const ExternalString = extern struct {
     pub inline fn from(in: string) ExternalString {
         return ExternalString{
             .value = String.init(in, in),
-            .hash = std.hash.Wyhash.hash(0, in),
+            .hash = bun.Wyhash.hash(0, in),
         };
     }
 
@@ -423,36 +699,8 @@ pub const ExternalString = extern struct {
         };
     }
 
-    pub inline fn slice(this: ExternalString, buf: string) string {
+    pub inline fn slice(this: *const ExternalString, buf: string) string {
         return this.value.slice(buf);
-    }
-};
-
-pub const BigExternalString = extern struct {
-    off: u32 = 0,
-    len: u32 = 0,
-    hash: u64 = 0,
-
-    pub fn from(in: string) BigExternalString {
-        return BigExternalString{
-            .off = 0,
-            .len = @truncate(u32, in.len),
-            .hash = std.hash.Wyhash.hash(0, in),
-        };
-    }
-
-    pub inline fn init(buf: string, in: string, hash: u64) BigExternalString {
-        std.debug.assert(@ptrToInt(buf.ptr) <= @ptrToInt(in.ptr) and ((@ptrToInt(in.ptr) + in.len) <= (@ptrToInt(buf.ptr) + buf.len)));
-
-        return BigExternalString{
-            .off = @truncate(u32, @ptrToInt(in.ptr) - @ptrToInt(buf.ptr)),
-            .len = @truncate(u32, in.len),
-            .hash = hash,
-        };
-    }
-
-    pub fn slice(this: BigExternalString, buf: string) string {
-        return buf[this.off..][0..this.len];
     }
 };
 
@@ -461,37 +709,66 @@ pub const SlicedString = struct {
     slice: string,
 
     pub inline fn init(buf: string, slice: string) SlicedString {
+        if (Environment.allow_assert and !@inComptime()) {
+            if (@intFromPtr(buf.ptr) > @intFromPtr(slice.ptr)) {
+                @panic("SlicedString.init buf is not in front of slice");
+            }
+        }
         return SlicedString{ .buf = buf, .slice = slice };
     }
 
     pub inline fn external(this: SlicedString) ExternalString {
-        if (comptime Environment.isDebug or Environment.isTest) std.debug.assert(@ptrToInt(this.buf.ptr) <= @ptrToInt(this.slice.ptr) and ((@ptrToInt(this.slice.ptr) + this.slice.len) <= (@ptrToInt(this.buf.ptr) + this.buf.len)));
+        if (comptime Environment.allow_assert) {
+            assert(@intFromPtr(this.buf.ptr) <= @intFromPtr(this.slice.ptr) and ((@intFromPtr(this.slice.ptr) + this.slice.len) <= (@intFromPtr(this.buf.ptr) + this.buf.len)));
+        }
 
-        return ExternalString.init(this.buf, this.slice, std.hash.Wyhash.hash(0, this.slice));
+        return ExternalString.init(this.buf, this.slice, bun.Wyhash11.hash(0, this.slice));
     }
 
     pub inline fn value(this: SlicedString) String {
-        if (comptime Environment.isDebug or Environment.isTest) std.debug.assert(@ptrToInt(this.buf.ptr) <= @ptrToInt(this.slice.ptr) and ((@ptrToInt(this.slice.ptr) + this.slice.len) <= (@ptrToInt(this.buf.ptr) + this.buf.len)));
+        if (comptime Environment.allow_assert) {
+            assert(@intFromPtr(this.buf.ptr) <= @intFromPtr(this.slice.ptr) and ((@intFromPtr(this.slice.ptr) + this.slice.len) <= (@intFromPtr(this.buf.ptr) + this.buf.len)));
+        }
 
         return String.init(this.buf, this.slice);
     }
 
     pub inline fn sub(this: SlicedString, input: string) SlicedString {
-        std.debug.assert(@ptrToInt(this.buf.ptr) <= @ptrToInt(this.buf.ptr) and ((@ptrToInt(input.ptr) + input.len) <= (@ptrToInt(this.buf.ptr) + this.buf.len)));
+        if (Environment.allow_assert) {
+            if (!(@intFromPtr(this.buf.ptr) <= @intFromPtr(this.buf.ptr) and ((@intFromPtr(input.ptr) + input.len) <= (@intFromPtr(this.buf.ptr) + this.buf.len)))) {
+                @panic("SlicedString.sub input is not a substring of the slice");
+            }
+        }
         return SlicedString{ .buf = this.buf, .slice = input };
     }
 };
 
-const RawType = void;
 pub const Version = extern struct {
     major: u32 = 0,
     minor: u32 = 0,
     patch: u32 = 0,
-    tag: Tag = Tag{},
-    // raw: RawType = RawType{},
+    _tag_padding: [4]u8 = .{0} ** 4, // [see padding_checker.zig]
+    tag: Tag = .{},
+
+    /// Assumes that there is only one buffer for all the strings
+    pub fn sortGt(ctx: []const u8, lhs: Version, rhs: Version) bool {
+        return orderFn(ctx, lhs, rhs) == .gt;
+    }
+
+    pub fn orderFn(ctx: []const u8, lhs: Version, rhs: Version) std.math.Order {
+        return lhs.order(rhs, ctx, ctx);
+    }
+
+    pub fn isZero(this: Version) bool {
+        return this.patch == 0 and this.minor == 0 and this.major == 0;
+    }
+
+    pub fn parseUTF8(slice: []const u8) ParseResult {
+        return parse(.{ .buf = slice, .slice = slice });
+    }
 
     pub fn cloneInto(this: Version, slice: []const u8, buf: *[]u8) Version {
-        return Version{
+        return .{
             .major = this.major,
             .minor = this.minor,
             .patch = this.patch,
@@ -503,47 +780,21 @@ pub const Version = extern struct {
         return this.tag.build.len + this.tag.pre.len;
     }
 
-    pub fn fmt(this: Version, input: string) Formatter {
-        return Formatter{ .version = this, .input = input };
-    }
-
-    pub fn count(this: Version, buf: []const u8, comptime StringBuilder: type, builder: StringBuilder) void {
-        if (this.tag.hasPre() and !this.tag.pre.isInline()) builder.count(this.tag.pre.slice(buf));
-        if (this.tag.hasBuild() and !this.tag.build.isInline()) builder.count(this.tag.build.slice(buf));
-    }
-
-    pub fn clone(this: Version, buf: []const u8, comptime StringBuilder: type, builder: StringBuilder) Version {
-        var that = this;
-
-        if (this.tag.hasPre() and !this.tag.pre.isInline()) that.tag.pre = builder.append(ExternalString, this.tag.pre.slice(buf));
-        if (this.tag.hasBuild() and !this.tag.build.isInline()) that.tag.build = builder.append(ExternalString, this.tag.build.slice(buf));
-
-        return that;
-    }
-
-    const HashableVersion = extern struct { major: u32, minor: u32, patch: u32, pre: u64, build: u64 };
-
-    pub fn hash(this: Version) u64 {
-        const hashable = HashableVersion{ .major = this.major, .minor = this.minor, .patch = this.patch, .pre = this.tag.pre.hash, .build = this.tag.build.hash };
-        const bytes = std.mem.asBytes(&hashable);
-        return std.hash.Wyhash.hash(0, bytes);
-    }
-
     pub const Formatter = struct {
         version: Version,
         input: string,
 
         pub fn format(formatter: Formatter, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
             const self = formatter.version;
-            try std.fmt.format(writer, "{d}.{d}.{d}", .{ self.major, self.minor, self.patch });
+            try std.fmt.format(writer, "{?d}.{?d}.{?d}", .{ self.major, self.minor, self.patch });
 
-            if (self.tag.pre.len() > 0) {
+            if (self.tag.hasPre()) {
                 const pre = self.tag.pre.slice(formatter.input);
                 try writer.writeAll("-");
                 try writer.writeAll(pre);
             }
 
-            if (self.tag.build.len() > 0) {
+            if (self.tag.hasBuild()) {
                 const build = self.tag.build.slice(formatter.input);
                 try writer.writeAll("+");
                 try writer.writeAll(build);
@@ -551,19 +802,389 @@ pub const Version = extern struct {
         }
     };
 
+    pub fn fmt(this: Version, input: string) Formatter {
+        return .{ .version = this, .input = input };
+    }
+
+    pub const DiffFormatter = struct {
+        version: Version,
+        buf: string,
+        other: Version,
+        other_buf: string,
+
+        pub fn format(this: DiffFormatter, comptime fmt_: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
+            if (!Output.enable_ansi_colors) {
+                // print normally if no colors
+                const formatter: Formatter = .{ .version = this.version, .input = this.buf };
+                return Formatter.format(formatter, fmt_, options, writer);
+            }
+
+            const diff = this.version.whichVersionIsDifferent(this.other, this.buf, this.other_buf) orelse .none;
+
+            switch (diff) {
+                .major => try writer.print(Output.prettyFmt("<r><b><red>{d}.{d}.{d}", true), .{
+                    this.version.major, this.version.minor, this.version.patch,
+                }),
+                .minor => {
+                    if (this.version.major == 0) {
+                        try writer.print(Output.prettyFmt("<d>{d}.<r><b><red>{d}.{d}", true), .{
+                            this.version.major, this.version.minor, this.version.patch,
+                        });
+                    } else {
+                        try writer.print(Output.prettyFmt("<d>{d}.<r><b><yellow>{d}.{d}", true), .{
+                            this.version.major, this.version.minor, this.version.patch,
+                        });
+                    }
+                },
+                .patch => {
+                    if (this.version.major == 0 and this.version.minor == 0) {
+                        try writer.print(Output.prettyFmt("<d>{d}.{d}.<r><b><red>{d}", true), .{
+                            this.version.major, this.version.minor, this.version.patch,
+                        });
+                    } else {
+                        try writer.print(Output.prettyFmt("<d>{d}.{d}.<r><b><green>{d}", true), .{
+                            this.version.major, this.version.minor, this.version.patch,
+                        });
+                    }
+                },
+                .none, .pre, .build => try writer.print(Output.prettyFmt("<d>{d}.{d}.{d}", true), .{
+                    this.version.major, this.version.minor, this.version.patch,
+                }),
+            }
+
+            // might be pre or build. loop through all characters, and insert <red> on
+            // first diff.
+
+            var set_color = false;
+            if (this.version.tag.hasPre()) {
+                if (this.other.tag.hasPre()) {
+                    const pre = this.version.tag.pre.slice(this.buf);
+                    const other_pre = this.other.tag.pre.slice(this.other_buf);
+
+                    var first = true;
+                    for (pre, 0..) |c, i| {
+                        if (!set_color and i < other_pre.len and c != other_pre[i]) {
+                            set_color = true;
+                            try writer.writeAll(Output.prettyFmt("<r><b><red>", true));
+                        }
+                        if (first) {
+                            first = false;
+                            try writer.writeByte('-');
+                        }
+                        try writer.writeByte(c);
+                    }
+                } else {
+                    try writer.print(Output.prettyFmt("<r><b><red>-{}", true), .{this.version.tag.pre.fmt(this.buf)});
+                    set_color = true;
+                }
+            }
+
+            if (this.version.tag.hasBuild()) {
+                if (this.other.tag.hasBuild()) {
+                    const build = this.version.tag.build.slice(this.buf);
+                    const other_build = this.other.tag.build.slice(this.other_buf);
+
+                    var first = true;
+                    for (build, 0..) |c, i| {
+                        if (!set_color and i < other_build.len and c != other_build[i]) {
+                            set_color = true;
+                            try writer.writeAll(Output.prettyFmt("<r><b><red>", true));
+                        }
+                        if (first) {
+                            first = false;
+                            try writer.writeByte('+');
+                        }
+                        try writer.writeByte(c);
+                    }
+                } else {
+                    if (!set_color) {
+                        try writer.print(Output.prettyFmt("<r><b><red>+{}", true), .{this.version.tag.build.fmt(this.buf)});
+                    } else {
+                        try writer.print("+{}", .{this.version.tag.build.fmt(this.other_buf)});
+                    }
+                }
+            }
+
+            try writer.writeAll(Output.prettyFmt("<r>", true));
+        }
+    };
+
+    pub fn diffFmt(this: Version, other: Version, this_buf: string, other_buf: string) DiffFormatter {
+        return .{
+            .version = this,
+            .buf = this_buf,
+            .other = other,
+            .other_buf = other_buf,
+        };
+    }
+
+    pub const ChangedVersion = enum {
+        major,
+        minor,
+        patch,
+        pre,
+        build,
+        none,
+    };
+
+    pub fn whichVersionIsDifferent(
+        left: Version,
+        right: Version,
+        left_buf: string,
+        right_buf: string,
+    ) ?ChangedVersion {
+        if (left.major != right.major) return .major;
+        if (left.minor != right.minor) return .minor;
+        if (left.patch != right.patch) return .patch;
+
+        if (left.tag.hasPre() != right.tag.hasPre()) return .pre;
+        if (!left.tag.hasPre() and !right.tag.hasPre()) return null;
+        if (left.tag.orderPre(right.tag, left_buf, right_buf) != .eq) return .pre;
+
+        if (left.tag.hasBuild() != right.tag.hasBuild()) return .build;
+        if (!left.tag.hasBuild() and !right.tag.hasBuild()) return null;
+        return if (left.tag.build.order(&right.tag.build, left_buf, right_buf) != .eq)
+            .build
+        else
+            null;
+    }
+
+    pub fn count(this: *const Version, buf: []const u8, comptime StringBuilder: type, builder: StringBuilder) void {
+        if (this.tag.hasPre() and !this.tag.pre.isInline()) builder.count(this.tag.pre.slice(buf));
+        if (this.tag.hasBuild() and !this.tag.build.isInline()) builder.count(this.tag.build.slice(buf));
+    }
+
+    pub fn append(this: *const Version, buf: []const u8, comptime StringBuilder: type, builder: StringBuilder) Version {
+        var that = this.*;
+
+        if (this.tag.hasPre() and !this.tag.pre.isInline()) that.tag.pre = builder.append(ExternalString, this.tag.pre.slice(buf));
+        if (this.tag.hasBuild() and !this.tag.build.isInline()) that.tag.build = builder.append(ExternalString, this.tag.build.slice(buf));
+
+        return that;
+    }
+
+    pub const Partial = struct {
+        major: ?u32 = null,
+        minor: ?u32 = null,
+        patch: ?u32 = null,
+        tag: Tag = .{},
+
+        pub fn min(this: Partial) Version {
+            return .{
+                .major = this.major orelse 0,
+                .minor = this.minor orelse 0,
+                .patch = this.patch orelse 0,
+                .tag = this.tag,
+            };
+        }
+
+        pub fn max(this: Partial) Version {
+            return .{
+                .major = this.major orelse std.math.maxInt(u32),
+                .minor = this.minor orelse std.math.maxInt(u32),
+                .patch = this.patch orelse std.math.maxInt(u32),
+                .tag = this.tag,
+            };
+        }
+    };
+
+    const Hashable = extern struct {
+        major: u32,
+        minor: u32,
+        patch: u32,
+        pre: u64,
+        build: u64,
+    };
+
+    pub fn hash(this: Version) u64 {
+        const hashable = Hashable{
+            .major = this.major,
+            .minor = this.minor,
+            .patch = this.patch,
+            .pre = this.tag.pre.hash,
+            .build = this.tag.build.hash,
+        };
+        const bytes = std.mem.asBytes(&hashable);
+        return bun.Wyhash.hash(0, bytes);
+    }
+
     pub fn eql(lhs: Version, rhs: Version) bool {
         return lhs.major == rhs.major and lhs.minor == rhs.minor and lhs.patch == rhs.patch and rhs.tag.eql(lhs.tag);
     }
 
     pub const HashContext = struct {
         pub fn hash(_: @This(), lhs: Version) u32 {
-            return @truncate(u32, lhs.hash());
+            return @as(u32, @truncate(lhs.hash()));
         }
 
         pub fn eql(_: @This(), lhs: Version, rhs: Version) bool {
             return lhs.eql(rhs);
         }
     };
+
+    pub const PinnedVersion = enum {
+        major, // ^
+        minor, // ~
+        patch, // =
+    };
+
+    /// Modified version of pnpm's `whichVersionIsPinned`
+    /// https://github.com/pnpm/pnpm/blob/bc0618cf192a9cafd0ab171a3673e23ed0869bbd/packages/which-version-is-pinned/src/index.ts#L9
+    ///
+    /// Differences:
+    /// - It's not used for workspaces
+    /// - `npm:` is assumed already removed from aliased versions
+    /// - Invalid input is considered major pinned (important because these strings are coming
+    ///    from package.json)
+    ///
+    /// The goal of this function is to avoid a complete parse of semver that's unused
+    pub fn whichVersionIsPinned(input: string) PinnedVersion {
+        const version = strings.trim(input, &strings.whitespace_chars);
+
+        var i: usize = 0;
+
+        const pinned: PinnedVersion = pinned: {
+            for (0..version.len) |j| {
+                switch (version[j]) {
+                    // newlines & whitespace
+                    ' ',
+                    '\t',
+                    '\n',
+                    '\r',
+                    std.ascii.control_code.vt,
+                    std.ascii.control_code.ff,
+
+                    // version separators
+                    'v',
+                    '=',
+                    => {},
+
+                    else => |c| {
+                        i = j;
+
+                        switch (c) {
+                            '~', '^' => {
+                                i += 1;
+
+                                for (i..version.len) |k| {
+                                    switch (version[k]) {
+                                        ' ',
+                                        '\t',
+                                        '\n',
+                                        '\r',
+                                        std.ascii.control_code.vt,
+                                        std.ascii.control_code.ff,
+                                        => {
+                                            // `v` and `=` not included.
+                                            // `~v==1` would update to `^1.1.0` if versions `1.0.0`, `1.0.1`, `1.1.0`, and `2.0.0` are available
+                                            // note that `~` changes to `^`
+                                        },
+
+                                        else => {
+                                            i = k;
+                                            break :pinned if (c == '~') .minor else .major;
+                                        },
+                                    }
+                                }
+
+                                // entire version after `~` is whitespace. invalid
+                                return .major;
+                            },
+
+                            '0'...'9' => break :pinned .patch,
+
+                            // could be invalid, could also be valid range syntax (>=, ...)
+                            // either way, pin major
+                            else => return .major,
+                        }
+                    },
+                }
+            }
+
+            // entire semver is whitespace, `v`, and `=`. Invalid
+            return .major;
+        };
+
+        // `pinned` is `.major`, `.minor`, or `.patch`. Check for each version core number:
+        // - if major is missing, return `if (pinned == .patch) .major else pinned`
+        // - if minor is missing, return `if (pinned == .patch) .minor else pinned`
+        // - if patch is missing, return `pinned`
+        // - if there's whitespace or non-digit characters between core numbers, return `.major`
+        // - if the end is reached, return `pinned`
+
+        // major
+        if (i >= version.len or !std.ascii.isDigit(version[i])) return .major;
+        var d = version[i];
+        while (std.ascii.isDigit(d)) {
+            i += 1;
+            if (i >= version.len) return if (pinned == .patch) .major else pinned;
+            d = version[i];
+        }
+
+        if (d != '.') return .major;
+
+        // minor
+        i += 1;
+        if (i >= version.len or !std.ascii.isDigit(version[i])) return .major;
+        d = version[i];
+        while (std.ascii.isDigit(d)) {
+            i += 1;
+            if (i >= version.len) return if (pinned == .patch) .minor else pinned;
+            d = version[i];
+        }
+
+        if (d != '.') return .major;
+
+        // patch
+        i += 1;
+        if (i >= version.len or !std.ascii.isDigit(version[i])) return .major;
+        d = version[i];
+        while (std.ascii.isDigit(d)) {
+            i += 1;
+
+            // patch is done and at input end, valid
+            if (i >= version.len) return pinned;
+            d = version[i];
+        }
+
+        // Skip remaining valid pre/build tag characters and whitespace.
+        // Does not validate whitespace used inside pre/build tags.
+        if (!validPreOrBuildTagCharacter(d) or std.ascii.isWhitespace(d)) return .major;
+        i += 1;
+
+        // at this point the semver is valid so we can return true if it ends
+        if (i >= version.len) return pinned;
+        d = version[i];
+        while (validPreOrBuildTagCharacter(d) and !std.ascii.isWhitespace(d)) {
+            i += 1;
+            if (i >= version.len) return pinned;
+            d = version[i];
+        }
+
+        // We've come across a character that is not valid for tags or is whitespace.
+        // Trailing whitespace was trimmed so we can assume there's another range
+        return .major;
+    }
+
+    fn validPreOrBuildTagCharacter(c: u8) bool {
+        return switch (c) {
+            '-', '+', '.', 'A'...'Z', 'a'...'z', '0'...'9' => true,
+            else => false,
+        };
+    }
+
+    pub fn isTaggedVersionOnly(input: []const u8) bool {
+        const version = strings.trim(input, &strings.whitespace_chars);
+
+        // first needs to be a-z
+        if (version.len == 0 or !std.ascii.isAlphabetic(version[0])) return false;
+
+        for (1..version.len) |i| {
+            if (!std.ascii.isAlphanumeric(version[i])) return false;
+        }
+
+        return true;
+    }
 
     pub fn orderWithoutTag(
         lhs: Version,
@@ -576,11 +1197,11 @@ pub const Version = extern struct {
         if (lhs.patch < rhs.patch) return .lt;
         if (lhs.patch > rhs.patch) return .gt;
 
-        if (lhs.tag.hasPre() != rhs.tag.hasPre())
-            return if (lhs.tag.hasPre()) .lt else .gt;
-
-        if (lhs.tag.hasBuild() != rhs.tag.hasBuild())
-            return if (lhs.tag.hasBuild()) .gt else .lt;
+        if (lhs.tag.hasPre()) {
+            if (!rhs.tag.hasPre()) return .lt;
+        } else {
+            if (rhs.tag.hasPre()) return .gt;
+        }
 
         return .eq;
     }
@@ -597,15 +1218,101 @@ pub const Version = extern struct {
         return lhs.tag.order(rhs.tag, lhs_buf, rhs_buf);
     }
 
+    pub fn orderWithoutBuild(
+        lhs: Version,
+        rhs: Version,
+        lhs_buf: []const u8,
+        rhs_buf: []const u8,
+    ) std.math.Order {
+        const order_without_tag = orderWithoutTag(lhs, rhs);
+        if (order_without_tag != .eq) return order_without_tag;
+
+        return lhs.tag.orderWithoutBuild(rhs.tag, lhs_buf, rhs_buf);
+    }
+
     pub const Tag = extern struct {
         pre: ExternalString = ExternalString{},
         build: ExternalString = ExternalString{},
 
-        pub fn order(lhs: Tag, rhs: Tag, lhs_buf: []const u8, rhs_buf: []const u8) std.math.Order {
+        pub fn orderPre(lhs: Tag, rhs: Tag, lhs_buf: []const u8, rhs_buf: []const u8) std.math.Order {
+            const lhs_str = lhs.pre.slice(lhs_buf);
+            const rhs_str = rhs.pre.slice(rhs_buf);
+
+            // 1. split each by '.', iterating through each one looking for integers
+            // 2. compare as integers, or if not possible compare as string
+            // 3. whichever is greater is the greater one
+            //
+            // 1.0.0-canary.0.0.0.0.0.0 < 1.0.0-canary.0.0.0.0.0.1
+
+            var lhs_itr = strings.split(lhs_str, ".");
+            var rhs_itr = strings.split(rhs_str, ".");
+
+            while (true) {
+                const lhs_part = lhs_itr.next();
+                const rhs_part = rhs_itr.next();
+
+                if (lhs_part == null and rhs_part == null) return .eq;
+
+                // if right is null, left is greater than.
+                if (rhs_part == null) return .gt;
+
+                // if left is null, left is less than.
+                if (lhs_part == null) return .lt;
+
+                const lhs_uint: ?u32 = std.fmt.parseUnsigned(u32, lhs_part.?, 10) catch null;
+                const rhs_uint: ?u32 = std.fmt.parseUnsigned(u32, rhs_part.?, 10) catch null;
+
+                // a part that doesn't parse as an integer is greater than a part that does
+                // https://github.com/npm/node-semver/blob/816c7b2cbfcb1986958a290f941eddfd0441139e/internal/identifiers.js#L12
+                if (lhs_uint != null and rhs_uint == null) return .lt;
+                if (lhs_uint == null and rhs_uint != null) return .gt;
+
+                if (lhs_uint == null and rhs_uint == null) {
+                    switch (strings.order(lhs_part.?, rhs_part.?)) {
+                        .eq => {
+                            // continue to the next part
+                            continue;
+                        },
+                        else => |not_equal| return not_equal,
+                    }
+                }
+
+                switch (std.math.order(lhs_uint.?, rhs_uint.?)) {
+                    .eq => continue,
+                    else => |not_equal| return not_equal,
+                }
+            }
+
+            unreachable;
+        }
+
+        pub fn order(
+            lhs: Tag,
+            rhs: Tag,
+            lhs_buf: []const u8,
+            rhs_buf: []const u8,
+        ) std.math.Order {
+            if (!lhs.pre.isEmpty() and !rhs.pre.isEmpty()) {
+                return lhs.orderPre(rhs, lhs_buf, rhs_buf);
+            }
+
             const pre_order = lhs.pre.order(&rhs.pre, lhs_buf, rhs_buf);
             if (pre_order != .eq) return pre_order;
 
             return lhs.build.order(&rhs.build, lhs_buf, rhs_buf);
+        }
+
+        pub fn orderWithoutBuild(
+            lhs: Tag,
+            rhs: Tag,
+            lhs_buf: []const u8,
+            rhs_buf: []const u8,
+        ) std.math.Order {
+            if (!lhs.pre.isEmpty() and !rhs.pre.isEmpty()) {
+                return lhs.orderPre(rhs, lhs_buf, rhs_buf);
+            }
+
+            return lhs.pre.order(&rhs.pre, lhs_buf, rhs_buf);
         }
 
         pub fn cloneInto(this: Tag, slice: []const u8, buf: *[]u8) Tag {
@@ -616,27 +1323,27 @@ pub const Version = extern struct {
                 pre = this.pre.value;
             } else {
                 const pre_slice = this.pre.slice(slice);
-                std.mem.copy(u8, buf.*, pre_slice);
+                bun.copy(u8, buf.*, pre_slice);
                 pre = String.init(buf.*, buf.*[0..pre_slice.len]);
                 buf.* = buf.*[pre_slice.len..];
             }
 
             if (this.build.isInline()) {
-                build = this.pre.build;
+                build = this.build.value;
             } else {
                 const build_slice = this.build.slice(slice);
-                std.mem.copy(u8, buf.*, build_slice);
+                bun.copy(u8, buf.*, build_slice);
                 build = String.init(buf.*, buf.*[0..build_slice.len]);
                 buf.* = buf.*[build_slice.len..];
             }
 
-            return Tag{
+            return .{
                 .pre = .{
                     .value = pre,
                     .hash = this.pre.hash,
                 },
                 .build = .{
-                    .value = this.build,
+                    .value = build,
                     .hash = this.build.hash,
                 },
             };
@@ -651,7 +1358,7 @@ pub const Version = extern struct {
         }
 
         pub fn eql(lhs: Tag, rhs: Tag) bool {
-            return lhs.build.hash == rhs.build.hash and lhs.pre.hash == rhs.pre.hash;
+            return lhs.pre.hash == rhs.pre.hash;
         }
 
         pub const TagResult = struct {
@@ -661,10 +1368,15 @@ pub const Version = extern struct {
 
         var multi_tag_warn = false;
         // TODO: support multiple tags
-        pub fn parse(_: std.mem.Allocator, sliced_string: SlicedString) TagResult {
+
+        pub fn parse(sliced_string: SlicedString) TagResult {
+            return parseWithPreCount(sliced_string, 0);
+        }
+
+        pub fn parseWithPreCount(sliced_string: SlicedString, initial_pre_count: u32) TagResult {
             var input = sliced_string.slice;
             var build_count: u32 = 0;
-            var pre_count: u32 = 0;
+            var pre_count: u32 = initial_pre_count;
 
             for (input) |c| {
                 switch (c) {
@@ -696,34 +1408,10 @@ pub const Version = extern struct {
             while (i < input.len) : (i += 1) {
                 const c = input[i];
                 switch (c) {
-                    ' ' => {
-                        switch (state) {
-                            .none => {},
-                            .pre => {
-                                result.tag.pre = sliced_string.sub(input[start..i]).external();
-                                if (comptime Environment.isDebug) {
-                                    std.debug.assert(!strings.containsChar(result.tag.pre.slice(sliced_string.buf), '-'));
-                                }
-                                state = State.none;
-                            },
-                            .build => {
-                                result.tag.build = sliced_string.sub(input[start..i]).external();
-                                if (comptime Environment.isDebug) {
-                                    std.debug.assert(!strings.containsChar(result.tag.build.slice(sliced_string.buf), '-'));
-                                }
-                                state = State.none;
-                            },
-                        }
-                        result.len = @truncate(u32, i);
-                        break;
-                    },
                     '+' => {
                         // qualifier  ::= ( '-' pre )? ( '+' build )?
-                        if (state == .pre) {
+                        if (state == .pre or state == .none and initial_pre_count > 0) {
                             result.tag.pre = sliced_string.sub(input[start..i]).external();
-                            if (comptime Environment.isDebug) {
-                                std.debug.assert(!strings.containsChar(result.tag.pre.slice(sliced_string.buf), '-'));
-                            }
                         }
 
                         if (state != .build) {
@@ -737,8 +1425,36 @@ pub const Version = extern struct {
                             start = i + 1;
                         }
                     },
-                    else => {},
+
+                    // only continue if character is a valid pre/build tag character
+                    // https://semver.org/#spec-item-9
+                    'a'...'z', 'A'...'Z', '0'...'9', '.' => {},
+
+                    else => {
+                        switch (state) {
+                            .none => {},
+                            .pre => {
+                                result.tag.pre = sliced_string.sub(input[start..i]).external();
+
+                                state = State.none;
+                            },
+                            .build => {
+                                result.tag.build = sliced_string.sub(input[start..i]).external();
+                                if (comptime Environment.isDebug) {
+                                    assert(!strings.containsChar(result.tag.build.slice(sliced_string.buf), '-'));
+                                }
+                                state = State.none;
+                            },
+                        }
+                        result.len = @truncate(i);
+                        break;
+                    },
                 }
+            }
+
+            if (state == .none and initial_pre_count > 0) {
+                state = .pre;
+                start = 0;
             }
 
             switch (state) {
@@ -746,34 +1462,30 @@ pub const Version = extern struct {
                 .pre => {
                     result.tag.pre = sliced_string.sub(input[start..i]).external();
                     // a pre can contain multiple consecutive tags
-                    if (comptime Environment.isDebug) {
-                        std.debug.assert(!strings.startsWithChar(result.tag.pre.slice(sliced_string.buf), '-'));
-                    }
+                    // checking for "-" prefix is not enough, as --canary.67e7966.0 is a valid tag
                     state = State.none;
                 },
                 .build => {
                     // a build can contain multiple consecutive tags
                     result.tag.build = sliced_string.sub(input[start..i]).external();
-                    if (comptime Environment.isDebug) {
-                        std.debug.assert(!strings.startsWithChar(result.tag.build.slice(sliced_string.buf), '+'));
-                    }
+
                     state = State.none;
                 },
             }
-            result.len = @truncate(u32, i);
+            result.len = @as(u32, @truncate(i));
 
             return result;
         }
     };
 
     pub const ParseResult = struct {
-        wildcard: Query.Token.Wildcard = Query.Token.Wildcard.none,
+        wildcard: Query.Token.Wildcard = .none,
         valid: bool = true,
-        version: Version = Version{},
-        stopped_at: u32 = 0,
+        version: Version.Partial = .{},
+        len: u32 = 0,
     };
 
-    pub fn parse(sliced_string: SlicedString, allocator: std.mem.Allocator) ParseResult {
+    pub fn parse(sliced_string: SlicedString) ParseResult {
         var input = sliced_string.slice;
         var result = ParseResult{};
 
@@ -786,9 +1498,34 @@ pub const Version = extern struct {
             return result;
         }
         var is_done = false;
-        var stopped_at: i32 = 0;
 
         var i: usize = 0;
+
+        for (0..input.len) |c| {
+            switch (input[c]) {
+                // newlines & whitespace
+                ' ',
+                '\t',
+                '\n',
+                '\r',
+                std.ascii.control_code.vt,
+                std.ascii.control_code.ff,
+
+                // version separators
+                'v',
+                '=',
+                => {},
+                else => {
+                    i = c;
+                    break;
+                },
+            }
+        }
+
+        if (i == input.len) {
+            result.valid = false;
+            return result;
+        }
 
         // two passes :(
         while (i < input.len) {
@@ -796,7 +1533,6 @@ pub const Version = extern struct {
                 break;
             }
 
-            stopped_at = @intCast(i32, i);
             switch (input[i]) {
                 ' ' => {
                     is_done = true;
@@ -804,7 +1540,9 @@ pub const Version = extern struct {
                 },
                 '|', '^', '#', '&', '%', '!' => {
                     is_done = true;
-                    stopped_at -= 1;
+                    if (i > 0) {
+                        i -= 1;
+                    }
                     break;
                 },
                 '0'...'9' => {
@@ -837,7 +1575,8 @@ pub const Version = extern struct {
                     }
 
                     if (i < input.len and switch (input[i]) {
-                        '.' => true,
+                        // `.` is expected only if there are remaining core version numbers
+                        '.' => part_i != 3,
                         else => false,
                     }) {
                         i += 1;
@@ -850,22 +1589,20 @@ pub const Version = extern struct {
                 },
                 '-', '+' => {
                     // Just a plain tag with no version is invalid.
-
-                    if (part_i < 2) {
+                    if (part_i < 2 and result.wildcard == .none) {
                         result.valid = false;
                         is_done = true;
                         break;
                     }
 
                     part_start_i = i;
-                    i += 1;
                     while (i < input.len and switch (input[i]) {
                         ' ' => true,
                         else => false,
                     }) {
                         i += 1;
                     }
-                    const tag_result = Tag.parse(allocator, sliced_string.sub(input[part_start_i..]));
+                    const tag_result = Tag.parse(sliced_string.sub(input[part_start_i..]));
                     result.version.tag = tag_result.tag;
                     i += tag_result.len;
                     break;
@@ -908,7 +1645,23 @@ pub const Version = extern struct {
                         }
                     }
                 },
-                else => {
+                else => |c| {
+
+                    // Some weirdo npm packages in the wild have a version like "1.0.0rc.1"
+                    // npm just expects that to work...even though it has no "-" qualifier.
+                    if (result.wildcard == .none and part_i >= 2 and switch (c) {
+                        'a'...'z', 'A'...'Z' => true,
+                        else => false,
+                    }) {
+                        part_start_i = i;
+                        const tag_result = Tag.parseWithPreCount(sliced_string.sub(input[part_start_i..]), 1);
+                        result.version.tag = tag_result.tag;
+                        i += tag_result.len;
+                        is_done = true;
+                        last_char_i = i;
+                        break;
+                    }
+
                     last_char_i = 0;
                     result.valid = false;
                     is_done = true;
@@ -932,28 +1685,24 @@ pub const Version = extern struct {
             }
         }
 
-        result.stopped_at = @intCast(u32, i);
-
-        if (comptime RawType != void) {
-            result.version.raw = sliced_string.sub(input[0..i]).external();
-        }
+        result.len = @as(u32, @intCast(i));
 
         return result;
     }
 
-    fn parseVersionNumber(input: string) u32 {
+    fn parseVersionNumber(input: string) ?u32 {
         // max decimal u32 is 4294967295
         var bytes: [10]u8 = undefined;
         var byte_i: u8 = 0;
 
-        std.debug.assert(input[0] != '.');
+        assert(input[0] != '.');
 
         for (input) |char| {
             switch (char) {
-                'X', 'x', '*' => return 0,
+                'X', 'x', '*' => return null,
                 '0'...'9' => {
                     // out of bounds
-                    if (byte_i + 1 > bytes.len) return 0;
+                    if (byte_i + 1 > bytes.len) return null;
                     bytes[byte_i] = char;
                     byte_i += 1;
                 },
@@ -963,8 +1712,8 @@ pub const Version = extern struct {
             }
         }
 
-        // If there are no numbers, it's 0.
-        if (byte_i == 0) return 0;
+        // If there are no numbers
+        if (byte_i == 0) return null;
 
         if (comptime Environment.isDebug) {
             return std.fmt.parseInt(u32, bytes[0..byte_i], 10) catch |err| {
@@ -991,8 +1740,20 @@ pub const Range = struct {
         gte = 6,
     };
 
-    left: Comparator = Comparator{},
-    right: Comparator = Comparator{},
+    left: Comparator = .{},
+    right: Comparator = .{},
+
+    pub fn format(this: Range, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+        if (this.left.op == .unset and this.right.op == .unset) {
+            return;
+        }
+
+        if (this.right.op == .unset) {
+            try std.fmt.format(writer, "{}", .{this.left});
+        } else {
+            try std.fmt.format(writer, "{} {}", .{ this.left, this.right });
+        }
+    }
 
     /// *
     /// >= 0.0.0
@@ -1001,14 +1762,14 @@ pub const Range = struct {
     /// >= x
     /// >= 0
     pub fn anyRangeSatisfies(this: *const Range) bool {
-        return this.left.op == .gte and this.left.version.eql(Version{});
+        return this.left.op == .gte and this.left.version.eql(.{});
     }
 
     pub fn initWildcard(version: Version, wildcard: Query.Token.Wildcard) Range {
         switch (wildcard) {
             .none => {
-                return Range{
-                    .left = Comparator{
+                return .{
+                    .left = .{
                         .op = Op.eql,
                         .version = version,
                     },
@@ -1016,55 +1777,52 @@ pub const Range = struct {
             },
 
             .major => {
-                return Range{
-                    .left = Comparator{
+                return .{
+                    .left = .{
                         .op = Op.gte,
-                        .version = Version{
+                        .version = .{
                             // .raw = version.raw
                         },
                     },
                 };
             },
             .minor => {
-                var lhs = Version{
+                const lhs = Version{
+                    .major = version.major +| 1,
                     // .raw = version.raw
                 };
-                lhs.major = version.major + 1;
-
-                var rhs = Version{
+                const rhs = Version{
+                    .major = version.major,
                     // .raw = version.raw
                 };
-                rhs.major = version.major;
-
-                return Range{
-                    .left = Comparator{
+                return .{
+                    .left = .{
                         .op = Op.lt,
                         .version = lhs,
                     },
-                    .right = Comparator{
+                    .right = .{
                         .op = Op.gte,
                         .version = rhs,
                     },
                 };
             },
             .patch => {
-                var lhs = Version{};
-                lhs.major = version.major;
-                lhs.minor = version.minor + 1;
-
-                var rhs = Version{};
-                rhs.major = version.major;
-                rhs.minor = version.minor;
-
-                // rhs.raw = version.raw;
-                // lhs.raw = version.raw;
-
+                const lhs = Version{
+                    .major = version.major,
+                    .minor = version.minor +| 1,
+                    // .raw = version.raw;
+                };
+                const rhs = Version{
+                    .major = version.major,
+                    .minor = version.minor,
+                    // .raw = version.raw;
+                };
                 return Range{
-                    .left = Comparator{
+                    .left = .{
                         .op = Op.lt,
                         .version = lhs,
                     },
-                    .right = Comparator{
+                    .right = .{
                         .op = Op.gte,
                         .version = rhs,
                     },
@@ -1087,27 +1845,79 @@ pub const Range = struct {
         return lhs.left.eql(rhs.left) and lhs.right.eql(rhs.right);
     }
 
+    pub const Formatter = struct {
+        buffer: []const u8,
+        range: *const Range,
+
+        pub fn format(this: @This(), comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+            if (this.range.left.op == Op.unset and this.range.right.op == Op.unset) {
+                return;
+            }
+
+            if (this.range.right.op == .unset) {
+                try std.fmt.format(writer, "{}", .{this.range.left.fmt(this.buffer)});
+            } else {
+                try std.fmt.format(writer, "{} {}", .{ this.range.left.fmt(this.buffer), this.range.right.fmt(this.buffer) });
+            }
+        }
+    };
+
+    pub fn fmt(this: *const Range, buf: []const u8) @This().Formatter {
+        return .{ .buffer = buf, .range = this };
+    }
+
     pub const Comparator = struct {
-        op: Op = Op.unset,
-        version: Version = Version{},
+        op: Op = .unset,
+        version: Version = .{},
 
         pub inline fn eql(lhs: Comparator, rhs: Comparator) bool {
             return lhs.op == rhs.op and lhs.version.eql(rhs.version);
         }
 
-        pub fn satisfies(this: Comparator, version: Version) bool {
-            const order = version.orderWithoutTag(this.version);
+        pub const Formatter = struct {
+            buffer: []const u8,
+            comparator: *const Comparator,
+
+            pub fn format(this: @This(), comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+                if (this.comparator.op == Op.unset) {
+                    return;
+                }
+
+                switch (this.comparator.op) {
+                    .unset => unreachable, // see above,
+                    .eql => try writer.writeAll("=="),
+                    .lt => try writer.writeAll("<"),
+                    .lte => try writer.writeAll("<="),
+                    .gt => try writer.writeAll(">"),
+                    .gte => try writer.writeAll(">="),
+                }
+
+                try std.fmt.format(writer, "{}", .{this.comparator.version.fmt(this.buffer)});
+            }
+        };
+
+        pub fn fmt(this: *const Comparator, buf: []const u8) @This().Formatter {
+            return .{ .buffer = buf, .comparator = this };
+        }
+
+        pub fn satisfies(
+            comparator: Comparator,
+            version: Version,
+            comparator_buf: string,
+            version_buf: string,
+        ) bool {
+            const order = version.orderWithoutBuild(comparator.version, version_buf, comparator_buf);
 
             return switch (order) {
-                .eq => switch (this.op) {
+                .eq => switch (comparator.op) {
                     .lte, .gte, .eql => true,
                     else => false,
                 },
-                .gt => switch (this.op) {
+                .gt => switch (comparator.op) {
                     .gt, .gte => true,
                     else => false,
                 },
-                .lt => switch (this.op) {
+                .lt => switch (comparator.op) {
                     .lt, .lte => true,
                     else => false,
                 },
@@ -1115,16 +1925,54 @@ pub const Range = struct {
         }
     };
 
-    pub fn satisfies(this: Range, version: Version) bool {
-        if (!this.hasLeft()) {
+    pub fn satisfies(range: Range, version: Version, range_buf: string, version_buf: string) bool {
+        const has_left = range.hasLeft();
+        const has_right = range.hasRight();
+
+        if (!has_left) {
             return true;
         }
 
-        if (!this.left.satisfies(version)) {
+        if (!range.left.satisfies(version, range_buf, version_buf)) {
             return false;
         }
 
-        if (this.hasRight() and !this.right.satisfies(version)) {
+        if (has_right and !range.right.satisfies(version, range_buf, version_buf)) {
+            return false;
+        }
+
+        return true;
+    }
+
+    pub fn satisfiesPre(range: Range, version: Version, range_buf: string, version_buf: string, pre_matched: *bool) bool {
+        if (comptime Environment.allow_assert) {
+            assert(version.tag.hasPre());
+        }
+        const has_left = range.hasLeft();
+        const has_right = range.hasRight();
+
+        if (!has_left) {
+            return true;
+        }
+
+        // If left has prerelease check if major,minor,patch matches with left. If
+        // not, check the same with right if right exists and has prerelease.
+        pre_matched.* = pre_matched.* or
+            (range.left.version.tag.hasPre() and
+            version.patch == range.left.version.patch and
+            version.minor == range.left.version.minor and
+            version.major == range.left.version.major) or
+            (has_right and
+            range.right.version.tag.hasPre() and
+            version.patch == range.right.version.patch and
+            version.minor == range.right.version.minor and
+            version.major == range.right.version.major);
+
+        if (!range.left.satisfies(version, range_buf, version_buf)) {
+            return false;
+        }
+
+        if (has_right and !range.right.satisfies(version, range_buf, version_buf)) {
             return false;
         }
 
@@ -1148,6 +1996,27 @@ pub const Query = struct {
     // AND
     next: ?*Query = null,
 
+    const Formatter = struct {
+        query: *const Query,
+        buffer: []const u8,
+        pub fn format(formatter: Formatter, comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+            const this = formatter.query;
+
+            if (this.next) |ptr| {
+                if (ptr.range.hasLeft() or ptr.range.hasRight()) {
+                    try std.fmt.format(writer, "{} && {}", .{ this.range.fmt(formatter.buffer), ptr.range.fmt(formatter.buffer) });
+                    return;
+                }
+            }
+
+            try std.fmt.format(writer, "{}", .{this.range.fmt(formatter.buffer)});
+        }
+    };
+
+    pub fn fmt(this: *const Query, buf: []const u8) @This().Formatter {
+        return .{ .query = this, .buffer = buf };
+    }
+
     /// Linked-list of Queries OR'd together
     /// "^1 || ^2"
     /// ----|-----
@@ -1159,20 +2028,69 @@ pub const Query = struct {
         // OR
         next: ?*List = null,
 
-        pub inline fn satisfies(this: *const List, version: Version) bool {
-            return this.head.satisfies(version) or (this.next orelse return false).satisfies(version);
+        const Formatter = struct {
+            list: *const List,
+            buffer: []const u8,
+            pub fn format(formatter: @This(), comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+                const this = formatter.list;
+
+                if (this.next) |ptr| {
+                    try std.fmt.format(writer, "{} || {}", .{ this.head.fmt(formatter.buffer), ptr.fmt(formatter.buffer) });
+                } else {
+                    try std.fmt.format(writer, "{}", .{this.head.fmt(formatter.buffer)});
+                }
+            }
+        };
+
+        pub fn fmt(this: *const List, buf: []const u8) @This().Formatter {
+            return .{ .list = this, .buffer = buf };
         }
 
-        pub inline fn eql(lhs: *const List, rhs: *const List) bool {
+        pub fn satisfies(list: *const List, version: Version, list_buf: string, version_buf: string) bool {
+            return list.head.satisfies(
+                version,
+                list_buf,
+                version_buf,
+            ) or (list.next orelse return false).satisfies(
+                version,
+                list_buf,
+                version_buf,
+            );
+        }
+
+        pub fn satisfiesPre(list: *const List, version: Version, list_buf: string, version_buf: string) bool {
+            if (comptime Environment.allow_assert) {
+                assert(version.tag.hasPre());
+            }
+
+            // `version` has a prerelease tag:
+            // - needs to satisfy each comparator in the query (<comparator> AND <comparator> AND ...) like normal comparison
+            // - if it does, also needs to match major, minor, patch with at least one of the other versions
+            //   with a prerelease
+            // https://github.com/npm/node-semver/blob/ac9b35769ab0ddfefd5a3af4a3ecaf3da2012352/classes/range.js#L505
+            var pre_matched = false;
+            return (list.head.satisfiesPre(
+                version,
+                list_buf,
+                version_buf,
+                &pre_matched,
+            ) and pre_matched) or (list.next orelse return false).satisfiesPre(
+                version,
+                list_buf,
+                version_buf,
+            );
+        }
+
+        pub fn eql(lhs: *const List, rhs: *const List) bool {
             if (!lhs.head.eql(&rhs.head)) return false;
 
-            var lhs_next = lhs.next orelse return rhs.next == null;
-            var rhs_next = rhs.next orelse return false;
+            const lhs_next = lhs.next orelse return rhs.next == null;
+            const rhs_next = rhs.next orelse return false;
 
             return lhs_next.eql(rhs_next);
         }
 
-        pub fn andRange(self: *List, allocator: std.mem.Allocator, range: Range) !void {
+        pub fn andRange(self: *List, allocator: Allocator, range: Range) !void {
             if (!self.head.range.hasLeft() and !self.head.range.hasRight()) {
                 self.head.range = range;
                 return;
@@ -1193,7 +2111,7 @@ pub const Query = struct {
     pub const Group = struct {
         head: List = List{},
         tail: ?*List = null,
-        allocator: std.mem.Allocator,
+        allocator: Allocator,
         input: string = "",
 
         flags: FlagsBitSet = FlagsBitSet.initEmpty(),
@@ -1202,14 +2120,116 @@ pub const Query = struct {
             pub const build = 0;
         };
 
-        pub const FlagsBitSet = std.bit_set.IntegerBitSet(3);
+        const Formatter = struct {
+            group: *const Group,
+            buf: string,
+
+            pub fn format(formatter: @This(), comptime _: []const u8, _: std.fmt.FormatOptions, writer: anytype) !void {
+                const this = formatter.group;
+
+                if (this.tail == null and this.head.tail == null and !this.head.head.range.hasLeft()) {
+                    return;
+                }
+
+                if (this.tail == null and this.head.tail == null) {
+                    try std.fmt.format(writer, "{}", .{this.head.fmt(formatter.buf)});
+                    return;
+                }
+
+                var list = &this.head;
+                while (list.next) |next| {
+                    try std.fmt.format(writer, "{} && ", .{list.fmt(formatter.buf)});
+                    list = next;
+                }
+
+                try std.fmt.format(writer, "{}", .{list.fmt(formatter.buf)});
+            }
+        };
+
+        pub fn fmt(this: *const Group, buf: string) @This().Formatter {
+            return .{
+                .group = this,
+                .buf = buf,
+            };
+        }
+
+        pub fn jsonStringify(this: *const Group, writer: anytype) !void {
+            const temp = try std.fmt.allocPrint(bun.default_allocator, "{}", .{this.fmt()});
+            defer bun.default_allocator.free(temp);
+            try std.json.encodeJsonString(temp, .{}, writer);
+        }
+
+        pub fn deinit(this: *const Group) void {
+            var list = this.head;
+            var allocator = this.allocator;
+
+            while (list.next) |next| {
+                var query = list.head;
+                while (query.next) |next_query| {
+                    query = next_query.*;
+                    allocator.destroy(next_query);
+                }
+                list = next.*;
+                allocator.destroy(next);
+            }
+        }
+
+        pub fn getExactVersion(this: *const Group) ?Version {
+            const range = this.head.head.range;
+            if (this.head.next == null and
+                this.head.head.next == null and
+                range.hasLeft() and
+                range.left.op == .eql and
+                !range.hasRight())
+            {
+                if (comptime Environment.allow_assert) {
+                    assert(this.tail == null);
+                }
+                return range.left.version;
+            }
+
+            return null;
+        }
+
+        pub fn from(version: Version) Group {
+            return .{
+                .allocator = bun.default_allocator,
+                .head = .{
+                    .head = .{
+                        .range = .{
+                            .left = .{
+                                .op = .eql,
+                                .version = version,
+                            },
+                        },
+                    },
+                },
+            };
+        }
+
+        pub const FlagsBitSet = bun.bit_set.IntegerBitSet(3);
 
         pub fn isExact(this: *const Group) bool {
             return this.head.next == null and this.head.head.next == null and !this.head.head.range.hasRight() and this.head.head.range.left.op == .eql;
         }
 
+        pub fn @"is *"(this: *const Group) bool {
+            const left = this.head.head.range.left;
+            return this.head.head.range.right.op == .unset and
+                left.op == .gte and
+                this.head.next == null and
+                this.head.head.next == null and
+                left.version.isZero() and
+                !this.flags.isSet(Flags.build);
+        }
+
         pub inline fn eql(lhs: Group, rhs: Group) bool {
             return lhs.head.eql(&rhs.head);
+        }
+
+        pub fn toVersion(this: Group) Version {
+            assert(this.isExact() or this.head.head.range.left.op == .unset);
+            return this.head.head.range.left.version;
         }
 
         pub fn orVersion(self: *Group, version: Version) !void {
@@ -1249,8 +2269,16 @@ pub const Query = struct {
             self.tail = new_tail;
         }
 
-        pub inline fn satisfies(this: *const Group, version: Version) bool {
-            return this.head.satisfies(version);
+        pub inline fn satisfies(
+            group: *const Group,
+            version: Version,
+            group_buf: string,
+            version_buf: string,
+        ) bool {
+            return if (version.tag.hasPre())
+                group.head.satisfiesPre(version, group_buf, version_buf)
+            else
+                group.head.satisfies(version, group_buf, version_buf);
         }
     };
 
@@ -1263,84 +2291,121 @@ pub const Query = struct {
         return lhs_next.eql(rhs_next);
     }
 
-    pub inline fn satisfies(this: *const Query, version: Version) bool {
-        const left = this.range.satisfies(version);
-
-        return left and (this.next orelse return true).satisfies(version);
+    pub fn satisfies(query: *const Query, version: Version, query_buf: string, version_buf: string) bool {
+        return query.range.satisfies(
+            version,
+            query_buf,
+            version_buf,
+        ) and (query.next orelse return true).satisfies(
+            version,
+            query_buf,
+            version_buf,
+        );
     }
 
-    pub const Token = struct {
+    pub fn satisfiesPre(query: *const Query, version: Version, query_buf: string, version_buf: string, pre_matched: *bool) bool {
+        if (comptime Environment.allow_assert) {
+            assert(version.tag.hasPre());
+        }
+        return query.range.satisfiesPre(
+            version,
+            query_buf,
+            version_buf,
+            pre_matched,
+        ) and (query.next orelse return true).satisfiesPre(
+            version,
+            query_buf,
+            version_buf,
+            pre_matched,
+        );
+    }
+
+    const Token = struct {
         tag: Tag = Tag.none,
         wildcard: Wildcard = Wildcard.none,
 
-        pub fn toRange(this: Token, version: Version) Range {
+        pub fn toRange(this: Token, version: Version.Partial) Range {
             switch (this.tag) {
                 // Allows changes that do not modify the left-most non-zero element in the [major, minor, patch] tuple
                 .caret => {
-                    var right_version = version;
-                    // https://github.com/npm/node-semver/blob/cb1ca1d5480a6c07c12ac31ba5f2071ed530c4ed/classes/range.js#L310-L336
-                    if (right_version.major == 0) {
-                        if (right_version.minor == 0) {
-                            right_version.patch += 1;
-                        } else {
-                            right_version.minor += 1;
-                            right_version.patch = 0;
-                        }
-                    } else {
-                        right_version.major += 1;
-                        right_version.patch = 0;
-                        right_version.minor = 0;
-                    }
-
-                    return Range{
-                        .left = .{
+                    // https://github.com/npm/node-semver/blob/3a8a4309ae986c1967b3073ba88c9e69433d44cb/classes/range.js#L302-L353
+                    var range = Range{};
+                    if (version.major) |major| done: {
+                        range.left = .{
                             .op = .gte,
-                            .version = version,
-                        },
-                        .right = .{
+                            .version = .{
+                                .major = major,
+                            },
+                        };
+                        range.right = .{
                             .op = .lt,
-                            .version = right_version,
-                        },
-                    };
+                        };
+                        if (version.minor) |minor| {
+                            range.left.version.minor = minor;
+                            if (version.patch) |patch| {
+                                range.left.version.patch = patch;
+                                range.left.version.tag = version.tag;
+                                if (major == 0) {
+                                    if (minor == 0) {
+                                        range.right.version.patch = patch +| 1;
+                                    } else {
+                                        range.right.version.minor = minor +| 1;
+                                    }
+                                    break :done;
+                                }
+                            } else if (major == 0) {
+                                range.right.version.minor = minor +| 1;
+                                break :done;
+                            }
+                        }
+                        range.right.version.major = major +| 1;
+                    }
+                    return range;
                 },
                 .tilda => {
-                    if (this.wildcard == .minor or this.wildcard == .major) {
-                        return Range.initWildcard(version, .minor);
-                    }
-
-                    // This feels like it needs to be tested more.
-                    var right_version = version;
-                    right_version.minor += 1;
-                    right_version.patch = 0;
-
-                    return Range{
-                        .left = .{
+                    // https://github.com/npm/node-semver/blob/3a8a4309ae986c1967b3073ba88c9e69433d44cb/classes/range.js#L261-L287
+                    var range = Range{};
+                    if (version.major) |major| done: {
+                        range.left = .{
                             .op = .gte,
-                            .version = version,
-                        },
-                        .right = .{
+                            .version = .{
+                                .major = major,
+                            },
+                        };
+                        range.right = .{
                             .op = .lt,
-                            .version = right_version,
-                        },
-                    };
+                        };
+                        if (version.minor) |minor| {
+                            range.left.version.minor = minor;
+                            if (version.patch) |patch| {
+                                range.left.version.patch = patch;
+                                range.left.version.tag = version.tag;
+                            }
+                            range.right.version.major = major;
+                            range.right.version.minor = minor +| 1;
+                            break :done;
+                        }
+                        range.right.version.major = major +| 1;
+                    }
+                    return range;
                 },
                 .none => unreachable,
                 .version => {
                     if (this.wildcard != Wildcard.none) {
-                        return Range.initWildcard(version, this.wildcard);
+                        return Range.initWildcard(version.min(), this.wildcard);
                     }
 
-                    return Range{ .left = .{ .op = .eql, .version = version } };
+                    return .{ .left = .{ .op = .eql, .version = version.min() } };
                 },
                 else => {},
             }
 
             return switch (this.wildcard) {
-                .major => Range{
-                    .left = .{ .op = .gte, .version = version },
+                .major => .{
+                    .left = .{ .op = .gte, .version = version.min() },
                     .right = .{
                         .op = .lte,
-                        .version = Version{
+                        .version = .{
                             .major = std.math.maxInt(u32),
                             .minor = std.math.maxInt(u32),
                             .patch = std.math.maxInt(u32),
@@ -1348,43 +2413,43 @@ pub const Query = struct {
                     },
                 },
                 .minor => switch (this.tag) {
-                    .lte => Range{
+                    .lte => .{
                         .left = .{
                             .op = .lte,
-                            .version = Version{
-                                .major = version.major,
+                            .version = .{
+                                .major = version.major orelse 0,
                                 .minor = std.math.maxInt(u32),
                                 .patch = std.math.maxInt(u32),
                             },
                         },
                     },
-                    .lt => Range{
+                    .lt => .{
                         .left = .{
                             .op = .lt,
-                            .version = Version{
-                                .major = version.major,
+                            .version = .{
+                                .major = version.major orelse 0,
                                 .minor = 0,
                                 .patch = 0,
                             },
                         },
                     },
 
-                    .gt => Range{
+                    .gt => .{
                         .left = .{
                             .op = .gt,
-                            .version = Version{
-                                .major = version.major,
+                            .version = .{
+                                .major = version.major orelse 0,
                                 .minor = std.math.maxInt(u32),
                                 .patch = std.math.maxInt(u32),
                             },
                         },
                     },
 
-                    .gte => Range{
+                    .gte => .{
                         .left = .{
                             .op = .gte,
-                            .version = Version{
-                                .major = version.major,
+                            .version = .{
+                                .major = version.major orelse 0,
                                 .minor = 0,
                                 .patch = 0,
                             },
@@ -1393,51 +2458,51 @@ pub const Query = struct {
                     else => unreachable,
                 },
                 .patch => switch (this.tag) {
-                    .lte => Range{
+                    .lte => .{
                         .left = .{
                             .op = .lte,
-                            .version = Version{
-                                .major = version.major,
-                                .minor = version.minor,
+                            .version = .{
+                                .major = version.major orelse 0,
+                                .minor = version.minor orelse 0,
                                 .patch = std.math.maxInt(u32),
                             },
                         },
                     },
-                    .lt => Range{
+                    .lt => .{
                         .left = .{
                             .op = .lt,
-                            .version = Version{
-                                .major = version.major,
-                                .minor = version.minor,
+                            .version = .{
+                                .major = version.major orelse 0,
+                                .minor = version.minor orelse 0,
                                 .patch = 0,
                             },
                         },
                     },
 
-                    .gt => Range{
+                    .gt => .{
                         .left = .{
                             .op = .gt,
-                            .version = Version{
-                                .major = version.major,
-                                .minor = version.minor,
+                            .version = .{
+                                .major = version.major orelse 0,
+                                .minor = version.minor orelse 0,
                                 .patch = std.math.maxInt(u32),
                             },
                         },
                     },
 
-                    .gte => Range{
+                    .gte => .{
                         .left = .{
                             .op = .gte,
-                            .version = Version{
-                                .major = version.major,
-                                .minor = version.minor,
+                            .version = .{
+                                .major = version.major orelse 0,
+                                .minor = version.minor orelse 0,
                                 .patch = 0,
                             },
                         },
                     },
                     else => unreachable,
                 },
-                .none => Range{
+                .none => .{
                     .left = .{
                         .op = switch (this.tag) {
                             .gt => .gt,
@@ -1446,7 +2511,7 @@ pub const Query = struct {
                             .lte => .lte,
                             else => unreachable,
                         },
-                        .version = version,
+                        .version = version.min(),
                     },
                 },
             };
@@ -1472,10 +2537,10 @@ pub const Query = struct {
     };
 
     pub fn parse(
-        allocator: std.mem.Allocator,
+        allocator: Allocator,
         input: string,
         sliced: SlicedString,
-    ) !Group {
+    ) bun.OOM!Group {
         var i: usize = 0;
         var list = Group{
             .allocator = allocator,
@@ -1559,34 +2624,42 @@ pub const Query = struct {
                 else => {
                     i += 1;
                     token.tag = Token.Tag.none;
+
+                    // skip tagged versions
+                    // we are assuming this is the beginning of a tagged version like "boop"
+                    // "1.0.0 || boop"
+                    while (i < input.len and input[i] != ' ' and input[i] != '|') : (i += 1) {}
                     skip_round = true;
                 },
             }
 
             if (!skip_round) {
-                const parse_result = Version.parse(sliced.sub(input[i..]), allocator);
-                if (parse_result.version.tag.hasBuild()) list.flags.setValue(Group.Flags.build, true);
-                if (parse_result.version.tag.hasPre()) list.flags.setValue(Group.Flags.pre, true);
+                const parse_result = Version.parse(sliced.sub(input[i..]));
+                const version = parse_result.version.min();
+                if (version.tag.hasBuild()) list.flags.setValue(Group.Flags.build, true);
+                if (version.tag.hasPre()) list.flags.setValue(Group.Flags.pre, true);
 
                 token.wildcard = parse_result.wildcard;
 
-                i += parse_result.stopped_at;
+                i += parse_result.len;
                 const rollback = i;
 
-                const had_space = i < input.len and input[i] == ' ';
+                const maybe_hyphenate = i < input.len and (input[i] == ' ' or input[i] == '-');
 
                 // TODO: can we do this without rolling back?
-                const hyphenate: bool = had_space and possibly_hyphenate: {
-                    i += 1;
-                    while (i < input.len and input[i] == ' ') : (i += 1) {}
+                const hyphenate: bool = maybe_hyphenate and possibly_hyphenate: {
+                    i += strings.lengthOfLeadingWhitespaceASCII(input[i..]);
                     if (!(i < input.len and input[i] == '-')) break :possibly_hyphenate false;
                     i += 1;
-                    if (!(i < input.len and input[i] == ' ')) break :possibly_hyphenate false;
-                    i += 1;
-                    while (i < input.len and switch (input[i]) {
-                        ' ', 'v', '=' => true,
-                        else => false,
-                    }) : (i += 1) {}
+                    i += strings.lengthOfLeadingWhitespaceASCII(input[i..]);
+                    if (i == input.len) break :possibly_hyphenate false;
+                    if (input[i] == 'v' or input[i] == '=') {
+                        i += 1;
+                    }
+                    if (i == input.len) break :possibly_hyphenate false;
+                    i += strings.lengthOfLeadingWhitespaceASCII(input[i..]);
+                    if (i == input.len) break :possibly_hyphenate false;
+
                     if (!(i < input.len and switch (input[i]) {
                         '0'...'9', 'X', 'x', '*' => true,
                         else => false,
@@ -1596,45 +2669,46 @@ pub const Query = struct {
                 };
 
                 if (!hyphenate) i = rollback;
-                i += @as(usize, @boolToInt(!hyphenate));
+                i += @as(usize, @intFromBool(!hyphenate));
 
                 if (hyphenate) {
-                    var second_version = Version.parse(sliced.sub(input[i..]), allocator);
-                    if (second_version.version.tag.hasBuild()) list.flags.setValue(Group.Flags.build, true);
-                    if (second_version.version.tag.hasPre()) list.flags.setValue(Group.Flags.pre, true);
-
+                    const second_parsed = Version.parse(sliced.sub(input[i..]));
+                    var second_version = second_parsed.version.min();
+                    if (second_version.tag.hasBuild()) list.flags.setValue(Group.Flags.build, true);
+                    if (second_version.tag.hasPre()) list.flags.setValue(Group.Flags.pre, true);
                     const range: Range = brk: {
-                        switch (second_version.wildcard) {
+                        switch (second_parsed.wildcard) {
                             .major => {
-                                second_version.version.major += 1;
+                                // "1.0.0 - x" --> ">=1.0.0"
                                 break :brk Range{
-                                    .left = .{ .op = .gte, .version = parse_result.version },
-                                    .right = .{ .op = .lte, .version = second_version.version },
+                                    .left = .{ .op = .gte, .version = version },
                                 };
                             },
                             .minor => {
-                                second_version.version.major += 1;
-                                second_version.version.minor = 0;
-                                second_version.version.patch = 0;
+                                // "1.0.0 - 1.x" --> ">=1.0.0 < 2.0.0"
+                                second_version.major +|= 1;
+                                second_version.minor = 0;
+                                second_version.patch = 0;
 
                                 break :brk Range{
-                                    .left = .{ .op = .gte, .version = parse_result.version },
-                                    .right = .{ .op = .lt, .version = second_version.version },
+                                    .left = .{ .op = .gte, .version = version },
+                                    .right = .{ .op = .lt, .version = second_version },
                                 };
                             },
                             .patch => {
-                                second_version.version.minor += 1;
-                                second_version.version.patch = 0;
+                                // "1.0.0 - 1.0.x" --> ">=1.0.0 <1.1.0"
+                                second_version.minor +|= 1;
+                                second_version.patch = 0;
 
                                 break :brk Range{
-                                    .left = .{ .op = .gte, .version = parse_result.version },
-                                    .right = .{ .op = .lt, .version = second_version.version },
+                                    .left = .{ .op = .gte, .version = version },
+                                    .right = .{ .op = .lt, .version = second_version },
                                 };
                             },
                             .none => {
                                 break :brk Range{
-                                    .left = .{ .op = .gte, .version = parse_result.version },
-                                    .right = .{ .op = .lte, .version = second_version.version },
+                                    .left = .{ .op = .gte, .version = version },
+                                    .right = .{ .op = .lte, .version = second_version },
                                 };
                             },
                         }
@@ -1646,17 +2720,26 @@ pub const Query = struct {
                         try list.andRange(range);
                     }
 
-                    i += second_version.stopped_at + 1;
+                    i += second_parsed.len + 1;
                 } else if (count == 0 and token.tag == .version) {
                     switch (parse_result.wildcard) {
                         .none => {
-                            try list.orVersion(parse_result.version);
+                            try list.orVersion(version);
                         },
                         else => {
                             try list.orRange(token.toRange(parse_result.version));
                         },
                     }
                 } else if (count == 0) {
+                    // From a semver perspective, treat "--foo" the same as "-foo"
+                    // example: foo/bar@1.2.3@--canary.24
+                    //                         ^
+                    if (token.tag == .none) {
+                        is_or = false;
+                        token.wildcard = .none;
+                        prev_token.tag = .none;
+                        continue;
+                    }
                     try list.andRange(token.toRange(parse_result.version));
                 } else if (is_or) {
                     try list.orRange(token.toRange(parse_result.version));
@@ -1675,362 +2758,133 @@ pub const Query = struct {
     }
 };
 
-const expect = struct {
-    pub var counter: usize = 0;
-    pub fn isRangeMatch(input: string, version_str: string) bool {
-        var parsed = Version.parse(SlicedString.init(version_str, version_str), default_allocator);
-        std.debug.assert(parsed.valid);
-        // std.debug.assert(strings.eql(parsed.version.raw.slice(version_str), version_str));
+pub const SemverObject = struct {
+    pub fn create(globalThis: *JSC.JSGlobalObject) JSC.JSValue {
+        const object = JSC.JSValue.createEmptyObject(globalThis, 2);
 
-        var list = Query.parse(
-            default_allocator,
-            input,
-            SlicedString.init(input, input),
-        ) catch |err| Output.panic("Test fail due to error {s}", .{@errorName(err)});
+        object.put(
+            globalThis,
+            JSC.ZigString.static("satisfies"),
+            JSC.NewFunction(
+                globalThis,
+                JSC.ZigString.static("satisfies"),
+                2,
+                SemverObject.satisfies,
+                false,
+            ),
+        );
 
-        return list.satisfies(parsed.version);
+        object.put(
+            globalThis,
+            JSC.ZigString.static("order"),
+            JSC.NewFunction(
+                globalThis,
+                JSC.ZigString.static("order"),
+                2,
+                SemverObject.order,
+                false,
+            ),
+        );
+
+        return object;
     }
 
-    pub fn range(input: string, version_str: string, src: std.builtin.SourceLocation) void {
-        Output.initTest();
-        defer counter += 1;
-        if (!isRangeMatch(input, version_str)) {
-            Output.panic("<r><red>Fail<r> Expected range <b>\"{s}\"<r> to match <b>\"{s}\"<r>\nAt: <blue><b>{s}:{d}:{d}<r><d> in {s}<r>", .{
-                input,
-                version_str,
-                src.file,
-                src.line,
-                src.column,
-                src.fn_name,
-            });
+    pub fn order(
+        globalThis: *JSC.JSGlobalObject,
+        callFrame: *JSC.CallFrame,
+    ) bun.JSError!JSC.JSValue {
+        var arena = std.heap.ArenaAllocator.init(bun.default_allocator);
+        defer arena.deinit();
+        var stack_fallback = std.heap.stackFallback(512, arena.allocator());
+        const allocator = stack_fallback.get();
+
+        const arguments = callFrame.arguments_old(2).slice();
+        if (arguments.len < 2) {
+            return globalThis.throw("Expected two arguments", .{});
         }
-    }
-    pub fn notRange(input: string, version_str: string, src: std.builtin.SourceLocation) void {
-        Output.initTest();
-        defer counter += 1;
-        if (isRangeMatch(input, version_str)) {
-            Output.panic("<r><red>Fail<r> Expected range <b>\"{s}\"<r> NOT match <b>\"{s}\"<r>\nAt: <blue><b>{s}:{d}:{d}<r><d> in {s}<r>", .{
-                input,
-                version_str,
-                src.file,
-                src.line,
-                src.column,
-                src.fn_name,
-            });
+
+        const left_arg = arguments[0];
+        const right_arg = arguments[1];
+
+        const left_string = left_arg.toStringOrNull(globalThis) orelse return JSC.jsNumber(0);
+        const right_string = right_arg.toStringOrNull(globalThis) orelse return JSC.jsNumber(0);
+
+        const left = left_string.toSlice(globalThis, allocator);
+        defer left.deinit();
+        const right = right_string.toSlice(globalThis, allocator);
+        defer right.deinit();
+
+        if (!strings.isAllASCII(left.slice())) return JSC.jsNumber(0);
+        if (!strings.isAllASCII(right.slice())) return JSC.jsNumber(0);
+
+        const left_result = Version.parse(SlicedString.init(left.slice(), left.slice()));
+        const right_result = Version.parse(SlicedString.init(right.slice(), right.slice()));
+
+        if (!left_result.valid) {
+            return globalThis.throw("Invalid SemVer: {s}\n", .{left.slice()});
         }
-    }
 
-    pub fn done(src: std.builtin.SourceLocation) void {
-        Output.prettyErrorln("<r><green>{d} passed expectations <d>in {s}<r>", .{ counter, src.fn_name });
-        Output.flush();
-        counter = 0;
-    }
-
-    pub fn version(input: string, v: [3]u32, src: std.builtin.SourceLocation) void {
-        Output.initTest();
-        defer counter += 1;
-        var result = Version.parse(SlicedString.init(input, input), default_allocator);
-        var other = Version{ .major = v[0], .minor = v[1], .patch = v[2] };
-        std.debug.assert(result.valid);
-
-        if (!other.eql(result.version)) {
-            Output.panic("<r><red>Fail<r> Expected version <b>\"{s}\"<r> to match <b>\"{d}.{d}.{d}\" but received <red>\"{d}.{d}.{d}\"<r>\nAt: <blue><b>{s}:{d}:{d}<r><d> in {s}<r>", .{
-                input,
-                v[0],
-                v[1],
-                v[2],
-                result.version.major,
-                result.version.minor,
-                result.version.patch,
-                src.file,
-                src.line,
-                src.column,
-                src.fn_name,
-            });
+        if (!right_result.valid) {
+            return globalThis.throw("Invalid SemVer: {s}\n", .{right.slice()});
         }
+
+        const left_version = left_result.version.max();
+        const right_version = right_result.version.max();
+
+        return switch (left_version.orderWithoutBuild(right_version, left.slice(), right.slice())) {
+            .eq => JSC.jsNumber(0),
+            .gt => JSC.jsNumber(1),
+            .lt => JSC.jsNumber(-1),
+        };
     }
 
-    pub fn versionT(input: string, v: Version, src: std.builtin.SourceLocation) void {
-        Output.initTest();
-        defer counter += 1;
+    pub fn satisfies(globalThis: *JSC.JSGlobalObject, callFrame: *JSC.CallFrame) bun.JSError!JSC.JSValue {
+        var arena = std.heap.ArenaAllocator.init(bun.default_allocator);
+        defer arena.deinit();
+        var stack_fallback = std.heap.stackFallback(512, arena.allocator());
+        const allocator = stack_fallback.get();
 
-        var result = Version.parse(SlicedString.init(input, input), default_allocator);
-        if (!v.eql(result.version)) {
-            Output.panic("<r><red>Fail<r> Expected version <b>\"{s}\"<r> to match <b>\"{s}\" but received <red>\"{}\"<r>\nAt: <blue><b>{s}:{d}:{d}<r><d> in {s}<r>", .{
-                input,
-                v,
-                result.version,
-                src.file,
-                src.line,
-                src.column,
-                src.fn_name,
-            });
+        const arguments = callFrame.arguments_old(2).slice();
+        if (arguments.len < 2) {
+            return globalThis.throw("Expected two arguments", .{});
         }
+
+        const left_arg = arguments[0];
+        const right_arg = arguments[1];
+
+        const left_string = left_arg.toStringOrNull(globalThis) orelse return .zero;
+        const right_string = right_arg.toStringOrNull(globalThis) orelse return .zero;
+
+        const left = left_string.toSlice(globalThis, allocator);
+        defer left.deinit();
+        const right = right_string.toSlice(globalThis, allocator);
+        defer right.deinit();
+
+        if (!strings.isAllASCII(left.slice())) return .false;
+        if (!strings.isAllASCII(right.slice())) return .false;
+
+        const left_result = Version.parse(SlicedString.init(left.slice(), left.slice()));
+        if (left_result.wildcard != .none) {
+            return .false;
+        }
+
+        const left_version = left_result.version.min();
+
+        const right_group = try Query.parse(
+            allocator,
+            right.slice(),
+            SlicedString.init(right.slice(), right.slice()),
+        );
+        defer right_group.deinit();
+
+        const right_version = right_group.getExactVersion();
+
+        if (right_version != null) {
+            return JSC.jsBoolean(left_version.eql(right_version.?));
+        }
+
+        return JSC.jsBoolean(right_group.satisfies(left_version, right.slice(), left.slice()));
     }
 };
 
-test "Version parsing" {
-    defer expect.done(@src());
-
-    expect.version("1.0.0", .{ 1, 0, 0 }, @src());
-    expect.version("1.1.0", .{ 1, 1, 0 }, @src());
-    expect.version("1.1.1", .{ 1, 1, 1 }, @src());
-    expect.version("1.1.0", .{ 1, 1, 0 }, @src());
-    expect.version("0.1.1", .{ 0, 1, 1 }, @src());
-    expect.version("0.0.1", .{ 0, 0, 1 }, @src());
-    expect.version("0.0.0", .{ 0, 0, 0 }, @src());
-
-    expect.version("1.x", .{ 1, 0, 0 }, @src());
-    expect.version("2.2.x", .{ 2, 2, 0 }, @src());
-    expect.version("2.x.2", .{ 2, 0, 2 }, @src());
-
-    expect.version("1.X", .{ 1, 0, 0 }, @src());
-    expect.version("2.2.X", .{ 2, 2, 0 }, @src());
-    expect.version("2.X.2", .{ 2, 0, 2 }, @src());
-
-    expect.version("1.*", .{ 1, 0, 0 }, @src());
-    expect.version("2.2.*", .{ 2, 2, 0 }, @src());
-    expect.version("2.*.2", .{ 2, 0, 2 }, @src());
-    expect.version("3", .{ 3, 0, 0 }, @src());
-    expect.version("3.x", .{ 3, 0, 0 }, @src());
-    expect.version("3.x.x", .{ 3, 0, 0 }, @src());
-    expect.version("3.*.*", .{ 3, 0, 0 }, @src());
-    expect.version("3.X.x", .{ 3, 0, 0 }, @src());
-
-    expect.version("0.0.0", .{ 0, 0, 0 }, @src());
-
-    {
-        var v = Version{
-            .major = 1,
-            .minor = 0,
-            .patch = 0,
-        };
-        var input: string = "1.0.0-beta";
-        v.tag.pre = SlicedString.init(input, input["1.0.0-".len..]).external();
-        expect.versionT(input, v, @src());
-    }
-
-    {
-        var v = Version{
-            .major = 1,
-            .minor = 0,
-            .patch = 0,
-        };
-        var input: string = "1.0.0-build101";
-        v.tag.pre = SlicedString.init(input, input["1.0.0-".len..]).external();
-        expect.versionT(input, v, @src());
-    }
-
-    {
-        var v = Version{
-            .major = 0,
-            .minor = 21,
-            .patch = 0,
-        };
-        var input: string = "0.21.0-beta-96ca8d915-20211115";
-        v.tag.pre = SlicedString.init(input, input["0.21.0-".len..]).external();
-        expect.versionT(input, v, @src());
-    }
-
-    {
-        var v = Version{
-            .major = 1,
-            .minor = 0,
-            .patch = 0,
-        };
-        var input: string = "1.0.0-beta+build101";
-        v.tag.build = SlicedString.init(input, input["1.0.0-beta+".len..]).external();
-        v.tag.pre = SlicedString.init(input, input["1.0.0-".len..][0..4]).external();
-        expect.versionT(input, v, @src());
-    }
-
-    var buf: [1024]u8 = undefined;
-
-    var triplet = [3]u32{ 0, 0, 0 };
-    var x: u32 = 0;
-    var y: u32 = 0;
-    var z: u32 = 0;
-
-    while (x < 32) : (x += 1) {
-        while (y < 32) : (y += 1) {
-            while (z < 32) : (z += 1) {
-                triplet[0] = x;
-                triplet[1] = y;
-                triplet[2] = z;
-                expect.version(try std.fmt.bufPrint(&buf, "{d}.{d}.{d}", .{ x, y, z }), triplet, @src());
-                triplet[0] = z;
-                triplet[1] = x;
-                triplet[2] = y;
-                expect.version(try std.fmt.bufPrint(&buf, "{d}.{d}.{d}", .{ z, x, y }), triplet, @src());
-
-                triplet[0] = y;
-                triplet[1] = x;
-                triplet[2] = z;
-                expect.version(try std.fmt.bufPrint(&buf, "{d}.{d}.{d}", .{ y, x, z }), triplet, @src());
-            }
-        }
-    }
-}
-
-test "Range parsing" {
-    defer expect.done(@src());
-
-    expect.range("~1.2.3", "1.2.3", @src());
-    expect.range("~1.2", "1.2.0", @src());
-    expect.range("~1", "1.0.0", @src());
-    expect.range("~1", "1.2.0", @src());
-    expect.range("~1", "1.2.999", @src());
-    expect.range("~0.2.3", "0.2.3", @src());
-    expect.range("~0.2", "0.2.0", @src());
-    expect.range("~0.2", "0.2.1", @src());
-
-    expect.range("~0 ", "0.0.0", @src());
-
-    expect.notRange("~1.2.3", "1.3.0", @src());
-    expect.notRange("~1.2", "1.3.0", @src());
-    expect.notRange("~1", "2.0.0", @src());
-    expect.notRange("~0.2.3", "0.3.0", @src());
-    expect.notRange("~0.2.3", "1.0.0", @src());
-    expect.notRange("~0 ", "1.0.0", @src());
-    expect.notRange("~0.2", "0.1.0", @src());
-    expect.notRange("~0.2", "0.3.0", @src());
-
-    expect.notRange("~3.0.5", "3.3.0", @src());
-
-    expect.range("^1.1.4", "1.1.4", @src());
-
-    expect.range(">=3", "3.5.0", @src());
-    expect.notRange(">=3", "2.999.999", @src());
-    expect.range(">=3", "3.5.1", @src());
-    expect.range(">=3", "4", @src());
-
-    expect.range("<6 >= 5", "5.0.0", @src());
-    expect.notRange("<6 >= 5", "4.0.0", @src());
-    expect.notRange("<6 >= 5", "6.0.0", @src());
-    expect.notRange("<6 >= 5", "6.0.1", @src());
-
-    expect.range(">2", "3", @src());
-    expect.notRange(">2", "2.1", @src());
-    expect.notRange(">2", "2", @src());
-    expect.notRange(">2", "1.0", @src());
-    expect.notRange(">1.3", "1.3.1", @src());
-    expect.range(">1.3", "2.0.0", @src());
-    expect.range(">2.1.0", "2.2.0", @src());
-    expect.range("<=2.2.99999", "2.2.0", @src());
-    expect.range(">=2.1.99999", "2.2.0", @src());
-    expect.range("<2.2.99999", "2.2.0", @src());
-    expect.range(">2.1.99999", "2.2.0", @src());
-    expect.range(">1.0.0", "2.0.0", @src());
-    expect.range("1.0.0", "1.0.0", @src());
-    expect.notRange("1.0.0", "2.0.0", @src());
-
-    expect.range("1.0.0 || 2.0.0", "1.0.0", @src());
-    expect.range("2.0.0 || 1.0.0", "1.0.0", @src());
-    expect.range("1.0.0 || 2.0.0", "2.0.0", @src());
-    expect.range("2.0.0 || 1.0.0", "2.0.0", @src());
-    expect.range("2.0.0 || >1.0.0", "2.0.0", @src());
-
-    expect.range(">1.0.0 <2.0.0 <2.0.1 >1.0.1", "1.0.2", @src());
-
-    expect.range("2.x", "2.0.0", @src());
-    expect.range("2.x", "2.1.0", @src());
-    expect.range("2.x", "2.2.0", @src());
-    expect.range("2.x", "2.3.0", @src());
-    expect.range("2.x", "2.1.1", @src());
-    expect.range("2.x", "2.2.2", @src());
-    expect.range("2.x", "2.3.3", @src());
-
-    expect.range("<2.0.1 >1.0.0", "2.0.0", @src());
-    expect.range("<=2.0.1 >=1.0.0", "2.0.0", @src());
-
-    expect.range("^2", "2.0.0", @src());
-    expect.range("^2", "2.9.9", @src());
-    expect.range("~2", "2.0.0", @src());
-    expect.range("~2", "2.1.0", @src());
-    expect.range("~2.2", "2.2.1", @src());
-
-    {
-        const passing = [_]string{ "2.4.0", "2.4.1", "3.0.0", "3.0.1", "3.1.0", "3.2.0", "3.3.0", "3.3.1", "3.4.0", "3.5.0", "3.6.0", "3.7.0", "2.4.2", "3.8.0", "3.9.0", "3.9.1", "3.9.2", "3.9.3", "3.10.0", "3.10.1", "4.0.0", "4.0.1", "4.1.0", "4.2.0", "4.2.1", "4.3.0", "4.4.0", "4.5.0", "4.5.1", "4.6.0", "4.6.1", "4.7.0", "4.8.0", "4.8.1", "4.8.2", "4.9.0", "4.10.0", "4.11.0", "4.11.1", "4.11.2", "4.12.0", "4.13.0", "4.13.1", "4.14.0", "4.14.1", "4.14.2", "4.15.0", "4.16.0", "4.16.1", "4.16.2", "4.16.3", "4.16.4", "4.16.5", "4.16.6", "4.17.0", "4.17.1", "4.17.2", "4.17.3", "4.17.4", "4.17.5", "4.17.9", "4.17.10", "4.17.11", "2.0.0", "2.1.0" };
-
-        for (passing) |item| {
-            expect.range("^2 <2.2 || > 2.3", item, @src());
-            expect.range("> 2.3 || ^2 <2.2", item, @src());
-        }
-
-        const not_passing = [_]string{
-            "0.1.0",
-            "0.10.0",
-            "0.2.0",
-            "0.2.1",
-            "0.2.2",
-            "0.3.0",
-            "0.3.1",
-            "0.3.2",
-            "0.4.0",
-            "0.4.1",
-            "0.4.2",
-            "0.5.0",
-            // "0.5.0-rc.1",
-            "0.5.1",
-            "0.5.2",
-            "0.6.0",
-            "0.6.1",
-            "0.7.0",
-            "0.8.0",
-            "0.8.1",
-            "0.8.2",
-            "0.9.0",
-            "0.9.1",
-            "0.9.2",
-            "1.0.0",
-            "1.0.1",
-            "1.0.2",
-            "1.1.0",
-            "1.1.1",
-            "1.2.0",
-            "1.2.1",
-            "1.3.0",
-            "1.3.1",
-            "2.2.0",
-            "2.2.1",
-            "2.3.0",
-            // "1.0.0-rc.1",
-            // "1.0.0-rc.2",
-            // "1.0.0-rc.3",
-        };
-
-        for (not_passing) |item| {
-            expect.notRange("^2 <2.2 || > 2.3", item, @src());
-            expect.notRange("> 2.3 || ^2 <2.2", item, @src());
-        }
-    }
-    expect.range("2.1.0 || > 2.2 || >3", "2.1.0", @src());
-    expect.range(" > 2.2 || >3 || 2.1.0", "2.1.0", @src());
-    expect.range(" > 2.2 || 2.1.0 || >3", "2.1.0", @src());
-    expect.range("> 2.2 || 2.1.0 || >3", "2.3.0", @src());
-    expect.notRange("> 2.2 || 2.1.0 || >3", "2.2.1", @src());
-    expect.notRange("> 2.2 || 2.1.0 || >3", "2.2.0", @src());
-    expect.range("> 2.2 || 2.1.0 || >3", "2.3.0", @src());
-    expect.range("> 2.2 || 2.1.0 || >3", "3.0.1", @src());
-    expect.range("~2", "2.0.0", @src());
-    expect.range("~2", "2.1.0", @src());
-
-    expect.range("1.2.0 - 1.3.0", "1.2.2", @src());
-    expect.range("1.2 - 1.3", "1.2.2", @src());
-    expect.range("1 - 1.3", "1.2.2", @src());
-    expect.range("1 - 1.3", "1.3.0", @src());
-    expect.range("1.2 - 1.3", "1.3.1", @src());
-    expect.notRange("1.2 - 1.3", "1.4.0", @src());
-    expect.range("1 - 1.3", "1.3.1", @src());
-
-    expect.notRange("1.2 - 1.3 || 5.0", "6.4.0", @src());
-    expect.range("1.2 - 1.3 || 5.0", "1.2.1", @src());
-    expect.range("5.0 || 1.2 - 1.3", "1.2.1", @src());
-    expect.range("1.2 - 1.3 || 5.0", "5.0", @src());
-    expect.range("5.0 || 1.2 - 1.3", "5.0", @src());
-    expect.range("1.2 - 1.3 || 5.0", "5.0.2", @src());
-    expect.range("5.0 || 1.2 - 1.3", "5.0.2", @src());
-    expect.range("1.2 - 1.3 || 5.0", "5.0.2", @src());
-    expect.range("5.0 || 1.2 - 1.3", "5.0.2", @src());
-    expect.range("5.0 || 1.2 - 1.3 || >8", "9.0.2", @src());
-}
+const assert = bun.assert;

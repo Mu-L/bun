@@ -1,6 +1,6 @@
-import { bench, group, run } from "mitata";
-import { readFileSync } from "fs";
 import { allocUnsafe } from "bun";
+import { readFileSync } from "fs";
+import { bench, group, run } from "../runner.mjs";
 
 function polyfill(chunks) {
   var size = 0;
@@ -34,33 +34,26 @@ function polyfillUninitialized(chunks) {
 
 const chunkGroups = [
   [Uint8Array.from([123]), Uint8Array.from([456]), Uint8Array.from([789])],
-  Array.from(readFileSync(import.meta.path)).map((a) => Uint8Array.from([a])),
+  Array.from(readFileSync(import.meta.path)).map(a => Uint8Array.from([a])),
   [readFileSync(import.meta.path)],
   Array.from({ length: 42 }, () => readFileSync(import.meta.path)),
-  Array.from({ length: 2 }, () =>
-    new TextEncoder().encode(readFileSync(import.meta.path, "utf8").repeat(100))
-  ),
+  Array.from({ length: 2 }, () => new TextEncoder().encode(readFileSync(import.meta.path, "utf8").repeat(100))),
 ];
 
 for (const chunks of chunkGroups) {
-  group(
-    `${chunks.reduce(
-      (prev, curr, i, a) => prev + curr.byteLength,
-      0
-    )} bytes for ${chunks.length} chunks`,
-    () => {
-      bench("Bun.concatArrayBuffers", () => {
-        Bun.concatArrayBuffers(chunks);
-      });
-      bench("Uint8Array.set", () => {
-        polyfill(chunks);
-      });
+  const name = `${chunks.reduce((prev, curr, i, a) => prev + curr.byteLength, 0)} bytes for ${chunks.length} chunks`
+  group(name, () => {
+    bench(`Bun.concatArrayBuffers (${name})`, () => {
+      Bun.concatArrayBuffers(chunks);
+    });
+    bench(`Uint8Array.set (${name})`, () => {
+      polyfill(chunks);
+    });
 
-      bench("Uint8Array.set (uninitialized memory)", () => {
-        polyfillUninitialized(chunks);
-      });
-    }
-  );
+    bench(`Uint8Array.set (uninitialized memory) (${name})`, () => {
+      polyfillUninitialized(chunks);
+    });
+  });
 }
 
 await run();

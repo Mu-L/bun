@@ -28,10 +28,14 @@
 
 #include "config.h"
 #include "FetchHeaders.h"
+#include "HTTPHeaderNames.h"
 
 #include "HTTPParsers.h"
+#include "wtf/DebugHeap.h"
 
 namespace WebCore {
+
+DEFINE_ALLOCATOR_WITH_HEAP_IDENTIFIER(FetchHeaders);
 
 // https://fetch.spec.whatwg.org/#concept-headers-remove-privileged-no-cors-request-headers
 static void removePrivilegedNoCORSRequestHeaders(HTTPHeaderMap& headers)
@@ -39,60 +43,96 @@ static void removePrivilegedNoCORSRequestHeaders(HTTPHeaderMap& headers)
     headers.remove(HTTPHeaderName::Range);
 }
 
+static ExceptionOr<bool> canWriteHeader(const HTTPHeaderName name, const String& value, const String& combinedValue, FetchHeaders::Guard guard)
+{
+    ASSERT(value.isEmpty() || (!isHTTPSpace(value[0]) && !isHTTPSpace(value[value.length() - 1])));
+    if (!isValidHTTPHeaderValue((value)))
+        return Exception { TypeError, makeString("Header '"_s, name, "' has invalid value: '"_s, value, "'"_s) };
+    if (guard == FetchHeaders::Guard::Immutable)
+        return Exception { TypeError, "Headers object's guard is 'immutable'"_s };
+    return true;
+}
+
 static ExceptionOr<bool> canWriteHeader(const String& name, const String& value, const String& combinedValue, FetchHeaders::Guard guard)
 {
     if (!isValidHTTPToken(name))
-        return Exception { TypeError, makeString("Invalid header name: '", name, "'") };
+        return Exception { TypeError, makeString("Invalid header name: '"_s, name, "'"_s) };
     ASSERT(value.isEmpty() || (!isHTTPSpace(value[0]) && !isHTTPSpace(value[value.length() - 1])));
     if (!isValidHTTPHeaderValue((value)))
-        return Exception { TypeError, makeString("Header '", name, "' has invalid value: '", value, "'") };
+        return Exception { TypeError, makeString("Header '"_s, name, "' has invalid value: '"_s, value, "'"_s) };
     if (guard == FetchHeaders::Guard::Immutable)
         return Exception { TypeError, "Headers object's guard is 'immutable'"_s };
-    if (guard == FetchHeaders::Guard::Request && isForbiddenHeaderName(name))
-        return false;
-    if (guard == FetchHeaders::Guard::RequestNoCors && !combinedValue.isEmpty() && !isSimpleHeader(name, combinedValue))
-        return false;
-    if (guard == FetchHeaders::Guard::Response && isForbiddenResponseHeaderName(name))
-        return false;
     return true;
 }
 
 static ExceptionOr<void> appendToHeaderMap(const String& name, const String& value, HTTPHeaderMap& headers, FetchHeaders::Guard guard)
 {
-    String normalizedValue = stripLeadingAndTrailingHTTPSpaces(value);
+    String normalizedValue = value.trim(isHTTPSpace);
     String combinedValue = normalizedValue;
-    if (headers.contains(name))
-        combinedValue = makeString(headers.get(name), ", ", normalizedValue);
+    HTTPHeaderName headerName;
+    if (findHTTPHeaderName(name, headerName)) {
+        auto index = headers.indexOf(headerName);
+
+        if (headerName != HTTPHeaderName::SetCookie) {
+            if (index.isValid()) {
+                auto existing = headers.getIndex(index);
+                if (headerName == HTTPHeaderName::Cookie) {
+                    combinedValue = makeString(existing, "; "_s, normalizedValue);
+                } else {
+                    combinedValue = makeString(existing, ", "_s, normalizedValue);
+                }
+            }
+        }
+
+        auto canWriteResult = canWriteHeader(headerName, normalizedValue, combinedValue, guard);
+
+        if (canWriteResult.hasException())
+            return canWriteResult.releaseException();
+        if (!canWriteResult.releaseReturnValue())
+            return {};
+
+        if (headerName != HTTPHeaderName::SetCookie) {
+            if (!headers.setIndex(index, combinedValue))
+                headers.set(headerName, combinedValue);
+        } else {
+            headers.add(headerName, normalizedValue);
+        }
+
+        return {};
+    }
+    auto index = headers.indexOf(name);
+    if (index.isValid()) {
+        combinedValue = makeString(headers.getIndex(index), ", "_s, normalizedValue);
+    }
     auto canWriteResult = canWriteHeader(name, normalizedValue, combinedValue, guard);
     if (canWriteResult.hasException())
         return canWriteResult.releaseException();
     if (!canWriteResult.releaseReturnValue())
-        return { };
-    headers.set(name, combinedValue);
+        return {};
 
-    if (guard == FetchHeaders::Guard::RequestNoCors)
-        removePrivilegedNoCORSRequestHeaders(headers);
+    if (!headers.setIndex(index, combinedValue))
+        headers.set(name, combinedValue);
 
-    return { };
+    // if (guard == FetchHeaders::Guard::RequestNoCors)
+    //     removePrivilegedNoCORSRequestHeaders(headers);
+
+    return {};
 }
 
 static ExceptionOr<void> appendToHeaderMap(const HTTPHeaderMap::HTTPHeaderMapConstIterator::KeyValue& header, HTTPHeaderMap& headers, FetchHeaders::Guard guard)
 {
-    String normalizedValue = stripLeadingAndTrailingHTTPSpaces(header.value);
+    String normalizedValue = header.value.trim(isHTTPSpace);
     auto canWriteResult = canWriteHeader(header.key, normalizedValue, header.value, guard);
     if (canWriteResult.hasException())
         return canWriteResult.releaseException();
     if (!canWriteResult.releaseReturnValue())
-        return { };
+        return {};
     if (header.keyAsHTTPHeaderName)
         headers.add(header.keyAsHTTPHeaderName.value(), header.value);
     else
         headers.add(header.key, header.value);
 
-    if (guard == FetchHeaders::Guard::RequestNoCors)
-        removePrivilegedNoCORSRequestHeaders(headers);
-
-    return { };
+    return {};
 }
 
 // https://fetch.spec.whatwg.org/#concept-headers-fill
@@ -116,7 +156,7 @@ static ExceptionOr<void> fillHeaderMap(HTTPHeaderMap& headers, const FetchHeader
         }
     }
 
-    return { };
+    return {};
 }
 
 ExceptionOr<Ref<FetchHeaders>> FetchHeaders::create(std::optional<Init>&& headersInit)
@@ -139,77 +179,113 @@ ExceptionOr<void> FetchHeaders::fill(const Init& headerInit)
 
 ExceptionOr<void> FetchHeaders::fill(const FetchHeaders& otherHeaders)
 {
+    if (this->size() == 0) {
+        HTTPHeaderMap headers;
+        headers.commonHeaders().appendVector(otherHeaders.m_headers.commonHeaders());
+        headers.uncommonHeaders().appendVector(otherHeaders.m_headers.uncommonHeaders());
+        headers.getSetCookieHeaders().appendVector(otherHeaders.m_headers.getSetCookieHeaders());
+        setInternalHeaders(WTFMove(headers));
+        m_updateCounter++;
+        return {};
+    }
+
     for (auto& header : otherHeaders.m_headers) {
         auto result = appendToHeaderMap(header, m_headers, m_guard);
         if (result.hasException())
             return result.releaseException();
     }
 
-    return { };
+    return {};
 }
 
 ExceptionOr<void> FetchHeaders::append(const String& name, const String& value)
 {
+    ++m_updateCounter;
     return appendToHeaderMap(name, value, m_headers, m_guard);
 }
 
 // https://fetch.spec.whatwg.org/#dom-headers-delete
-ExceptionOr<void> FetchHeaders::remove(const String& name)
+ExceptionOr<void> FetchHeaders::remove(const StringView name)
 {
     if (!isValidHTTPToken(name))
-        return Exception { TypeError, makeString("Invalid header name: '", name, "'") };
+        return Exception { TypeError, makeString("Invalid header name: '"_s, name, "'"_s) };
     if (m_guard == FetchHeaders::Guard::Immutable)
         return Exception { TypeError, "Headers object's guard is 'immutable'"_s };
     if (m_guard == FetchHeaders::Guard::Request && isForbiddenHeaderName(name))
-        return { };
+        return {};
     if (m_guard == FetchHeaders::Guard::RequestNoCors && !isNoCORSSafelistedRequestHeaderName(name) && !isPriviledgedNoCORSRequestHeaderName(name))
-        return { };
+        return {};
     if (m_guard == FetchHeaders::Guard::Response && isForbiddenResponseHeaderName(name))
-        return { };
+        return {};
 
+    ++m_updateCounter;
     m_headers.remove(name);
 
     if (m_guard == FetchHeaders::Guard::RequestNoCors)
         removePrivilegedNoCORSRequestHeaders(m_headers);
 
-    return { };
+    return {};
 }
 
-ExceptionOr<String> FetchHeaders::get(const String& name) const
+size_t FetchHeaders::memoryCost() const
+{
+    return m_headers.memoryCost() + sizeof(*this);
+}
+
+ExceptionOr<String> FetchHeaders::get(const StringView name) const
 {
     if (!isValidHTTPToken(name))
-        return Exception { TypeError, makeString("Invalid header name: '", name, "'") };
+        return Exception { TypeError, makeString("Invalid header name: '"_s, name, "'"_s) };
     return m_headers.get(name);
 }
 
-ExceptionOr<bool> FetchHeaders::has(const String& name) const
+ExceptionOr<bool> FetchHeaders::has(const StringView name) const
 {
     if (!isValidHTTPToken(name))
-        return Exception { TypeError, makeString("Invalid header name: '", name, "'") };
+        return Exception { TypeError, makeString("Invalid header name: '"_s, name, '"') };
     return m_headers.contains(name);
 }
 
-ExceptionOr<void> FetchHeaders::set(const String& name, const String& value)
+ExceptionOr<void> FetchHeaders::set(const HTTPHeaderName name, const String& value)
 {
-    String normalizedValue = stripLeadingAndTrailingHTTPSpaces(value);
+    String normalizedValue = value.trim(isHTTPSpace);
     auto canWriteResult = canWriteHeader(name, normalizedValue, normalizedValue, m_guard);
     if (canWriteResult.hasException())
         return canWriteResult.releaseException();
     if (!canWriteResult.releaseReturnValue())
-        return { };
+        return {};
 
+    ++m_updateCounter;
     m_headers.set(name, normalizedValue);
 
     if (m_guard == FetchHeaders::Guard::RequestNoCors)
         removePrivilegedNoCORSRequestHeaders(m_headers);
 
-    return { };
+    return {};
+}
+
+ExceptionOr<void> FetchHeaders::set(const String& name, const String& value)
+{
+    String normalizedValue = value.trim(isHTTPSpace);
+    auto canWriteResult = canWriteHeader(name, normalizedValue, normalizedValue, m_guard);
+    if (canWriteResult.hasException())
+        return canWriteResult.releaseException();
+    if (!canWriteResult.releaseReturnValue())
+        return {};
+
+    ++m_updateCounter;
+    m_headers.set(name, normalizedValue);
+
+    if (m_guard == FetchHeaders::Guard::RequestNoCors)
+        removePrivilegedNoCORSRequestHeaders(m_headers);
+
+    return {};
 }
 
 void FetchHeaders::filterAndFill(const HTTPHeaderMap& headers, Guard guard)
 {
     for (auto& header : headers) {
-        String normalizedValue = stripLeadingAndTrailingHTTPSpaces(header.value);
+        String normalizedValue = header.value.trim(isHTTPSpace);
         auto canWriteResult = canWriteHeader(header.key, normalizedValue, header.value, guard);
         if (canWriteResult.hasException())
             continue;
@@ -224,22 +300,64 @@ void FetchHeaders::filterAndFill(const HTTPHeaderMap& headers, Guard guard)
 
 std::optional<KeyValuePair<String, String>> FetchHeaders::Iterator::next()
 {
+    if (m_keys.isEmpty() || m_updateCounter != m_headers->m_updateCounter) {
+        bool hasSetCookie = !m_headers->getSetCookieHeaders().isEmpty();
+        m_keys.resize(0);
+        m_keys.reserveCapacity(m_headers->m_headers.size() + (hasSetCookie ? 1 : 0));
+        if (m_lowerCaseKeys) {
+            for (auto& header : m_headers->m_headers)
+                m_keys.unsafeAppendWithoutCapacityCheck(header.asciiLowerCaseName());
+        } else {
+            for (auto& header : m_headers->m_headers)
+                m_keys.unsafeAppendWithoutCapacityCheck(header.name());
+        }
+        std::sort(m_keys.begin(), m_keys.end(), WTF::codePointCompareLessThan);
+        if (hasSetCookie)
+            m_keys.unsafeAppendWithoutCapacityCheck(String());
+
+        m_currentIndex += m_cookieIndex;
+        if (hasSetCookie) {
+            size_t setCookieKeyIndex = m_keys.size() - 1;
+            if (m_currentIndex < setCookieKeyIndex)
+                m_cookieIndex = 0;
+            else {
+                m_cookieIndex = std::min(m_currentIndex - setCookieKeyIndex, m_headers->getSetCookieHeaders().size());
+                m_currentIndex -= m_cookieIndex;
+            }
+        } else
+            m_cookieIndex = 0;
+
+        m_updateCounter = m_headers->m_updateCounter;
+    }
+
+    auto& setCookieHeaders = m_headers->m_headers.getSetCookieHeaders();
+
     while (m_currentIndex < m_keys.size()) {
-        auto key = m_keys[m_currentIndex++];
+        auto key = m_keys[m_currentIndex];
+
+        if (key.isNull()) {
+            if (m_cookieIndex < setCookieHeaders.size()) {
+                String value = setCookieHeaders[m_cookieIndex++];
+                return KeyValuePair<String, String> { WTF::httpHeaderNameStringImpl(HTTPHeaderName::SetCookie), WTFMove(value) };
+            }
+            m_currentIndex++;
+            continue;
+        }
+
+        m_currentIndex++;
         auto value = m_headers->m_headers.get(key);
         if (!value.isNull())
             return KeyValuePair<String, String> { WTFMove(key), WTFMove(value) };
     }
+
     return std::nullopt;
 }
 
-FetchHeaders::Iterator::Iterator(FetchHeaders& headers)
+FetchHeaders::Iterator::Iterator(FetchHeaders& headers, bool lowerCaseKeys = true)
     : m_headers(headers)
 {
-    m_keys.reserveInitialCapacity(headers.m_headers.size());
-    for (auto& header : headers.m_headers)
-        m_keys.uncheckedAppend(header.key.convertToASCIILowercase());
-    std::sort(m_keys.begin(), m_keys.end(), WTF::codePointCompareLessThan);
+    m_cookieIndex = 0;
+    m_lowerCaseKeys = lowerCaseKeys;
 }
 
 } // namespace WebCore

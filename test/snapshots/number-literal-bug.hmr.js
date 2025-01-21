@@ -8,12 +8,11 @@ __FastRefreshModule as FastHMR
 import {
 __FastRefreshRuntime as FastRefresh
 } from "http://localhost:8080/bun:wrap";
-var hmr = new FastHMR(3925211795, "number-literal-bug.js", FastRefresh), exports = hmr.exports;
+var hmr = new FastHMR(472725871, "number-literal-bug.js", FastRefresh), exports = hmr.exports;
 (hmr._load = function() {
   function test() {
-    const precision = 10;
     try {
-      parseFloat(0 .toPrecision(precision) + "1");
+      parseFloat(0 .toPrecision(10) + "1");
     } catch (exception) {
       throw new Error("Test Failed", exception);
     }

@@ -1,6 +1,6 @@
 
-#include "wtf/FastMalloc.h"
-#include "wtf/Noncopyable.h"
+#include <wtf/FastMalloc.h>
+#include <wtf/Noncopyable.h>
 
 #pragma once
 
@@ -855,7 +855,7 @@ enum class DOMConstructorID : uint16_t {
     XSLTProcessor,
 
     // --bun--
-    Buffer,
+    EventEmitter,
 };
 
 static constexpr unsigned numberOfDOMConstructorsBase = 846;

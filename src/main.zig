@@ -1,79 +1,76 @@
 const std = @import("std");
-const lex = @import("js_lexer.zig");
-const logger = @import("logger.zig");
-const options = @import("options.zig");
-const js_parser = @import("js_parser.zig");
-const json_parser = @import("json_parser.zig");
-const js_printer = @import("js_printer.zig");
-const js_ast = @import("js_ast.zig");
-const linker = @import("linker.zig");
-const bun = @import("global.zig");
-const string = bun.string;
+const builtin = @import("builtin");
+const bun = @import("root").bun;
 const Output = bun.Output;
-const Global = bun.Global;
 const Environment = bun.Environment;
-const strings = bun.strings;
-const MutableString = bun.MutableString;
-const stringZ = bun.stringZ;
-pub const JSC = @import("javascript_core");
-const default_allocator = bun.default_allocator;
-const C = bun.C;
-const panicky = @import("panic_handler.zig");
-const cli = @import("cli.zig");
-pub const MainPanicHandler = panicky.NewPanicHandler(std.builtin.default_panic);
-const js = @import("bun.js/bindings/bindings.zig");
-const JavaScript = @import("bun.js/javascript.zig");
+
+pub const panic = bun.crash_handler.panic;
+pub const std_options = std.Options{
+    .enable_segfault_handler = false,
+};
+
 pub const io_mode = .blocking;
-pub const bindgen = if (@import("builtin").is_test) undefined else @import("build_options").bindgen;
-const Report = @import("./report.zig");
-pub fn panic(msg: []const u8, error_return_trace: ?*std.builtin.StackTrace) noreturn {
-    MainPanicHandler.handle_panic(msg, error_return_trace);
+
+comptime {
+    bun.assert(builtin.target.cpu.arch.endian() == .little);
 }
 
-const CrashReporter = @import("crash_reporter");
-
-pub fn PLCrashReportHandler() void {
-    Report.fatal(null, null);
-}
-
-pub var start_time: i128 = 0;
+extern fn bun_warn_avx_missing(url: [*:0]const u8) void;
+pub extern "C" var _environ: ?*anyopaque;
+pub extern "C" var environ: ?*anyopaque;
 pub fn main() void {
-    if (comptime Environment.isRelease)
-        CrashReporter.start(null, Report.CrashReportWriter.printFrame, Report.handleCrash) catch unreachable;
+    bun.crash_handler.init();
 
-    start_time = std.time.nanoTimestamp();
+    // This should appear before we make any calls at all to libuv.
+    // So it's safest to put it very early in the main function.
+    if (Environment.isWindows) {
+        _ = bun.windows.libuv.uv_replace_allocator(
+            @ptrCast(&bun.Mimalloc.mi_malloc),
+            @ptrCast(&bun.Mimalloc.mi_realloc),
+            @ptrCast(&bun.Mimalloc.mi_calloc),
+            @ptrCast(&bun.Mimalloc.mi_free),
+        );
+        environ = @ptrCast(std.os.environ.ptr);
+        _environ = @ptrCast(std.os.environ.ptr);
+    }
 
-    // The memory allocator makes a massive difference.
-    // std.heap.raw_c_allocator and default_allocator perform similarly.
-    // std.heap.GeneralPurposeAllocator makes this about 3x _slower_ than esbuild.
-    // var root_alloc = std.heap.ArenaAllocator.init(std.heap.raw_c_allocator);
-    // var root_alloc_ = &root_alloc.allocator;
+    bun.start_time = std.time.nanoTimestamp();
+    bun.initArgv(bun.default_allocator) catch |err| {
+        Output.panic("Failed to initialize argv: {s}\n", .{@errorName(err)});
+    };
 
-    var stdout = std.io.getStdOut();
-    // var stdout = std.io.bufferedWriter(stdout_file.writer());
-    var stderr = std.io.getStdErr();
-    var output_source = Output.Source.init(stdout, stderr);
-
-    Output.Source.set(&output_source);
+    Output.Source.Stdio.init();
     defer Output.flush();
-
-    cli.Cli.start(default_allocator, stdout, stderr, MainPanicHandler);
-
-    std.mem.doNotOptimizeAway(JavaScriptVirtualMachine.fetch);
-    std.mem.doNotOptimizeAway(JavaScriptVirtualMachine.init);
-    std.mem.doNotOptimizeAway(JavaScriptVirtualMachine.resolve);
+    if (Environment.isX64 and Environment.enableSIMD and Environment.isPosix) {
+        bun_warn_avx_missing(@import("./cli/upgrade_command.zig").Version.Bun__githubBaselineURL.ptr);
+    }
+    bun.StackCheck.configureThread();
+    bun.CLI.Cli.start(bun.default_allocator);
+    bun.Global.exit(0);
 }
 
-pub const JavaScriptVirtualMachine = JavaScript.VirtualMachine;
+pub const overrides = struct {
+    pub const mem = struct {
+        extern "C" fn wcslen(s: [*:0]const u16) usize;
 
-test "" {
-    @import("std").testing.refAllDecls(@This());
+        pub fn indexOfSentinel(comptime T: type, comptime sentinel: T, p: [*:sentinel]const T) usize {
+            if (comptime T == u16 and sentinel == 0 and Environment.isWindows) {
+                return wcslen(p);
+            }
 
-    std.mem.doNotOptimizeAway(JavaScriptVirtualMachine.fetch);
-    std.mem.doNotOptimizeAway(JavaScriptVirtualMachine.init);
-    std.mem.doNotOptimizeAway(JavaScriptVirtualMachine.resolve);
-}
+            if (comptime T == u8 and sentinel == 0) {
+                return bun.C.strlen(p);
+            }
 
-test "panic" {
-    panic("woah", null);
+            var i: usize = 0;
+            while (p[i] != sentinel) {
+                i += 1;
+            }
+            return i;
+        }
+    };
+};
+
+pub export fn Bun__panic(msg: [*]const u8, len: usize) noreturn {
+    Output.panic("{s}", .{msg[0..len]});
 }
